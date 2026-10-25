@@ -6,3 +6,7 @@ UsdOptixViewer/build/
 .idea/
 *.swp
 .DS_Store
+
+# literate book intermediates
+LiterateP/build/
+__pycache__/

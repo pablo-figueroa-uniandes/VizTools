@@ -1,0 +1,1088 @@
+@** The renderer. The renderer is the part of the program that talks to the
+GPU. It owns the CUDA stream, the OptiX device context and pipeline, the
+acceleration structure built over the scene's triangles, the textures, and the
+buffers into which the device programs write their pixels. The rest of the
+program sees a small interface: hand it a [[FlatGeometry]], a camera and a few
+switches, call [[render]], and read back an RGBA image together with the
+identity of the mesh under every pixel.
+
+Everything the GPU needs for one launch travels in a single structure,
+[[LaunchParams]]; its definition is in \lpfile{LaunchParams.h}. The renderer
+keeps a host copy of it, [[m_params]], updates its fields as the user changes things, and copies
+it to the device right before every launch. Most setters below therefore do no
+more than write one field.
+
+@* The interface. The header declares the class [[OptixRenderer]]. It cannot
+be copied: it owns GPU resources that must be released exactly once.
+
+<<UsdOptixViewer/src/OptixRenderer.h>>=
+// Ray traces a FlatGeometry with OptiX into a host-side RGBA image.
+#pragma once
+
+<<Headers and declarations of the renderer interface>>
+
+class OptixRenderer
+{
+public:
+    <<Renderer construction and initialization>>
+
+    <<Renderer scene and view settings>>
+
+    <<Renderer frame production and results>>
+
+private:
+    <<The device buffer helper>>
+
+    <<Private steps of the renderer>>
+
+    <<CUDA and OptiX handles of the renderer>>
+
+    <<Scene and output buffers of the renderer>>
+
+    <<Host-side results of the renderer>>
+};
+@ The header needs the CUDA types ([[CUdeviceptr]], [[CUstream]],
+[[cudaMipmappedArray_t]]), the OptiX handle types, and the shared parameter
+structure. The scene's [[FlatGeometry]] is only passed by reference, so a
+forward declaration is enough and the header does not drag in OpenUSD.
+
+<<Headers and declarations of the renderer interface>>=
+#include <string>
+#include <vector>
+
+#include <cuda.h>
+#include <cuda_runtime.h>
+#include <optix_types.h>
+
+#include "LaunchParams.h"
+
+struct FlatGeometry;
+@ Construction does nothing; the real work happens in [[init]], which may
+fail (no GPU, an old driver, a PTX that does not compile) and reports the
+reason as text instead of throwing, so that the application can show it in a
+dialog and keep running without a viewport.
+
+<<Renderer construction and initialization>>=
+OptixRenderer() = default;
+~OptixRenderer();
+OptixRenderer(const OptixRenderer&) = delete;
+OptixRenderer& operator=(const OptixRenderer&) = delete;
+
+// Creates the CUDA/OptiX context and pipeline. Returns false and sets
+// `error` on failure.
+bool init(std::string& error);
+const std::string& deviceName() const { return m_deviceName; }
+@ The scene is replaced as a whole with [[setGeometry]]. The view is described
+by the image size, the camera and the light. The remaining switches map
+one-to-one onto fields of the launch parameters and are read by the device
+programs: shadows, mipmapped texture filtering, normal maps, traced
+reflections, and the mesh to highlight as selected.
+
+<<Renderer scene and view settings>>=
+void setGeometry(const FlatGeometry& geometry);
+void resize(unsigned int width, unsigned int height);
+void setCamera(const float eye[3], const float target[3], const float up[3], float fovYDeg);
+void setLightDir(const float dir[3]);
+void setShadows(bool on) { m_params.shadows = on ? 1u : 0u; }
+void setMipmaps(bool on) { m_params.mipmaps = on ? 1u : 0u; }
+void setNormalMaps(bool on) { m_params.normalMaps = on ? 1u : 0u; }
+void setReflections(bool on) { m_params.reflections = on ? 1u : 0u; }
+void setSelectedMesh(unsigned int meshId) { m_params.selectedMesh = meshId; }
+@ Rendering is progressive. Each call of [[render]] traces one new sample per
+pixel and adds it to an accumulation buffer on the GPU; the image handed back
+is the running average. The counter [[frameIndex]] in the launch parameters is
+the number of samples accumulated so far, so resetting the accumulation is
+just setting it to zero. The caller must do that after any change that
+invalidates the picture, such as a camera move.
+
+The results are an array of RGBA pixels, ready to be uploaded to an SDL
+texture, and a lookup [[meshIdAt]] used for picking with the mouse.
+
+<<Renderer frame production and results>>=
+// Adds one progressive sample per pixel and copies the average to the
+// host buffers. Call resetAccumulation() after changing anything.
+void render();
+void resetAccumulation() { m_params.frameIndex = 0; }
+unsigned int samples() const { return m_params.frameIndex; }
+
+unsigned int width() const { return m_params.width; }
+unsigned int height() const { return m_params.height; }
+const std::vector<uchar4>& pixels() const { return m_pixels; }
+unsigned int meshIdAt(unsigned int x, unsigned int y) const;
+float lastRenderMs() const { return m_lastRenderMs; }
+@ A [[DeviceBuffer]] is a block of GPU memory together with its size. OptiX
+wants device addresses as [[CUdeviceptr]], a plain integer, so that is how we
+store them. The helper is deliberately small: it can be resized, filled from
+host memory, and freed. It has no destructor, because the order in which GPU
+memory is released matters less than the fact that it is released before the
+CUDA context goes away; the renderer's destructor frees every buffer
+explicitly.
+
+<<The device buffer helper>>=
+struct DeviceBuffer
+{
+    CUdeviceptr ptr = 0;
+    size_t size = 0;
+    void resize(size_t bytes);
+    void upload(const void* data, size_t bytes);
+    void free();
+};
+@
+<<Private steps of the renderer>>=
+void createPipeline();
+void buildSbt();
+void uploadTextures(const FlatGeometry& geometry);
+void freeTextures();
+@ The handles fall into three groups. First come CUDA and OptiX objects that
+live as long as the renderer: the CUDA context and stream, the OptiX context,
+the module compiled from the PTX, the program groups and the pipeline linked
+from them, and the shader binding table with its three record buffers.
+
+<<CUDA and OptiX handles of the renderer>>=
+std::string m_deviceName;
+CUcontext m_cuContext = nullptr;
+CUstream m_stream = nullptr;
+OptixDeviceContext m_context = nullptr;
+OptixModule m_module = nullptr;
+OptixPipeline m_pipeline = nullptr;
+OptixProgramGroup m_raygenPG = nullptr, m_missPG[RAY_TYPE_COUNT] = {}, m_hitPG = nullptr;
+OptixShaderBindingTable m_sbt = {};
+DeviceBuffer m_raygenRecord, m_missRecords, m_hitRecords;
+@ Then come the per-scene and per-image buffers. The scene arrays mirror those
+of [[FlatGeometry]]: vertex positions, triangle indices, and for every
+triangle its mesh, material, corner texture coordinates and corner normals.
+[[m_gas]] holds the acceleration structure. The image needs three buffers: the
+8-bit colors shown on screen, the floating-point sums of the progressive
+samples, and the mesh ids for picking. Finally, every texture is a mipmapped
+CUDA array plus a texture object, and the objects are gathered in a device
+table that the shaders index by number.
+
+<<Scene and output buffers of the renderer>>=
+DeviceBuffer m_vertices, m_indices, m_triMesh, m_triMaterial, m_triUVs, m_triNormals, m_materials, m_gas;
+DeviceBuffer m_colorBuffer, m_accumBuffer, m_meshIdBuffer, m_paramsBuffer;
+std::vector<cudaMipmappedArray_t> m_textureArrays;
+std::vector<cudaTextureObject_t> m_textureObjects;
+DeviceBuffer m_textureTable;
+LaunchParams m_params = {};
+@
+<<Host-side results of the renderer>>=
+std::vector<uchar4> m_pixels;
+std::vector<unsigned int> m_meshIds;
+float m_lastRenderMs = 0.0f;
+@* The implementation. The source file is organized as follows; the helpers
+in the anonymous namespace are private to it.
+
+<<UsdOptixViewer/src/OptixRenderer.cpp>>=
+<<Headers of the renderer implementation>>
+
+<<Declare the embedded PTX>>
+
+namespace {
+
+<<Error checking of CUDA and OptiX calls>>
+
+<<The shader binding table record type>>
+
+<<Small vector helpers of the host>>
+
+<<Compute the next mip level of a texture>>
+
+}  // namespace
+
+<<Resize a device buffer>>
+
+<<Upload host data to a device buffer>>
+
+<<Free a device buffer>>
+
+<<Destroy the renderer>>
+
+<<Initialize CUDA and OptiX>>
+
+<<Create the OptiX pipeline>>
+
+<<Build the shader binding table>>
+
+<<Set the scene geometry>>
+
+<<Upload the textures>>
+
+<<Free the textures>>
+
+<<Resize the output image>>
+
+<<Set the camera>>
+
+<<Set the light direction>>
+
+<<Render one progressive sample>>
+
+<<Look up the mesh under a pixel>>
+@ OptiX's host functions are not exported by any library. Instead, one header
+defines a global table of function pointers,
+\begin{center}\lpfile{optix\_function\_table\_definition.h},\end{center}
+and another, \lpfile{optix\_stubs.h}, defines inline functions with the
+documented names that call through that table; [[optixInit]] fills the table
+from the driver. The definition header must be included in exactly one
+translation unit of the program, and this is it.
+
+<<Headers of the renderer implementation>>=
+#include "OptixRenderer.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+
+#include <cuda_runtime.h>
+#include <optix.h>
+#include <optix_function_table_definition.h>
+#include <optix_stubs.h>
+
+#include "Scene.h"
+@ The device programs reach us as PTX text, compiled into the executable by
+the build system (see <<Compile the device programs to PTX and embed them>>).
+The array is terminated by a zero byte, and the size excludes it.
+
+<<Declare the embedded PTX>>=
+extern const char g_devicePrograms[];
+extern const size_t g_devicePrograms_size;
+@ Errors. Every CUDA and OptiX call returns a status code. Rather than test
+each one by hand, we pass it to an overloaded [[check]] that throws an
+exception carrying the name of the operation and the library's description of
+the error. The exceptions are caught in [[init]] and in the application's
+render loop, which turn them into a message for the user.
+
+<<Error checking of CUDA and OptiX calls>>=
+void check(cudaError_t r, const char* what)
+{
+    if (r != cudaSuccess)
+        throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(r));
+}
+
+void check(OptixResult r, const char* what)
+{
+    if (r != OPTIX_SUCCESS)
+        throw std::runtime_error(std::string(what) + ": " + optixGetErrorName(r));
+}
+@ Shader binding table records. OptiX finds the program to run for a ray
+generation, a miss or a hit through the \emph{shader binding table} (SBT), an
+array of records in device memory. Each record starts with an opaque header of
+[[OPTIX_SBT_RECORD_HEADER_SIZE]] bytes, which identifies a program group, and
+may continue with data of our own; records must be aligned to
+[[OPTIX_SBT_RECORD_ALIGNMENT]] bytes. Our programs find all their data in the
+launch parameters, so the payload type is the empty [[Empty]], and every
+record is just an aligned header.
+
+<<The shader binding table record type>>=
+template <typename T>
+struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) SbtRecord
+{
+    alignas(OPTIX_SBT_RECORD_ALIGNMENT) char header[OPTIX_SBT_RECORD_HEADER_SIZE];
+    T data;
+};
+struct Empty {};
+@ CUDA's [[float3]] is a plain structure without operators on the host side,
+and the camera code needs a handful of vector operations. These five
+functions are all it takes; [[normalize]] leaves a zero vector unchanged
+instead of dividing by zero.
+
+<<Small vector helpers of the host>>=
+float3 make3(const float v[3]) { return make_float3(v[0], v[1], v[2]); }
+float3 sub(float3 a, float3 b) { return make_float3(a.x - b.x, a.y - b.y, a.z - b.z); }
+float3 scale(float3 a, float s) { return make_float3(a.x * s, a.y * s, a.z * s); }
+float3 cross(float3 a, float3 b) { return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
+float3 normalize(float3 a)
+{
+    const float len = std::sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    return len > 0.0f ? scale(a, 1.0f / len) : a;
+}
+@* Mipmaps. A texture seen from far away covers many texels per pixel. If we
+sampled only the full-resolution image, neighboring pixels would pick
+unrelated texels and the picture would shimmer with moir\'e patterns. The
+classical cure is a \emph{mip chain}: a sequence of images, each half the size
+of the previous one, down to $1\times1$. The texture unit then reads from the
+level whose texels match the footprint of a pixel; the device programs
+estimate that footprint with ray differentials.
+
+CUDA can store a mip chain but does not compute one, so we build the levels on
+the CPU. Each texel of level $k+1$ is the average of a $2\times2$ block of
+level~$k$ (a box filter). When a dimension is odd, the last row or column
+simply has no partner, and we repeat the edge texel; when it is already~1, it
+stays~1.
+
+<<Compute the next mip level of a texture>>=
+// Next mip level with a 2x2 box filter (edge texels are repeated for odd
+// sizes). sRGB color channels are averaged in linear space.
+std::vector<unsigned char> downsample(const std::vector<unsigned char>& src, int w, int h, bool srgb)
+{
+    <<The sRGB to linear lookup table>>
+    const int nw = std::max(1, w / 2), nh = std::max(1, h / 2);
+    std::vector<unsigned char> dst(size_t(nw) * nh * 4);
+    for (int y = 0; y < nh; ++y)
+        for (int x = 0; x < nw; ++x)
+        {
+            <<Gather the 2x2 block of source texels>>
+            for (int c = 0; c < 4; ++c)
+            {
+                <<Average one channel of the block>>
+            }
+        }
+    return dst;
+}
+@ Color textures are almost always stored in sRGB, a nonlinear encoding that
+spends more of the 256 levels on dark tones. Averaging sRGB values directly
+makes the smaller levels too dark: the average of black and white should be
+light that is half as bright, whose sRGB code is 188, not 128. We therefore
+convert to linear light, average, and convert back. The conversion from an
+8-bit code $c/255$ to linear light is
+$$\ell=\begin{cases}c/12.92, & \text{if } c\le0.04045;\\ \bigl((c+0.055)/1.055\bigr)^{2.4}, & \text{otherwise,}\end{cases}$$
+and since it has only 256 possible inputs we tabulate it once, the first time
+the function is called.
+
+<<The sRGB to linear lookup table>>=
+static const auto toLinear = [] {
+    std::array<float, 256> lut{};
+    for (int i = 0; i < 256; ++i)
+    {
+        const float c = i / 255.0f;
+        lut[i] = c <= 0.04045f ? c / 12.92f : std::pow((c + 0.055f) / 1.055f, 2.4f);
+    }
+    return lut;
+}();
+@ The four source texels of output texel $(x,y)$ are those at $(2x,2y)$ to
+$(2x+1,2y+1)$, clamped to the image; pixels are four bytes, RGBA.
+
+<<Gather the 2x2 block of source texels>>=
+const int x0 = std::min(2 * x, w - 1), x1 = std::min(2 * x + 1, w - 1);
+const int y0 = std::min(2 * y, h - 1), y1 = std::min(2 * y + 1, h - 1);
+const unsigned char* texels[4] = {&src[(size_t(y0) * w + x0) * 4], &src[(size_t(y0) * w + x1) * 4],
+                                  &src[(size_t(y1) * w + x0) * 4], &src[(size_t(y1) * w + x1) * 4]};
+unsigned char* out = &dst[(size_t(y) * nw + x) * 4];
+@ The color channels of an sRGB texture go through linear space, and the
+result is encoded again with the inverse of the curve above,
+$$c=\begin{cases}12.92\,\ell, & \text{if } \ell\le0.0031308;\\ 1.055\,\ell^{1/2.4}-0.055, & \text{otherwise.}\end{cases}$$
+The alpha channel, and every channel of a raw texture (normal maps, roughness,
+metallic), is linear already and is averaged as integers, with $+2$ for
+rounding to nearest.
+
+<<Average one channel of the block>>=
+if (srgb && c < 3)
+{
+    float sum = 0.0f;
+    for (const unsigned char* t : texels)
+        sum += toLinear[t[c]];
+    const float l = sum * 0.25f;
+    const float e = l <= 0.0031308f ? l * 12.92f : 1.055f * std::pow(l, 1.0f / 2.4f) - 0.055f;
+    out[c] = (unsigned char)std::lround(std::clamp(e, 0.0f, 1.0f) * 255.0f);
+}
+else
+    out[c] = (unsigned char)((texels[0][c] + texels[1][c] + texels[2][c] + texels[3][c] + 2) / 4);
+@* Device buffers. Resizing to the current size is free; otherwise the old
+block is released and a new one allocated. A size of zero leaves the buffer
+empty, with a null pointer, which happens for a scene without textures or
+without triangles.
+
+<<Resize a device buffer>>=
+// ---- DeviceBuffer ---------------------------------------------------------
+void OptixRenderer::DeviceBuffer::resize(size_t bytes)
+{
+    if (bytes == size)
+        return;
+    free();
+    if (bytes)
+        check(cudaMalloc(reinterpret_cast<void**>(&ptr), bytes), "cudaMalloc");
+    size = bytes;
+}
+@ Uploads are synchronous: they happen when a scene is loaded, not in the
+render loop, so simplicity wins over overlap.
+
+<<Upload host data to a device buffer>>=
+void OptixRenderer::DeviceBuffer::upload(const void* data, size_t bytes)
+{
+    resize(bytes);
+    if (bytes)
+        check(cudaMemcpy(reinterpret_cast<void*>(ptr), data, bytes, cudaMemcpyHostToDevice), "cudaMemcpy");
+}
+@
+<<Free a device buffer>>=
+void OptixRenderer::DeviceBuffer::free()
+{
+    if (ptr)
+        cudaFree(reinterpret_cast<void*>(ptr));
+    ptr = 0;
+    size = 0;
+}
+@* Life and death of the renderer. If [[init]] never got as far as creating
+an OptiX context, there is nothing to release. Otherwise we wait for the GPU
+to finish any work in flight and release the resources in the reverse order of
+their creation: textures and buffers first, then the pipeline, the program
+groups and the module it was linked from, then the OptiX context, and last the
+CUDA stream. The CUDA primary context itself is reference-counted by the
+runtime and is released when the process exits.
+
+<<Destroy the renderer>>=
+// ---- OptixRenderer --------------------------------------------------------
+OptixRenderer::~OptixRenderer()
+{
+    if (!m_context)
+        return;
+    cudaDeviceSynchronize();
+    freeTextures();
+    for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_vertices, &m_indices, &m_triMesh,
+                            &m_triMaterial, &m_triUVs, &m_triNormals, &m_materials, &m_gas, &m_colorBuffer,
+                            &m_accumBuffer, &m_meshIdBuffer,
+                            &m_paramsBuffer})
+        b->free();
+    optixPipelineDestroy(m_pipeline);
+    optixProgramGroupDestroy(m_raygenPG);
+    for (OptixProgramGroup pg : m_missPG)
+        optixProgramGroupDestroy(pg);
+    optixProgramGroupDestroy(m_hitPG);
+    optixModuleDestroy(m_module);
+    optixDeviceContextDestroy(m_context);
+    cudaStreamDestroy(m_stream);
+}
+@ Initialization proceeds in three steps, any of which may throw; the
+exception's message becomes the error text.
+
+<<Initialize CUDA and OptiX>>=
+bool OptixRenderer::init(std::string& error)
+{
+    try
+    {
+        <<Select the GPU and its primary context>>
+
+        <<Create the OptiX device context>>
+
+        <<Build the pipeline and set the default parameters>>
+    }
+    catch (const std::exception& e)
+    {
+        error = e.what();
+        return false;
+    }
+    return true;
+}
+@ The workstation has two GPUs; one is plenty for an interactive viewer, so we
+use device~0. The CUDA runtime creates a device's \emph{primary context}
+lazily, on the first call that needs one; [[cudaFree(nullptr)]] is the
+customary way to force that creation without doing anything else. OptiX,
+however, is built on the lower-level driver API and wants a [[CUcontext]], so
+we ask the driver for the context that is now current, which is that primary
+context. Runtime and driver calls then share the same context, and memory
+allocated with [[cudaMalloc]] is valid for OptiX. The stream orders all our
+GPU work: acceleration builds, launches and copies.
+
+<<Select the GPU and its primary context>>=
+int deviceCount = 0;
+check(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount");
+if (deviceCount == 0)
+    throw std::runtime_error("no CUDA capable device found");
+check(cudaSetDevice(0), "cudaSetDevice");
+check(cudaFree(nullptr), "cudaFree");  // creates the primary context
+cudaDeviceProp props{};
+check(cudaGetDeviceProperties(&props, 0), "cudaGetDeviceProperties");
+m_deviceName = props.name;
+check(cudaStreamCreate(&m_stream), "cudaStreamCreate");
+if (cuCtxGetCurrent(&m_cuContext) != CUDA_SUCCESS)
+    throw std::runtime_error("cuCtxGetCurrent failed");
+@ [[optixInit]] locates the OptiX implementation inside the installed driver
+and fills the function table; it fails if the driver is too old for the
+headers we compiled against (OptiX~9.1 needs driver R590 or newer). The
+device context is then created on top of the CUDA context, with default
+options.
+
+<<Create the OptiX device context>>=
+check(optixInit(), "optixInit");
+OptixDeviceContextOptions options = {};
+check(optixDeviceContextCreate(m_cuContext, &options, &m_context), "optixDeviceContextCreate");
+@ With a context in hand we compile the pipeline and fill in the shader
+binding table, then give the launch parameters their initial values:
+nothing selected, every feature on, and a light coming from above, to the
+right and in front of the default camera. The device copy of the parameters
+needs space for one [[LaunchParams]].
+
+<<Build the pipeline and set the default parameters>>=
+createPipeline();
+buildSbt();
+m_params.selectedMesh = kNoMesh;
+m_params.shadows = 1u;
+m_params.mipmaps = 1u;
+m_params.normalMaps = 1u;
+m_params.reflections = 1u;
+const float light[3] = {0.4f, 0.8f, 0.45f};
+setLightDir(light);
+m_paramsBuffer.resize(sizeof(LaunchParams));
+@* The pipeline. An OptiX \emph{pipeline} is the complete program run by a
+launch. It is assembled from \emph{program groups}, which in turn refer to
+entry functions inside \emph{modules}, the compiled form of PTX. Our single
+module holds all the device programs.
+
+<<Create the OptiX pipeline>>=
+void OptixRenderer::createPipeline()
+{
+    <<Module compile options>>
+
+    <<Pipeline compile options>>
+
+    <<Compile the embedded PTX into a module>>
+
+    <<Create the ray generation program group>>
+
+    <<Create the miss program groups>>
+
+    <<Create the hit group>>
+
+    <<Link the pipeline and set its stack size>>
+}
+@ The module is compiled with the default optimization level and the minimal
+debug level, which keeps line information for profilers without slowing the
+code down.
+
+<<Module compile options>>=
+OptixModuleCompileOptions moduleOptions = {};
+moduleOptions.maxRegisterCount = OPTIX_COMPILE_DEFAULT_MAX_REGISTER_COUNT;
+moduleOptions.optLevel = OPTIX_COMPILE_OPTIMIZATION_DEFAULT;
+moduleOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
+@ The pipeline compile options must be identical for every module of a
+pipeline, because they shape the calling convention between programs.
+\begin{itemize}
+\item The whole scene is one geometry acceleration structure (GAS), with no
+  instancing, so we promise OptiX a traversable graph of a single GAS, its
+  fastest case.
+\item The \emph{payload} is the set of 32-bit registers a ray carries between
+  the program that traces it and the programs it triggers. Radiance rays use
+  six: the three color components as float bits, the id of the mesh that was
+  hit, the recursion depth, and the state of the random number generator.
+  Shadow rays use only the first.
+\item Triangles report two \emph{attributes}, their barycentric coordinates.
+\item The launch parameters live in a constant-memory variable that the device
+  code calls [[params]]; OptiX copies our parameter buffer into it.
+\item Only built-in triangles are used, which lets OptiX drop support for
+  other primitive types.
+\end{itemize}
+
+<<Pipeline compile options>>=
+OptixPipelineCompileOptions pipelineOptions = {};
+pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
+pipelineOptions.numPayloadValues = 6;
+pipelineOptions.numAttributeValues = 2;
+pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
+pipelineOptions.pipelineLaunchParamsVariableName = "params";
+pipelineOptions.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
+@ The PTX is compiled to machine code for the installed GPU here, at run time.
+OptiX writes warnings and errors to a log buffer; [[logSize]] goes in as the
+capacity and comes back as the length used, so it is reset before every call.
+We do not print the log: on failure the error code already says what went
+wrong, and the PTX was compiled and checked at build time.
+
+<<Compile the embedded PTX into a module>>=
+char log[2048];
+size_t logSize = sizeof(log);
+check(optixModuleCreate(m_context, &moduleOptions, &pipelineOptions, g_devicePrograms, g_devicePrograms_size,
+                        log, &logSize, &m_module),
+      "optixModuleCreate");
+@ Program groups name their entry functions by string. OptiX requires the
+names to start with a prefix that tells the kind of program:
+\texttt{\_\_raygen\_\_}, \texttt{\_\_miss\_\_}, \texttt{\_\_closesthit\_\_} or
+\texttt{\_\_anyhit\_\_}. The ray generation program
+is launched once per pixel.
+
+<<Create the ray generation program group>>=
+OptixProgramGroupOptions pgOptions = {};
+OptixProgramGroupDesc desc = {};
+desc.kind = OPTIX_PROGRAM_GROUP_KIND_RAYGEN;
+desc.raygen.module = m_module;
+desc.raygen.entryFunctionName = "__raygen__renderFrame";
+logSize = sizeof(log);
+check(optixProgramGroupCreate(m_context, &desc, 1, &pgOptions, log, &logSize, &m_raygenPG), "raygen group");
+@ There are two ray types, radiance and shadow, and each has its own miss
+program: a radiance ray that escapes returns the color of the sky, while a
+shadow ray that escapes reports that the light is visible.
+
+<<Create the miss program groups>>=
+const char* missNames[RAY_TYPE_COUNT] = {"__miss__radiance", "__miss__shadow"};
+for (int i = 0; i < RAY_TYPE_COUNT; ++i)
+{
+    desc = {};
+    desc.kind = OPTIX_PROGRAM_GROUP_KIND_MISS;
+    desc.miss.module = m_module;
+    desc.miss.entryFunctionName = missNames[i];
+    logSize = sizeof(log);
+    check(optixProgramGroupCreate(m_context, &desc, 1, &pgOptions, log, &logSize, &m_missPG[i]), "miss group");
+}
+@ A \emph{hit group} bundles the programs run when a ray meets a triangle. The
+closest-hit program shades the nearest intersection; the any-hit program runs
+for every candidate intersection along the ray and is where alpha cutouts
+discard the transparent parts of leaves and fences. A single hit group serves
+both ray types: shadow rays are traced with closest-hit disabled, so for them
+only the any-hit program matters, and that is exactly what a shadow test
+needs.
+
+<<Create the hit group>>=
+desc = {};
+desc.kind = OPTIX_PROGRAM_GROUP_KIND_HITGROUP;
+desc.hitgroup.moduleCH = m_module;
+desc.hitgroup.entryFunctionNameCH = "__closesthit__radiance";
+desc.hitgroup.moduleAH = m_module;
+desc.hitgroup.entryFunctionNameAH = "__anyhit__cutout";
+logSize = sizeof(log);
+check(optixProgramGroupCreate(m_context, &desc, 1, &pgOptions, log, &logSize, &m_hitPG), "hit group");
+@ Linking needs the maximum depth of nested [[optixTrace]] calls. A camera
+ray (depth~1) may hit a glossy surface whose closest-hit program traces a
+reflection ray (depth~2); where that one lands, the closest-hit program traces
+a shadow ray (depth~3). Nothing goes deeper: the reflected hit does not
+reflect again, and shadow rays do not shade.
+
+Recursion lives on a stack whose size OptiX must know. In general one adds up
+the stack needs of all programs; OptiX~9 can do this for us from the call
+depths: three levels of tracing, no continuation or direct callables, and a
+traversable graph one level deep.
+
+<<Link the pipeline and set its stack size>>=
+OptixProgramGroup groups[] = {m_raygenPG, m_missPG[0], m_missPG[1], m_hitPG};
+OptixPipelineLinkOptions linkOptions = {};
+linkOptions.maxTraceDepth = 3;  // camera -> reflection -> shadow
+logSize = sizeof(log);
+check(optixPipelineCreate(m_context, &pipelineOptions, &linkOptions, groups, 4, log, &logSize, &m_pipeline),
+      "optixPipelineCreate");
+check(optixPipelineSetStackSizeFromCallDepths(m_pipeline, linkOptions.maxTraceDepth, 0, 0, 0, 1),
+      "optixPipelineSetStackSizeFromCallDepths");
+@* The shader binding table. When a ray of type $r$ hits geometry, OptiX picks
+the hit record at index $\hbox{offset}+\hbox{stride}\times\hbox{geometry index}$, where
+offset and stride are arguments of [[optixTrace]]; misses use the miss record
+named by another argument. The device programs pass the ray type as the miss
+index, an offset of~0 and a stride of [[RAY_TYPE_COUNT]]. With a single
+geometry (index~0), every ray therefore lands on hit record~0, and the second
+record exists only so that the table has one record per ray type, the layout
+that a stride of [[RAY_TYPE_COUNT]] presumes.
+
+<<Build the shader binding table>>=
+void OptixRenderer::buildSbt()
+{
+    <<Pack the ray generation record>>
+
+    <<Pack the miss records>>
+
+    <<Pack the hit records>>
+
+    <<Point the shader binding table at the records>>
+}
+@ Packing a record writes the header that identifies the program group;
+then the record is copied to the GPU.
+
+<<Pack the ray generation record>>=
+SbtRecord<Empty> raygen;
+check(optixSbtRecordPackHeader(m_raygenPG, &raygen), "pack raygen");
+m_raygenRecord.upload(&raygen, sizeof(raygen));
+@
+<<Pack the miss records>>=
+SbtRecord<Empty> miss[RAY_TYPE_COUNT];
+for (int i = 0; i < RAY_TYPE_COUNT; ++i)
+    check(optixSbtRecordPackHeader(m_missPG[i], &miss[i]), "pack miss");
+m_missRecords.upload(miss, sizeof(miss));
+@
+<<Pack the hit records>>=
+// Both ray types use the same record; the shadow ray disables closest-hit.
+SbtRecord<Empty> hit[RAY_TYPE_COUNT];
+for (int i = 0; i < RAY_TYPE_COUNT; ++i)
+    check(optixSbtRecordPackHeader(m_hitPG, &hit[i]), "pack hit");
+m_hitRecords.upload(hit, sizeof(hit));
+@
+<<Point the shader binding table at the records>>=
+m_sbt.raygenRecord = m_raygenRecord.ptr;
+m_sbt.missRecordBase = m_missRecords.ptr;
+m_sbt.missRecordStrideInBytes = sizeof(SbtRecord<Empty>);
+m_sbt.missRecordCount = RAY_TYPE_COUNT;
+m_sbt.hitgroupRecordBase = m_hitRecords.ptr;
+m_sbt.hitgroupRecordStrideInBytes = sizeof(SbtRecord<Empty>);
+m_sbt.hitgroupRecordCount = RAY_TYPE_COUNT;
+@* Loading a scene. [[setGeometry]] replaces everything that depends on the
+scene: the arrays, the materials, the textures and the acceleration
+structure. The old acceleration structure is invalid as soon as the arrays
+change, so its handle is cleared first, and the accumulated image restarts.
+
+<<Set the scene geometry>>=
+void OptixRenderer::setGeometry(const FlatGeometry& g)
+{
+    <<Upload the flattened scene arrays>>
+    <<Pack the materials for the device>>
+    <<Upload the textures and publish the device pointers>>
+
+    <<Describe the triangles to OptiX>>
+
+    <<Choose the acceleration structure build options>>
+
+    <<Build the geometry acceleration structure>>
+}
+@ The arrays of [[FlatGeometry]] are copied as they are. Their element types
+on the device ([[float3]], [[uint3]], [[float2]]) have the same layout as the
+consecutive [[float]]s and [[unsigned int]]s of the host vectors.
+
+<<Upload the flattened scene arrays>>=
+m_params.handle = 0;
+m_params.frameIndex = 0;
+m_gas.free();
+m_vertices.upload(g.vertices.data(), g.vertices.size() * sizeof(float));
+m_indices.upload(g.indices.data(), g.indices.size() * sizeof(unsigned int));
+m_triMesh.upload(g.triMesh.data(), g.triMesh.size() * sizeof(unsigned int));
+m_triMaterial.upload(g.triMaterial.data(), g.triMaterial.size() * sizeof(unsigned int));
+m_triUVs.upload(g.triUVs.data(), g.triUVs.size() * sizeof(float));
+m_triNormals.upload(g.triNormals.data(), g.triNormals.size() * sizeof(float));
+@ Materials are another matter. The scene describes them with C++ types that
+are convenient on the host ([[std::array]], [[bool]], [[ScalarInput]]); the
+device wants the flat, CUDA-aligned [[MaterialData]] of
+\lpfile{LaunchParams.h}. We convert field by field.
+
+<<Pack the materials for the device>>=
+std::vector<MaterialData> materials;
+for (const Material& m : g.materials)
+{
+    <<Conversions from host material fields>>
+    <<Fill in one device material>>
+}
+m_materials.upload(materials.data(), materials.size() * sizeof(MaterialData));
+@ Three small lambdas turn the host types into their device counterparts: a
+four-component array into a [[float4]], a three-component one into a
+[[float3]], and a scalar input (a constant, or a channel of a texture with a
+scale and a bias) into a [[ScalarParam]].
+
+<<Conversions from host material fields>>=
+auto f4 = [](const std::array<float, 4>& v) { return make_float4(v[0], v[1], v[2], v[3]); };
+auto f3 = [](const std::array<float, 3>& v) { return make_float3(v[0], v[1], v[2]); };
+auto scalar = [](const ScalarInput& in) {
+    return ScalarParam{in.value, in.texture, in.channel, in.scale, in.bias};
+};
+@ The fields follow the UsdPreviewSurface inputs: the diffuse texture's scale
+and bias, those of the normal map and the specular color, the constant
+colors, texture indices ($-1$ meaning none), roughness and metallic, the
+alpha-cutout channel and threshold, the workflow flag and the index of
+refraction. Texture indices refer to the table built below.
+
+<<Fill in one device material>>=
+MaterialData d = {};
+d.texScale = f4(m.scale);
+d.texBias = f4(m.bias);
+d.normalScale = f4(m.normalScale);
+d.normalBias = f4(m.normalBias);
+d.specScale = f4(m.specularScale);
+d.specBias = f4(m.specularBias);
+d.color = f3(m.color);
+d.texture = m.texture;
+d.specColor = f3(m.specularColor);
+d.specTexture = m.specularTexture;
+d.roughness = scalar(m.roughness);
+d.metallic = scalar(m.metallic);
+d.opacityTexture = m.opacityTexture;
+d.opacityChannel = m.opacityChannel;
+d.opacityThreshold = m.opacityThreshold;
+d.normalTexture = m.normalTexture;
+d.specularWorkflow = m.specularWorkflow ? 1 : 0;
+d.ior = m.ior;
+materials.push_back(d);
+@ With the textures uploaded, all device addresses are known and we store them
+in the launch parameters. A scene without triangles stops here: the handle
+stays zero, and [[render]] then simply paints the background.
+
+<<Upload the textures and publish the device pointers>>=
+uploadTextures(g);
+m_params.vertices = reinterpret_cast<const float3*>(m_vertices.ptr);
+m_params.indices = reinterpret_cast<const uint3*>(m_indices.ptr);
+m_params.triMesh = reinterpret_cast<const unsigned int*>(m_triMesh.ptr);
+m_params.triMaterial = reinterpret_cast<const unsigned int*>(m_triMaterial.ptr);
+m_params.triUVs = reinterpret_cast<const float2*>(m_triUVs.ptr);
+m_params.triNormals = reinterpret_cast<const float3*>(m_triNormals.ptr);
+m_params.materials = reinterpret_cast<const MaterialData*>(m_materials.ptr);
+m_params.textures = reinterpret_cast<const cudaTextureObject_t*>(m_textureTable.ptr);
+if (g.empty())
+    return;
+@ The acceleration structure. OptiX builds a bounding volume hierarchy over
+the triangles, the \emph{geometry acceleration structure}, which the hardware
+ray-tracing cores traverse. The whole scene is one build input: an indexed
+triangle array of world-space [[float3]] vertices and [[uint3]] index
+triplets, with one SBT record.
+
+The geometry flag deserves a word. The usual advice for opaque geometry is the flag
+\begin{center}[[OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT]],\end{center}
+which spares the traversal a call per candidate hit, and an early version of
+the viewer did exactly that. Alpha cutouts need the any-hit program, though,
+so the flag is now [[OPTIX_GEOMETRY_FLAG_NONE]]; for opaque materials the
+program returns at once.
+
+<<Describe the triangles to OptiX>>=
+// any-hit stays enabled for alpha cutouts; it returns early for opaque materials
+const unsigned int flags[] = {OPTIX_GEOMETRY_FLAG_NONE};
+OptixBuildInput input = {};
+input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+OptixBuildInputTriangleArray& tri = input.triangleArray;
+tri.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+tri.vertexStrideInBytes = sizeof(float3);
+tri.numVertices = unsigned(g.vertices.size() / 3);
+tri.vertexBuffers = &m_vertices.ptr;
+tri.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+tri.indexStrideInBytes = sizeof(uint3);
+tri.numIndexTriplets = unsigned(g.indices.size() / 3);
+tri.indexBuffer = m_indices.ptr;
+tri.flags = flags;
+tri.numSbtRecords = 1;
+@ The scene is static once loaded, so we ask for the structure that traces
+fastest, at the price of a slower build, and do not request updates or
+compaction.
+
+<<Choose the acceleration structure build options>>=
+OptixAccelBuildOptions accelOptions = {};
+accelOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
+accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
+@ OptiX first tells us how much memory the build needs: scratch space for the
+build itself and room for the result. The build runs on our stream and
+writes the \emph{traversable handle} straight into the launch parameters; we
+wait for it before releasing the scratch buffer.
+
+<<Build the geometry acceleration structure>>=
+OptixAccelBufferSizes sizes = {};
+check(optixAccelComputeMemoryUsage(m_context, &accelOptions, &input, 1, &sizes), "optixAccelComputeMemoryUsage");
+DeviceBuffer temp;
+temp.resize(sizes.tempSizeInBytes);
+m_gas.resize(sizes.outputSizeInBytes);
+check(optixAccelBuild(m_context, m_stream, &accelOptions, &input, 1, temp.ptr, temp.size, m_gas.ptr, m_gas.size,
+                      &m_params.handle, nullptr, 0),
+      "optixAccelBuild");
+check(cudaStreamSynchronize(m_stream), "accel build");
+temp.free();
+@* Textures. Every texture of the scene becomes a CUDA \emph{mipmapped array}
+holding its full mip chain, and a \emph{texture object}: a 64-bit handle that
+combines the array with a description of how to sample it. The handles go
+into a table on the device, indexed by the texture numbers stored in the
+materials.
+
+<<Upload the textures>>=
+void OptixRenderer::uploadTextures(const FlatGeometry& g)
+{
+    freeTextures();
+    for (const Texture& t : g.textures)
+    {
+        <<Allocate a mipmapped array for the texture>>
+        <<Upload every mip level>>
+
+        <<Describe how the texture is sampled>>
+        <<Create the texture object>>
+    }
+    m_textureTable.upload(m_textureObjects.data(), m_textureObjects.size() * sizeof(cudaTextureObject_t));
+}
+@ A chain that halves down to $1\times1$ has $1+\lfloor\log_2\max(w,h)\rfloor$
+levels. Texels are four unsigned bytes, as decoded by the scene.
+
+<<Allocate a mipmapped array for the texture>>=
+// full mip chain, down to 1x1
+const unsigned levels = 1u + unsigned(std::floor(std::log2(double(std::max(t.width, t.height)))));
+const cudaChannelFormatDesc format = cudaCreateChannelDesc<uchar4>();
+cudaMipmappedArray_t mipmaps = nullptr;
+check(cudaMallocMipmappedArray(&mipmaps, &format, make_cudaExtent(size_t(t.width), size_t(t.height), 0),
+                               levels),
+      "cudaMallocMipmappedArray");
+m_textureArrays.push_back(mipmaps);
+@ Level~0 is the image itself. After uploading each level we compute the next
+one from it with [[downsample]], which halves the dimensions the same way CUDA
+does, never going below~1.
+
+<<Upload every mip level>>=
+std::vector<unsigned char> level = t.rgba;
+int w = t.width, h = t.height;
+for (unsigned l = 0; l < levels; ++l)
+{
+    cudaArray_t array = nullptr;
+    check(cudaGetMipmappedArrayLevel(&array, mipmaps, l), "cudaGetMipmappedArrayLevel");
+    check(cudaMemcpy2DToArray(array, 0, 0, level.data(), size_t(w) * 4, size_t(w) * 4, size_t(h),
+                              cudaMemcpyHostToDevice),
+          "texture upload");
+    if (l + 1 < levels)
+    {
+        level = downsample(level, w, h, t.srgb);
+        w = std::max(1, w / 2);
+        h = std::max(1, h / 2);
+    }
+}
+@ The sampling description is where the texture hardware earns its keep.
+\begin{itemize}
+\item The USD wrap modes map onto CUDA address modes: \texttt{repeat} to
+  wrap, \texttt{mirror} to mirror, \texttt{clamp} to clamp, and
+  \texttt{black} to border, whose border color is zero.
+\item Filtering is \emph{trilinear}: bilinear within a level, and linear
+  between the two levels nearest to the requested one.
+\item Up to eight anisotropic samples are taken along the longer axis of a
+  pixel's footprint. This only works with explicit gradients, which is why the
+  device programs sample with [[tex2DGrad]]; it keeps floors seen at grazing
+  angles sharp instead of blurring them to the coarsest level the short axis
+  would allow.
+\item Texels are read as normalized floats in $[0,1]$, addressed with
+  normalized coordinates.
+\item For sRGB textures the hardware converts each texel to linear light
+  \emph{before} filtering, which is the correct order and costs nothing.
+\end{itemize}
+
+<<Describe how the texture is sampled>>=
+cudaResourceDesc resource = {};
+resource.resType = cudaResourceTypeMipmappedArray;
+resource.res.mipmap.mipmap = mipmaps;
+cudaTextureDesc desc = {};
+auto mode = [](TextureWrap w) {
+    switch (w)
+    {
+    case TextureWrap::Mirror: return cudaAddressModeMirror;
+    case TextureWrap::Clamp: return cudaAddressModeClamp;
+    case TextureWrap::Black: return cudaAddressModeBorder;
+    default: return cudaAddressModeWrap;
+    }
+};
+desc.addressMode[0] = mode(t.wrapS);
+desc.addressMode[1] = mode(t.wrapT);
+desc.filterMode = cudaFilterModeLinear;
+desc.mipmapFilterMode = cudaFilterModeLinear;
+desc.maxMipmapLevelClamp = float(levels - 1);
+desc.maxAnisotropy = 8;
+desc.readMode = cudaReadModeNormalizedFloat;
+desc.normalizedCoords = 1;
+desc.sRGB = t.srgb ? 1 : 0;  // the hardware converts sRGB texels to linear
+@
+<<Create the texture object>>=
+cudaTextureObject_t object = 0;
+check(cudaCreateTextureObject(&object, &resource, &desc, nullptr), "cudaCreateTextureObject");
+m_textureObjects.push_back(object);
+@ Texture objects must be destroyed before the arrays they refer to.
+
+<<Free the textures>>=
+void OptixRenderer::freeTextures()
+{
+    for (cudaTextureObject_t object : m_textureObjects)
+        cudaDestroyTextureObject(object);
+    for (cudaMipmappedArray_t mipmaps : m_textureArrays)
+        cudaFreeMipmappedArray(mipmaps);
+    m_textureObjects.clear();
+    m_textureArrays.clear();
+    m_textureTable.free();
+}
+@* The image and the camera. The output buffers follow the size of the
+viewport. A minimized or collapsed viewport may report a zero size, which we
+round up to one pixel so that every buffer stays valid. Resizing restarts the
+accumulation, since the old sums belong to other pixels. The accumulation
+buffer holds one [[float4]] per pixel: the sum of the sample colors, and in
+the fourth component the number of samples.
+
+<<Resize the output image>>=
+void OptixRenderer::resize(unsigned int width, unsigned int height)
+{
+    width = width ? width : 1;
+    height = height ? height : 1;
+    if (width == m_params.width && height == m_params.height)
+        return;
+    m_params.width = width;
+    m_params.height = height;
+    m_colorBuffer.resize(size_t(width) * height * sizeof(uchar4));
+    m_accumBuffer.resize(size_t(width) * height * sizeof(float4));
+    m_params.accumBuffer = reinterpret_cast<float4*>(m_accumBuffer.ptr);
+    m_params.frameIndex = 0;
+    m_meshIdBuffer.resize(size_t(width) * height * sizeof(unsigned int));
+    m_params.colorBuffer = reinterpret_cast<uchar4*>(m_colorBuffer.ptr);
+    m_params.meshIdBuffer = reinterpret_cast<unsigned int*>(m_meshIdBuffer.ptr);
+    m_pixels.resize(size_t(width) * height);
+    m_meshIds.resize(size_t(width) * height);
+}
+@ A pinhole camera is described to the device by its eye point and three
+vectors. Let $\mathbf w$ be the unit vector from the eye towards the target,
+$\mathbf u=\mathbf w\times\mathbf{up}$ normalized (pointing right), and
+$\mathbf v=\mathbf u\times\mathbf w$ (pointing up). If $\phi$ is the vertical
+field of view and $a$ the aspect ratio, the image plane at distance~1 spans
+$\pm\tan(\phi/2)$ vertically and $\pm a\tan(\phi/2)$ horizontally. Scaling
+$\mathbf u$ and $\mathbf v$ by those half-extents lets the ray generation
+program write the direction through normalized device coordinates
+$(x,y)\in[-1,1]^2$ simply as $\mathbf w+x\,\mathbf u+y\,\mathbf v$. The
+aspect ratio is taken from the current image size, so the camera must be set
+after [[resize]].
+
+<<Set the camera>>=
+void OptixRenderer::setCamera(const float eyeIn[3], const float targetIn[3], const float upIn[3], float fovYDeg)
+{
+    const float3 eye = make3(eyeIn);
+    const float3 w = normalize(sub(make3(targetIn), eye));
+    const float3 u = normalize(cross(w, make3(upIn)));
+    const float3 v = cross(u, w);
+    const float halfH = std::tan(fovYDeg * 0.5f * float(M_PI) / 180.0f);
+    const float aspect = m_params.height ? float(m_params.width) / float(m_params.height) : 1.0f;
+    m_params.camera = {eye, scale(u, halfH * aspect), scale(v, halfH), w};
+}
+@ The light is directional; the device programs want the unit vector that
+points towards it.
+
+<<Set the light direction>>=
+void OptixRenderer::setLightDir(const float dir[3])
+{
+    m_params.lightDir = normalize(make3(dir));
+}
+@* Rendering. Each call adds one sample per pixel. If there is no image or no
+scene there is nothing to trace: an empty scene is painted in a dark gray and
+reports no mesh anywhere.
+
+<<Render one progressive sample>>=
+void OptixRenderer::render()
+{
+    <<Handle an empty image or scene>>
+    <<Launch one sample per pixel>>
+    <<Download the image and the picking ids>>
+}
+@
+<<Handle an empty image or scene>>=
+if (!m_params.width || !m_params.height)
+    return;
+const auto start = std::chrono::steady_clock::now();
+if (!m_params.handle)
+{
+    // Nothing to trace: clear to the background color.
+    std::fill(m_pixels.begin(), m_pixels.end(), make_uchar4(40, 42, 48, 255));
+    std::fill(m_meshIds.begin(), m_meshIds.end(), kNoMesh);
+    return;
+}
+@ The host copy of the launch parameters goes to the device, and the pipeline
+is launched over a two-dimensional grid with one thread per pixel. Both
+operations are queued on the same stream, so the launch sees the new
+parameters; the frame index tells the ray generation program whether to start
+a new sum (frame~0) or add to the existing one.
+
+<<Launch one sample per pixel>>=
+check(cudaMemcpyAsync(reinterpret_cast<void*>(m_paramsBuffer.ptr), &m_params, sizeof(m_params),
+                      cudaMemcpyHostToDevice, m_stream),
+      "upload params");
+check(optixLaunch(m_pipeline, m_stream, m_paramsBuffer.ptr, sizeof(LaunchParams), &m_sbt, m_params.width,
+                  m_params.height, 1),
+      "optixLaunch");
+@ The averaged image comes back after every sample, so the user sees it
+converge. The mesh ids are another story: the first sample shoots its rays
+through the pixel centers and is the only one that writes them, because later
+samples jitter their rays inside the pixel, and a jittered id would flicker
+along the edges of objects. We download them only after that first sample.
+Then we wait for the stream, count the sample, and record how long it took,
+for the status bar.
+
+<<Download the image and the picking ids>>=
+check(cudaMemcpyAsync(m_pixels.data(), reinterpret_cast<void*>(m_colorBuffer.ptr), m_colorBuffer.size,
+                      cudaMemcpyDeviceToHost, m_stream),
+      "download color");
+if (m_params.frameIndex == 0)
+    check(cudaMemcpyAsync(m_meshIds.data(), reinterpret_cast<void*>(m_meshIdBuffer.ptr), m_meshIdBuffer.size,
+                          cudaMemcpyDeviceToHost, m_stream),
+          "download ids");
+check(cudaStreamSynchronize(m_stream), "render");
+++m_params.frameIndex;
+m_lastRenderMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+@ Picking reads the host copy of the ids; coordinates outside the image hit
+nothing.
+
+<<Look up the mesh under a pixel>>=
+unsigned int OptixRenderer::meshIdAt(unsigned int x, unsigned int y) const
+{
+    if (x >= m_params.width || y >= m_params.height)
+        return kNoMesh;
+    return m_meshIds[size_t(y) * m_params.width + x];
+}

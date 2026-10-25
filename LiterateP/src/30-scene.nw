@@ -1,0 +1,1403 @@
+@** The scene. Everything the viewer knows about a USD file passes through
+one object of class [[Scene]]. It has three jobs. First, it opens the stage and
+mirrors its prims into an EnTT \emph{registry}, so that the user interface can
+walk the hierarchy and attach information to any prim. Second, it resolves the
+materials of the scene: it follows UsdShade connections to the inputs of the
+UsdPreviewSurface shader, and loads the textures they name. Third, it
+\emph{flattens} every visible piece of geometry into a few large arrays of
+world-space triangles, which is the only form of geometry the renderer
+understands.
+
+The declarations live in \lpfile{Scene.h} and the code in \lpfile{Scene.cpp}.
+The header is short enough to be read as a table of contents for this part.
+
+<<UsdOptixViewer/src/Scene.h>>=
+<<Headers needed by the scene declarations>>
+
+<<The PrimInfo component>>
+
+<<The Hierarchy component>>
+
+<<The MeshGeometry component>>
+
+<<Texture wrap modes and decoded textures>>
+
+<<The ScalarInput material parameter>>
+
+<<The Material record>>
+
+<<The flattened world-space geometry>>
+
+<<The Scene class>>
+@ The header needs the standard containers, EnTT, and two USD headers: the
+stage itself and the UsdShade material class, which appears in the
+signature of a private member function.
+
+<<Headers needed by the scene declarations>>=
+// A USD stage mirrored into an EnTT registry: one entity per prim, with
+// components describing its place in the hierarchy and its geometry.
+#pragma once
+
+#include <array>
+#include <map>
+#include <string>
+#include <tuple>
+#include <vector>
+
+#include <entt/entt.hpp>
+#include <pxr/usd/usd/stage.h>
+#include <pxr/usd/usdShade/material.h>
+@* Entities and components. EnTT is an \emph{entity--component--system}
+library. An entity is nothing but an integer handle; data are attached to it as
+\emph{components}, plain structures stored in dense arrays, one array per
+component type. We create one entity for every prim of the stage, including the
+invisible pseudo-root ``[[/]]''. This costs little and gives every prim an
+identity that the user interface can store (the current selection is an
+entity) and that other parts of the program can decorate: only the prims that
+produce triangles receive a [[MeshGeometry]] component, so ``is this prim
+drawn?'' is simply ``does this entity have that component?''.
+
+Every entity carries a [[PrimInfo]], which names the prim it stands for. The
+path is the key back into the USD stage; the name and the type name are copied
+because the hierarchy panel shows them for every visible row, every frame.
+
+<<The PrimInfo component>>=
+// ---- components -----------------------------------------------------------
+struct PrimInfo
+{
+    pxr::SdfPath path;
+    std::string  name;
+    std::string  typeName;
+};
+@ The tree structure is stored explicitly. USD can of course enumerate the
+children of a prim, but doing so through the stage on every frame of the user
+interface would be wasteful, and the list would have to be filtered the same
+way every time. A [[Hierarchy]] keeps the parent and the children in USD's
+order. The root's parent is [[entt::null]].
+
+<<The Hierarchy component>>=
+struct Hierarchy
+{
+    entt::entity parent = entt::null;
+    std::vector<entt::entity> children;
+};
+@ A prim that contributed triangles remembers where they went. Its triangles
+occupy a contiguous range of the flattened arrays, from [[firstTriangle]] on;
+[[meshId]] is the small integer that the renderer writes into its picking
+buffer, so that a click on the image can be mapped back to the entity. The
+remaining fields are for the inspector: the index of the material bound to the
+prim, how many GeomSubsets override it, and whether texture coordinates were
+found.
+
+<<The MeshGeometry component>>=
+// Present on prims that contributed triangles to the rendered geometry.
+struct MeshGeometry
+{
+    unsigned int meshId;
+    unsigned int firstTriangle;
+    unsigned int triangleCount;
+    unsigned int material;        // material bound to the prim itself
+    unsigned int subsetMaterials;  // number of GeomSubsets with their own material
+    bool hasUVs;
+};
+@ The [[Scene]] class is small from the outside. A scene is either empty or
+holds one open stage; [[load]] replaces whatever was there. The accessors give
+the user interface the stage, the registry, the root entity, the flattened
+geometry and the list of warnings collected while reading the file. The up
+axis matters to the camera, which must know whether ``up'' is $+y$ or $+z$.
+
+<<The Scene class>>=
+class Scene
+{
+public:
+    <<Public interface of the scene>>
+
+private:
+    <<Private helpers of the scene>>
+
+    <<Data members of the scene>>
+};
+@
+<<Public interface of the scene>>=
+bool load(const std::string& path, std::string& error);
+void clear();
+
+bool loaded() const { return static_cast<bool>(m_stage); }
+const std::string& filePath() const { return m_filePath; }
+const pxr::UsdStageRefPtr& stage() const { return m_stage; }
+entt::registry& registry() { return m_registry; }
+entt::entity root() const { return m_root; }
+const FlatGeometry& geometry() const { return m_geometry; }
+const std::vector<std::string>& warnings() const { return m_warnings; }
+bool zUp() const { return m_zUp; }
+
+pxr::UsdPrim prim(entt::entity e) const;
+@ Besides the registry and the geometry, the scene keeps the time at which
+the stage is sampled, and two caches that we shall explain with the materials:
+a material is converted only once however many prims bind it, and a texture is
+decoded only once however many materials read it.
+
+<<Data members of the scene>>=
+std::string         m_filePath;
+pxr::UsdStageRefPtr m_stage;
+pxr::UsdTimeCode    m_time;
+entt::registry      m_registry;
+entt::entity        m_root = entt::null;
+FlatGeometry        m_geometry;
+std::vector<std::string> m_warnings;
+std::map<pxr::SdfPath, unsigned int> m_materialCache;
+std::map<std::tuple<std::string, bool, int, int>, int> m_textureCache;
+bool                m_zUp = false;
+@ The private member functions do the real work, and each has its own
+sections below.
+
+<<Private helpers of the scene>>=
+entt::entity createEntities(const pxr::UsdPrim& prim, entt::entity parent);
+void extractGeometry();
+unsigned int materialFor(const pxr::UsdShadeMaterial& material);
+unsigned int displayColorMaterial(const pxr::UsdPrim& prim);
+// srgbByDefault: color space when sourceColorSpace is neither "raw" nor "sRGB"
+int loadTexture(const pxr::UsdShadeShader& shader, bool srgbByDefault = true);
+ScalarInput scalarInput(const pxr::UsdShadeShader& surface, const char* name, float fallback);
+void warn(const std::string& message);
+@* The implementation file. \lpfile{Scene.cpp} begins with a number of
+helpers that know nothing about the [[Scene]] class: they turn USD geometry
+into triangles and read values out of shading networks. They live in an
+anonymous namespace. The member functions follow.
+
+<<UsdOptixViewer/src/Scene.cpp>>=
+<<Headers needed by the scene implementation>>
+
+namespace {
+
+<<Local triangle soup of one prim>>
+
+<<Convert a UsdGeomMesh into a local triangle soup>>
+
+<<Close the bookkeeping of a generated primitive>>
+
+<<Generate the triangles of a cube>>
+
+<<Generate the triangles of a sphere>>
+
+<<Read the value of a shader input>>
+
+<<Find the shader that drives an input>>
+
+<<Identify a shader and its wrap modes>>
+
+}  // namespace
+
+<<Open a stage and build the scene>>
+
+<<Forget the current stage>>
+
+<<Collect a warning once>>
+
+<<Find the prim of an entity>>
+
+<<Mirror the prim hierarchy into the registry>>
+
+<<Material for a prim without a bound material>>
+
+<<Convert a UsdShade material into a Material record>>
+
+<<Read a float input that may come from a texture>>
+
+<<Load a texture once>>
+
+<<Flatten the stage into world-space triangles>>
+@ Besides the USD schemas for geometry and shading, we need the asset
+resolver (to read textures, even from inside \lpfile{.usdz} packages) and the
+image decoder. [[PXR_NAMESPACE_USING_DIRECTIVE]] lets us write [[UsdPrim]]
+instead of [[pxr::UsdPrim]] in this file.
+
+<<Headers needed by the scene implementation>>=
+#include "Scene.h"
+
+#include <algorithm>
+#include <cmath>
+
+#include <pxr/base/gf/matrix4d.h>
+#include <pxr/usd/ar/asset.h>
+#include <pxr/usd/ar/resolver.h>
+#include <pxr/usd/usdGeom/cube.h>
+#include <pxr/usd/usdGeom/mesh.h>
+#include <pxr/usd/usdGeom/metrics.h>
+#include <pxr/usd/usdGeom/primvarsAPI.h>
+#include <pxr/usd/usdGeom/sphere.h>
+#include <pxr/usd/usdGeom/subset.h>
+#include <pxr/usd/usdGeom/tokens.h>
+#include <pxr/usd/usdGeom/xformCache.h>
+#include <pxr/usd/usdShade/materialBindingAPI.h>
+#include <pxr/usd/usdShade/utils.h>
+
+#include "third_party/stb_image.h"
+
+PXR_NAMESPACE_USING_DIRECTIVE
+@* Opening a stage. Loading starts from a clean slate. [[UsdStage::Open]]
+composes the file with everything it references; if that fails, the error
+message is returned to the caller, who shows it in a dialog.
+
+Two global properties of the stage are recorded. The up axis is part of the
+stage metadata and defaults to $y$. The time is the start of the authored
+time range if there is one, and USD's \emph{default} time otherwise: the
+viewer shows a single moment, and for an animated file the first frame is the
+natural choice. Then we build the entities and flatten the geometry.
+
+<<Open a stage and build the scene>>=
+bool Scene::load(const std::string& path, std::string& error)
+{
+    clear();
+    UsdStageRefPtr stage = UsdStage::Open(path);
+    if (!stage)
+    {
+        error = "Could not open USD stage: " + path;
+        return false;
+    }
+    m_stage = stage;
+    m_filePath = path;
+    m_zUp = UsdGeomGetStageUpAxis(stage) == UsdGeomTokens->z;
+    m_time = stage->HasAuthoredTimeCodeRange() ? UsdTimeCode(stage->GetStartTimeCode()) : UsdTimeCode::Default();
+    m_root = createEntities(stage->GetPseudoRoot(), entt::null);
+    extractGeometry();
+    return true;
+}
+@ Clearing destroys every entity and empties both caches. Releasing the
+stage pointer closes the stage, unless somebody else still holds it.
+
+<<Forget the current stage>>=
+void Scene::clear()
+{
+    m_registry.clear();
+    m_root = entt::null;
+    m_geometry = FlatGeometry{};
+    m_warnings.clear();
+    m_materialCache.clear();
+    m_textureCache.clear();
+    m_stage = nullptr;
+    m_filePath.clear();
+}
+@ Problems found while reading a file are not errors: an unsupported shader
+or a missing texture should not prevent us from showing the rest of the scene.
+They are collected as warnings, which the inspector lists. A large scene can
+produce the same complaint for hundreds of prims, so each distinct message is
+kept only once.
+
+<<Collect a warning once>>=
+void Scene::warn(const std::string& message)
+{
+    if (std::find(m_warnings.begin(), m_warnings.end(), message) == m_warnings.end())
+        m_warnings.push_back(message);
+}
+@ Going from an entity back to its prim is a path lookup on the stage. An
+invalid entity (for instance [[entt::null]], meaning ``nothing selected'')
+yields an invalid prim, which callers test with [[if (prim)]].
+
+<<Find the prim of an entity>>=
+UsdPrim Scene::prim(entt::entity e) const
+{
+    if (!m_stage || !m_registry.valid(e))
+        return {};
+    return m_stage->GetPrimAtPath(m_registry.get<PrimInfo>(e).path);
+}
+@ The hierarchy is copied by a recursive walk. Each entity gets its
+[[PrimInfo]] before its children are visited, so the entities are created in
+depth-first preorder, and its [[Hierarchy]] after, when the children's handles
+are known.
+
+The predicate [[UsdTraverseInstanceProxies]] deserves a word. USD shares the
+contents of \emph{instanceable} prims: all instances of a model point to a
+single hidden \emph{prototype}, and by default the children of an instance are
+not visible at all. With this predicate, the walk descends into every instance
+and yields \emph{instance proxies}, read-only stand-ins for the prototype's
+prims at the instance's location. Each instance therefore gets its own
+entities, its own row in the tree and, later, its own copy of the triangles.
+That is wasteful for scenes with thousands of instances, but it keeps the
+renderer simple: there is just one bag of triangles.
+
+<<Mirror the prim hierarchy into the registry>>=
+entt::entity Scene::createEntities(const UsdPrim& prim, entt::entity parent)
+{
+    const entt::entity e = m_registry.create();
+    m_registry.emplace<PrimInfo>(e, prim.GetPath(), prim.IsPseudoRoot() ? std::string("/") : prim.GetName().GetString(),
+                                 prim.GetTypeName().GetString());
+    Hierarchy hierarchy{parent, {}};
+    for (const UsdPrim& child : prim.GetFilteredChildren(UsdTraverseInstanceProxies()))
+        hierarchy.children.push_back(createEntities(child, e));
+    m_registry.emplace<Hierarchy>(e, std::move(hierarchy));
+    return e;
+}
+@* The flattened geometry. The renderer builds a single acceleration
+structure over all the triangles of the scene, already placed in world space.
+[[FlatGeometry]] is that soup, together with everything a hit point needs in
+order to be shaded. Positions are shared between the triangles of one prim and
+addressed by [[indices]]; all the other arrays are \emph{per triangle}, so that
+the GPU, which learns only the index of the triangle that was hit, can find
+its mesh, its material, the texture coordinates of its three corners and the
+shading normals of its three corners. A zero normal means ``no shading normal;
+use the flat normal of the triangle''. Materials and textures are kept in
+arrays and referred to by index. Finally, [[meshEntity]] maps a [[meshId]] back
+to its entity, and the bounds let the camera frame the whole scene.
+
+<<The flattened world-space geometry>>=
+// Geometry flattened to world space, ready to upload to the renderer.
+struct FlatGeometry
+{
+    std::vector<float>        vertices;     // xyz
+    std::vector<unsigned int> indices;      // 3 per triangle
+    std::vector<unsigned int> triMesh;      // mesh id per triangle
+    std::vector<unsigned int> triMaterial;  // material per triangle
+    std::vector<float>        triUVs;       // 6 per triangle (st of each corner)
+    std::vector<float>        triNormals;   // 9 per triangle (shading normal of each corner, 0 = flat)
+    std::vector<Material>     materials;
+    std::vector<Texture>      textures;
+    std::vector<entt::entity> meshEntity;   // entity of each mesh id
+    float boundsMin[3] = {0, 0, 0};
+    float boundsMax[3] = {0, 0, 0};
+
+    bool empty() const { return indices.empty(); }
+};
+@ Flattening is one pass over the entities. For each prim that should be
+drawn we produce its triangles in local space, decide the material of each
+face, read its texture coordinates, transform it to world space and append it
+to the arrays. Each of these steps gets a section of its own.
+
+<<Flatten the stage into world-space triangles>>=
+// ---- geometry ---------------------------------------------------------------
+void Scene::extractGeometry()
+{
+    <<Prepare the flattening of the stage>>
+
+    for (auto [e, info] : m_registry.view<PrimInfo>().each())
+    {
+        <<Skip prims that are not visible renderable geometry>>
+
+        <<Triangulate a prim in its local space>>
+
+        <<Assign a material to every face of a prim>>
+
+        <<Read the texture coordinates of a prim>>
+
+        <<Transform the points of a prim to world space>>
+
+        <<Append the triangles of a prim to the flat geometry>>
+
+        <<Warn about textured prims without texture coordinates>>
+    }
+
+    <<Record the bounds of the scene>>
+}
+@ A [[UsdGeomXformCache]] computes local-to-world matrices and remembers the
+matrices of ancestors, so that siblings deep in the tree do not recompute the
+same chain of transforms. The bounds start empty, at $+\infty$ and $-\infty$.
+
+<<Prepare the flattening of the stage>>=
+UsdGeomXformCache xformCache(m_time);
+FlatGeometry& g = m_geometry;
+float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+@ Only \emph{gprims}, the geometric primitives of UsdGeom, can be drawn.
+Visibility is inherited, so we ask USD to \emph{compute} it rather than read
+the prim's own attribute: a mesh under an invisible transform is invisible.
+The \emph{purpose} works the same way; we draw what a final render would draw
+(purpose [[default]] or [[render]]) and skip the [[proxy]] and [[guide]]
+geometry that applications use for previews and manipulators.
+
+<<Skip prims that are not visible renderable geometry>>=
+const UsdPrim p = m_stage->GetPrimAtPath(info.path);
+if (!p || !p.IsA<UsdGeomGprim>())
+    continue;
+const UsdGeomImageable imageable(p);
+const TfToken purpose = imageable.ComputePurpose();
+if (imageable.ComputeVisibility(m_time) == UsdGeomTokens->invisible ||
+    (purpose != UsdGeomTokens->default_ && purpose != UsdGeomTokens->render))
+    continue;
+@* From prims to triangles. Three kinds of gprims are supported: polygonal
+meshes, and the implicit cube and sphere. Each is converted into a
+[[LocalMesh]], a triangle soup in the prim's own coordinate system. The other
+gprims (cylinders, cones, capsules, curves, points) produce no triangles and
+are skipped. The default sizes are USD's: a cube of edge~2 and a sphere of
+radius~1.
+
+<<Triangulate a prim in its local space>>=
+LocalMesh local;
+if (p.IsA<UsdGeomMesh>())
+    meshFromUsdMesh(UsdGeomMesh(p), m_time, local);
+else if (p.IsA<UsdGeomCube>())
+{
+    double size = 2.0;
+    UsdGeomCube(p).GetSizeAttr().Get(&size, m_time);
+    meshFromCube(size, local);
+}
+else if (p.IsA<UsdGeomSphere>())
+{
+    double radius = 1.0;
+    UsdGeomSphere(p).GetRadiusAttr().Get(&radius, m_time);
+    meshFromSphere(radius, local);
+}
+if (local.indices.empty())
+    continue;
+@ A triangle soup must remember more than three point indices per triangle.
+USD attaches data to meshes at different rates, called \emph{interpolations}:
+once per point ([[vertex]] or [[varying]]), once per face ([[uniform]]), once
+per corner of each face ([[faceVarying]]), or once for the whole mesh
+([[constant]]). To fetch the right value for each corner of each triangle
+later, we keep, besides the point index, the \emph{face-vertex} index of the
+corner (its position in USD's [[faceVertexIndices]] array) and the index of
+the face the triangle came from. The face index also serves GeomSubsets, which
+assign materials to sets of faces. The shading normals, when there are any,
+are resolved per corner right away.
+
+<<Local triangle soup of one prim>>=
+// Local-space triangle soup produced for one prim.
+struct LocalMesh
+{
+    std::vector<GfVec3f> points;
+    std::vector<unsigned int> indices;     // 3 point indices per triangle
+    std::vector<unsigned int> cornerFv;    // 3 face-vertex indices per triangle
+    std::vector<unsigned int> faceOfTri;   // source face of each triangle
+    std::vector<GfVec3f> cornerNormals;    // 3 shading normals per triangle, empty = flat
+    size_t faceCount = 1;
+};
+@ A [[UsdGeomMesh]] describes polygons by three arrays: the points, the
+number of vertices of each face, and the concatenated vertex indices of all
+faces. Converting it takes four steps.
+
+<<Convert a UsdGeomMesh into a local triangle soup>>=
+bool meshFromUsdMesh(const UsdGeomMesh& mesh, UsdTimeCode time, LocalMesh& out)
+{
+    <<Read the points and the face topology of a mesh>>
+
+    <<Fan-triangulate the faces of a mesh>>
+
+    <<Rewind the triangles of a left-handed mesh>>
+
+    <<Compute the shading normals of each triangle corner>>
+    return true;
+}
+@ A mesh lacking any of the three arrays has nothing to draw.
+
+<<Read the points and the face topology of a mesh>>=
+VtArray<GfVec3f> points;
+VtArray<int> counts, faceIndices;
+if (!mesh.GetPointsAttr().Get(&points, time) || !mesh.GetFaceVertexCountsAttr().Get(&counts, time) ||
+    !mesh.GetFaceVertexIndicesAttr().Get(&faceIndices, time))
+    return false;
+@ A face with $n$ vertices $v_0,\ldots,v_{n-1}$ becomes the $n-2$ triangles
+$(v_0, v_k, v_{k+1})$ for $1\le k\le n-2$, a \emph{fan} around the first
+vertex. This is exact for triangles and for convex polygons, which is what
+real assets contain almost exclusively; a concave polygon may come out wrong,
+and we accept that. The variable [[offset]] is the face-vertex index of the
+face's first corner, so [[c0]], [[c1]] and [[c2]] are the face-vertex indices of
+the triangle's corners.
+
+Files are not always well formed, and a bad index would make the GPU read
+outside its buffers. A negative or excessive vertex count ends the conversion;
+a triangle that names a nonexistent point is dropped.
+
+<<Fan-triangulate the faces of a mesh>>=
+out.points.assign(points.begin(), points.end());
+out.faceCount = counts.size();
+size_t offset = 0;
+for (size_t face = 0; face < counts.size(); ++face)
+{
+    const int count = counts[face];
+    if (count < 0 || offset + count > faceIndices.size())
+        break;
+    for (int k = 1; k + 1 < count; ++k)  // fan triangulation
+    {
+        const size_t c0 = offset, c1 = offset + k, c2 = offset + k + 1;
+        const int i0 = faceIndices[c0], i1 = faceIndices[c1], i2 = faceIndices[c2];
+        if (i0 < 0 || i1 < 0 || i2 < 0 || size_t(std::max({i0, i1, i2})) >= points.size())
+            continue;
+        out.indices.insert(out.indices.end(), {unsigned(i0), unsigned(i1), unsigned(i2)});
+        out.cornerFv.insert(out.cornerFv.end(), {unsigned(c0), unsigned(c1), unsigned(c2)});
+        out.faceOfTri.push_back(unsigned(face));
+    }
+    offset += count;
+}
+@ USD meshes are right-handed by default: seen from the outside, the
+vertices of a face go counter-clockwise, and the cross product of two edges,
+$(p_1-p_0)\times(p_2-p_0)$, points outward. A mesh may declare itself
+[[leftHanded]], with the opposite winding. The renderer relies on the
+cross product to know which side of a triangle faces out (it needs this for
+the normal-map frame and to orient shading normals), so we normalize the
+winding here, once: swapping two corners of each triangle reverses it. The
+face-vertex indices are swapped along, so that each corner keeps its own
+texture coordinates and normals.
+
+<<Rewind the triangles of a left-handed mesh>>=
+// Make every triangle counter-clockwise when seen from outside, so the
+// renderer can derive the outward normal (and the normal-map frame) from it.
+TfToken orientation;
+if (mesh.GetOrientationAttr().Get(&orientation) && orientation == UsdGeomTokens->leftHanded)
+    for (size_t t = 0; t < out.indices.size(); t += 3)
+    {
+        std::swap(out.indices[t + 1], out.indices[t + 2]);
+        std::swap(out.cornerFv[t + 1], out.cornerFv[t + 2]);
+    }
+@ Shading normals. A glossy highlight on a sphere made of flat facets shows
+every facet, so we interpolate \emph{shading normals} across triangles when
+the mesh is meant to look smooth. The rules follow what Pixar's Hydra renderers
+do. Normals authored in the file win. Otherwise the subdivision scheme decides:
+USD's default scheme is Catmull--Clark, meaning ``this cage describes a smooth
+surface'', and we approximate that surface by smoothing the normals of the
+unrefined cage; a mesh with [[subdivisionScheme = "none"]] is a true polygonal
+mesh and is shaded flat. (The test scenes of this repository mark their boxes
+and walls [[none]] for exactly this reason: with the default scheme a cube
+shades like a rounded blob, which is correct USD behavior.)
+
+<<Compute the shading normals of each triangle corner>>=
+// Shading normals: authored primvars:normals or normals, otherwise smooth
+// vertex normals for subdivision surfaces (as Hydra does) and flat for
+// polygonal meshes.
+<<Find the authored normals of a mesh>>
+<<Compute smooth normals for a subdivision surface>>
+<<Pick the shading normal of each triangle corner>>
+@ Normals may be authored in two places. The primvar
+\texttt{primvars:normals} takes precedence over the older [[normals]]
+attribute, as the UsdGeom documentation prescribes. [[ComputeFlattened]]
+expands an \emph{indexed} primvar (values plus an index array) into one value
+per element, so we never deal with the indices ourselves.
+
+<<Find the authored normals of a mesh>>=
+VtArray<GfVec3f> normals;
+TfToken interpolation;
+if (const UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(mesh).GetPrimvar(UsdGeomTokens->normals);
+    pv && pv.ComputeFlattened(&normals, time))
+    interpolation = pv.GetInterpolation();
+else if (mesh.GetNormalsAttr().Get(&normals, time))
+    interpolation = mesh.GetNormalsInterpolation();
+@ Smooth normals are accumulated per point. The cross product of two edges of
+a triangle has length twice its area, so summing the unnormalized cross
+products weights each triangle by its area: large faces dominate, and a sliver
+triangle does not tilt the normal. Since the triangles were rewound in the
+previous step, all the cross products point outward. The sums are normalized
+later, after the transformation to world space.
+
+<<Compute smooth normals for a subdivision surface>>=
+TfToken scheme;
+mesh.GetSubdivisionSchemeAttr().Get(&scheme);
+if (normals.empty() && scheme != UsdGeomTokens->none)
+{
+    normals.assign(points.size(), GfVec3f(0.0f));
+    for (size_t t = 0; t < out.indices.size(); t += 3)
+    {
+        const unsigned i0 = out.indices[t], i1 = out.indices[t + 1], i2 = out.indices[t + 2];
+        const GfVec3f n = GfCross(points[i1] - points[i0], points[i2] - points[i0]);  // area weighted
+        normals[i0] += n;
+        normals[i1] += n;
+        normals[i2] += n;
+    }
+    interpolation = UsdGeomTokens->vertex;
+}
+@ Finally each corner looks up its normal according to the interpolation:
+by face-vertex index, by point index, or by face. A [[constant]] normal falls
+through all the tests and uses element~0. An index beyond the array, which only
+a malformed file produces, gives the zero vector, which the renderer treats as
+``flat''. When there are no normals at all, [[cornerNormals]] stays empty and
+the whole mesh is shaded flat.
+
+<<Pick the shading normal of each triangle corner>>=
+if (!normals.empty())
+    for (size_t t = 0; t < out.indices.size(); t += 3)
+        for (size_t c = 0; c < 3; ++c)
+        {
+            size_t i = 0;
+            if (interpolation == UsdGeomTokens->faceVarying)
+                i = out.cornerFv[t + c];
+            else if (interpolation == UsdGeomTokens->vertex || interpolation == UsdGeomTokens->varying)
+                i = out.indices[t + c];
+            else if (interpolation == UsdGeomTokens->uniform)
+                i = out.faceOfTri[t / 3];
+            out.cornerNormals.push_back(i < normals.size() ? normals[i] : GfVec3f(0.0f));
+        }
+@ Implicit primitives. The cube and the sphere have no faces in USD's sense,
+so after generating their triangles we fill in the bookkeeping: each corner's
+``face-vertex'' index is simply its point index, and the whole primitive counts
+as a single face, number~0. (These primitives carry no texture coordinates,
+so the choice only has to be consistent.)
+
+<<Close the bookkeeping of a generated primitive>>=
+void finishPrimitive(LocalMesh& out)
+{
+    out.cornerFv = out.indices;
+    out.faceOfTri.assign(out.indices.size() / 3, 0u);
+}
+@ The eight corners of a cube centered at the origin are numbered by three
+bits: bit~0 selects $\pm x$, bit~1 $\pm y$ and bit~2 $\pm z$. The twelve
+triangles, two per side, are listed so that each is counter-clockwise when
+seen from outside; for instance $(0,2,1)$ lies on the $-z$ side, and
+$(p_2-p_0)\times(p_1-p_0)$ is a positive multiple of $(0,1,0)\times(1,0,0)=
+(0,0,-1)$, the outward direction. A cube has no shading normals: it is meant to
+be flat.
+
+<<Generate the triangles of a cube>>=
+void meshFromCube(double size, LocalMesh& out)
+{
+    const float h = float(size) * 0.5f;
+    for (int i = 0; i < 8; ++i)
+        out.points.emplace_back(i & 1 ? h : -h, i & 2 ? h : -h, i & 4 ? h : -h);
+    out.indices = {0, 2, 1, 1, 2, 3, 4, 5, 6, 5, 7, 6, 0, 1, 4, 1, 5, 4,
+                   2, 6, 3, 3, 6, 7, 0, 4, 2, 2, 4, 6, 1, 3, 5, 3, 7, 5};
+    finishPrimitive(out);
+}
+@ The sphere is a latitude--longitude grid: 24 stacks from the north pole
+($\phi=0$, on the $+y$ axis) to the south pole ($\phi=\pi$), and 48 slices
+around. A point is
+$$r\,(\sin\phi\cos\theta,\ \cos\phi,\ \sin\phi\sin\theta).$$
+Each grid cell, with corners $a$ and $a+1$ on one stack and $b$ and $b+1$ on
+the next, becomes two triangles. The order $(a, a+1, b)$ is the outward one:
+near the equator at $\theta=0$, the edge from $a$ to $a+1$ runs toward $+z$
+and the edge from $a$ to $b$ runs toward $-y$, and $(0,0,1)\times(0,-1,0) =
+(1,0,0)$ points away from the center. (An earlier version had the opposite
+order, which went unnoticed while the shading was two-sided and flat; it
+became visible as soon as shading normals had to agree with the winding.)
+
+On a sphere centered at the origin the normal at a point is the point itself,
+scaled; we store the points as normals and let the world-space step normalize
+them. Every corner thus gets an exact, smooth normal.
+
+<<Generate the triangles of a sphere>>=
+void meshFromSphere(double radius, LocalMesh& out)
+{
+    const int slices = 48, stacks = 24;
+    for (int j = 0; j <= stacks; ++j)
+    {
+        const double phi = M_PI * j / stacks;
+        for (int i = 0; i <= slices; ++i)
+        {
+            const double theta = 2.0 * M_PI * i / slices;
+            out.points.emplace_back(float(radius * std::sin(phi) * std::cos(theta)), float(radius * std::cos(phi)),
+                                    float(radius * std::sin(phi) * std::sin(theta)));
+        }
+    }
+    for (int j = 0; j < stacks; ++j)
+        for (int i = 0; i < slices; ++i)
+        {
+            const unsigned a = j * (slices + 1) + i, b = a + slices + 1;
+            out.indices.insert(out.indices.end(), {a, a + 1, b, a + 1, b + 1, b});  // counter-clockwise from outside
+        }
+    finishPrimitive(out);
+    for (unsigned idx : out.indices)
+        out.cornerNormals.push_back(out.points[idx]);  // normalized later
+}
+@* Materials. The viewer understands a subset of \emph{UsdPreviewSurface},
+the simple physically based material that every USD tool can read. A material
+in USD is a small graph: a [[Material]] prim whose surface output is connected
+to a [[UsdPreviewSurface]] shader, whose inputs are either values or
+connections to other shaders, typically [[UsdUVTexture]] nodes, which in turn
+read their texture coordinates from [[UsdPrimvarReader_float2]] nodes. We
+condense such a graph into a flat [[Material]] record that the GPU can read
+without following any pointers.
+
+The first kind of record field is used for decoded images. A [[Texture]] holds
+eight-bit RGBA pixels, whether they should be converted from sRGB to linear
+values when sampled, and what happens outside the unit square of texture
+coordinates in each direction. USD's [[UsdUVTexture]] offers repeat, mirror,
+clamp and black, which map directly to CUDA's address modes.
+
+<<Texture wrap modes and decoded textures>>=
+// ---- render data ----------------------------------------------------------
+enum class TextureWrap { Repeat, Mirror, Clamp, Black };
+
+struct Texture
+{
+    std::string path;  // resolved path (may point inside a .usdz)
+    int width = 0, height = 0;
+    std::vector<unsigned char> rgba;
+    bool srgb = true;
+    TextureWrap wrapS = TextureWrap::Repeat, wrapT = TextureWrap::Repeat;
+};
+@ Several inputs of UsdPreviewSurface, such as roughness and metallic, are
+single numbers that may instead come from one channel of a texture. Packing
+several such maps into the channels of one image is common practice, so we
+record which channel to read, and that channel's scale and bias from the
+[[UsdUVTexture]] node, which maps the texel $t$ to $t\cdot\mathit{scale}+
+\mathit{bias}$.
+
+<<The ScalarInput material parameter>>=
+// A float material input: a constant, or one channel of a texture
+// (texture[channel] * scale + bias).
+struct ScalarInput
+{
+    float value = 0.0f;
+    int texture = -1;
+    int channel = 0;
+    float scale = 1.0f, bias = 0.0f;
+};
+@ The [[Material]] record. Texture fields are indices into
+[[FlatGeometry::textures]], with $-1$ for ``none''.
+
+<<The Material record>>=
+// Simplified UsdPreviewSurface: diffuse color, optionally from a texture
+// (texture * scale + bias), tangent-space normal maps, alpha cutouts
+// (opacity + opacityThreshold) and GGX specular in the metallic or the
+// specular workflow.
+struct Material
+{
+    <<Diffuse, cutout and normal-map fields of a material>>
+
+    <<Specular fields of a material>>
+
+    <<Test whether a material reads any texture>>
+};
+@ The name is for the inspector. The diffuse color defaults to a light gray,
+which is what a prim without any material or display color looks like. The
+texture coordinates are read from the primvar named by [[uvSet]], almost
+always [[st]]. A cutout discards hits where one channel of a texture, usually
+alpha, falls below a threshold. The defaults of the normal-map remapping,
+$2t-1$, turn the usual eight-bit encoding of a unit vector, with components
+in $[0,1]$, back into components in $[-1,1]$.
+
+<<Diffuse, cutout and normal-map fields of a material>>=
+std::string name;  // material prim path, or "displayColor"
+std::array<float, 3> color = {0.7f, 0.7f, 0.7f};
+int texture = -1;
+std::array<float, 4> scale = {1, 1, 1, 1};
+std::array<float, 4> bias = {0, 0, 0, 0};
+std::string uvSet = "st";  // primvar read by the texture
+// alpha cutout: hits where opacityTexture[opacityChannel] < opacityThreshold are ignored
+int opacityTexture = -1;
+int opacityChannel = 3;
+float opacityThreshold = 0.0f;
+// tangent-space normal = normalTexture * normalScale + normalBias
+int normalTexture = -1;
+std::array<float, 4> normalScale = {2, 2, 2, 1};
+std::array<float, 4> normalBias = {-1, -1, -1, 0};
+@ UsdPreviewSurface has two ways of describing the specular reflection. In
+the default \emph{metallic workflow}, a metallic factor blends between a
+dielectric, whose reflectance at normal incidence follows from the index of
+refraction, and a metal, which reflects with its diffuse color. In the
+\emph{specular workflow} the reflectance at normal incidence is given directly
+as a color. The defaults are those of the specification: roughness~0.5,
+metallic~0, index of refraction~1.5.
+
+<<Specular fields of a material>>=
+ScalarInput roughness{0.5f};
+ScalarInput metallic{0.0f};
+float ior = 1.5f;
+// useSpecularWorkflow: specularColor replaces metallic as the reflectance at normal incidence
+bool specularWorkflow = false;
+std::array<float, 3> specularColor = {0, 0, 0};
+int specularTexture = -1;
+std::array<float, 4> specularScale = {1, 1, 1, 1};
+std::array<float, 4> specularBias = {0, 0, 0, 0};
+@ A material that reads any texture needs texture coordinates. This question
+is asked when choosing which primvar to read and when deciding whether to warn
+about missing coordinates.
+
+<<Test whether a material reads any texture>>=
+bool usesTextures() const
+{
+    return texture >= 0 || opacityTexture >= 0 || normalTexture >= 0 || roughness.texture >= 0 ||
+           metallic.texture >= 0 || specularTexture >= 0;
+}
+@ Reading shading networks. UsdShade connections can be indirect: a shader
+input may be connected to an input of the enclosing [[Material]] (its
+\emph{interface}), which may in turn be connected to something else, possibly
+through node graphs. [[GetValueProducingAttributes]] follows such chains to
+their ends and returns the attributes that actually produce the value: either
+outputs of shaders, or inputs that hold a value. We want a plain value, so we
+accept only the latter. This is how a texture whose file name is published on
+the material's interface, as in our test scene, still finds its file.
+
+The function is a template because inputs come in many types: colors, floats,
+integers, tokens, asset paths. When the input exists but holds a value of
+another type, [[Get]] fails and so do we, and the caller keeps its default.
+
+<<Read the value of a shader input>>=
+// Value of a shader input, following connections to material interface
+// inputs. Returns false when the input is unset or driven by another shader.
+template <typename T>
+bool inputValue(const UsdShadeShader& shader, const char* name, T* value)
+{
+    const UsdShadeInput input = shader.GetInput(TfToken(name));
+    if (!input)
+        return false;
+    for (const UsdAttribute& attr : input.GetValueProducingAttributes())
+        if (UsdShadeUtils::GetType(attr.GetName()) == UsdShadeAttributeType::Input && attr.Get(value))
+            return true;
+    return false;
+}
+@ The other question to ask of an input is ``which shader drives it?''. With
+[[shaderOutputsOnly]] set, the same function returns only shader outputs; we
+take the first. Callers sometimes need the output itself, because its name
+([[outputs:rgb]], [[outputs:r]], \ldots) says which channels are used, and
+sometimes only the shader.
+
+<<Find the shader that drives an input>>=
+// Shader output that drives the given input (through node graphs), if any.
+UsdAttribute sourceOutput(const UsdShadeInput& input)
+{
+    if (input)
+        for (const UsdAttribute& attr : input.GetValueProducingAttributes(/*shaderOutputsOnly=*/true))
+            return attr;
+    return UsdAttribute();
+}
+
+UsdShadeShader sourceShader(const UsdShadeInput& input)
+{
+    const UsdAttribute output = sourceOutput(input);
+    return output ? UsdShadeShader(output.GetPrim()) : UsdShadeShader();
+}
+@ A shader's kind is its [[info:id]], such as [[UsdUVTexture]]. The wrap mode
+[[useMetadata]], USD's default, asks to use whatever the image file says; the
+formats we decode carry no such metadata, so it is treated as [[repeat]], like
+anything unrecognized.
+
+<<Identify a shader and its wrap modes>>=
+TfToken shaderId(const UsdShadeShader& shader)
+{
+    TfToken id;
+    shader.GetShaderId(&id);
+    return id;
+}
+
+TextureWrap wrapMode(const UsdShadeShader& shader, const char* name)
+{
+    TfToken mode;
+    inputValue(shader, name, &mode);
+    if (mode == "mirror")
+        return TextureWrap::Mirror;
+    if (mode == "clamp")
+        return TextureWrap::Clamp;
+    if (mode == "black")
+        return TextureWrap::Black;
+    return TextureWrap::Repeat;  // "repeat" and "useMetadata"
+}
+@ A prim without a bound material is drawn with its \emph{display color}, a
+primvar that every gprim may carry, and with all other properties at their
+defaults. Display colors differ from prim to prim, so these materials are not
+cached; each such prim gets its own record. A display color may vary over the
+surface; we use its first value only.
+
+<<Material for a prim without a bound material>>=
+// ---- materials and textures -------------------------------------------------
+unsigned int Scene::displayColorMaterial(const UsdPrim& prim)
+{
+    Material m;
+    m.name = "displayColor";
+    VtArray<GfVec3f> colors;
+    if (UsdGeomGprim(prim).GetDisplayColorPrimvar().ComputeFlattened(&colors, m_time) && !colors.empty())
+        m.color = {colors[0][0], colors[0][1], colors[0][2]};
+    m_geometry.materials.push_back(m);
+    return unsigned(m_geometry.materials.size() - 1);
+}
+@ Converting a UsdShade material proceeds input by input.
+[[ComputeSurfaceSource]] finds the shader connected to the material's surface
+output. A material without one keeps the defaults; one with a surface shader
+has its inputs read one group at a time.
+
+<<Convert a UsdShade material into a Material record>>=
+unsigned int Scene::materialFor(const UsdShadeMaterial& material)
+{
+    <<Return the cached Material of a UsdShade material>>
+
+    <<Start a Material with the UsdPreviewSurface defaults>>
+    if (const UsdShadeShader surface = material.ComputeSurfaceSource())
+    {
+        <<Read the diffuse color of a surface>>
+
+        <<Read the diffuse texture of a surface>>
+
+        <<Read an alpha cutout of a surface>>
+
+        <<Read the specular parameters of a surface>>
+
+        <<Read the normal map of a surface>>
+    }
+    <<Store a new Material in the cache>>
+}
+@ Many prims usually share a material, so the conversion is cached by the
+path of the material prim.
+
+<<Return the cached Material of a UsdShade material>>=
+const SdfPath path = material.GetPath();
+if (auto it = m_materialCache.find(path); it != m_materialCache.end())
+    return it->second;
+@ A material that does bind but specifies nothing is a UsdPreviewSurface
+with all inputs at their defaults, and the default diffuse color of the
+specification is a dark gray, $0.18$.
+
+<<Start a Material with the UsdPreviewSurface defaults>>=
+Material m;
+m.name = path.GetString();
+m.color = {0.18f, 0.18f, 0.18f};  // UsdPreviewSurface default
+@
+<<Store a new Material in the cache>>=
+m_geometry.materials.push_back(m);
+const unsigned index = unsigned(m_geometry.materials.size() - 1);
+m_materialCache[path] = index;
+return index;
+@ The diffuse color. A plain value, possibly published on the material's
+interface, is the easy case. But an input can carry both a value and a
+connection: many exporters write the color that a texture would average to
+next to the connection to the texture. [[inputValue]] does not return that
+value, because the connection wins, so we read the attribute's own value
+separately. It becomes the color used if the texture cannot be loaded. This
+matters in practice: before textures were supported, it was the reason a
+textured model looked plausible but plain.
+
+<<Read the diffuse color of a surface>>=
+GfVec3f c;
+if (inputValue(surface, "diffuseColor", &c))
+    m.color = {c[0], c[1], c[2]};
+else if (const UsdShadeInput in = surface.GetInput(TfToken("diffuseColor")); in && in.GetAttr().Get(&c))
+    m.color = {c[0], c[1], c[2]};  // authored default beside a connection
+@ If [[diffuseColor]] is driven by a [[UsdUVTexture]], the record points to
+the decoded image, and the texture's coordinates tell us which primvar to
+read. Any other kind of shader (a procedural, or a MaterialX node) is beyond
+us, and we say so.
+
+<<Read the diffuse texture of a surface>>=
+const UsdShadeShader texture = sourceShader(surface.GetInput(TfToken("diffuseColor")));
+if (texture && shaderId(texture) == "UsdUVTexture")
+{
+    <<Read the scale, bias and fallback of the diffuse texture>>
+
+    <<Find the primvar that holds the diffuse texture coordinates>>
+}
+else if (texture)
+    warn("Unsupported shader driving diffuseColor: " + shaderId(texture).GetString() + " (" + m.name + ")");
+@ The texture node's own [[fallback]] value, meant for when the image is
+missing, takes precedence over the color found above. Diffuse textures are
+decoded as sRGB unless the node says otherwise, which is what nearly every
+color image is.
+
+<<Read the scale, bias and fallback of the diffuse texture>>=
+GfVec4f v;
+if (inputValue(texture, "scale", &v))
+    m.scale = {v[0], v[1], v[2], v[3]};
+if (inputValue(texture, "bias", &v))
+    m.bias = {v[0], v[1], v[2], v[3]};
+if (inputValue(texture, "fallback", &v))
+    m.color = {v[0], v[1], v[2]};
+m.texture = loadTexture(texture);
+@ The [[st]] input of the texture is normally connected to a primvar reader,
+whose [[varname]] names the primvar. The specification says [[varname]] is a
+string, but older files, and some current exporters, write a token; we accept
+both. A [[UsdTransform2d]] node between the reader and the texture would
+scale, rotate or offset the coordinates; we do not implement it, and the
+coordinates are then read, untransformed, from the default primvar [[st]].
+
+<<Find the primvar that holds the diffuse texture coordinates>>=
+// texture coordinates come from a UsdPrimvarReader_float2
+const UsdShadeShader reader = sourceShader(texture.GetInput(TfToken("st")));
+VtValue varname;
+if (reader && shaderId(reader) == "UsdTransform2d")
+    warn("UsdTransform2d texture transforms are ignored (" + m.name + ")");
+else if (reader && inputValue(reader, "varname", &varname))
+{
+    if (varname.IsHolding<TfToken>())
+        m.uvSet = varname.UncheckedGet<TfToken>().GetString();
+    else if (varname.IsHolding<std::string>())
+        m.uvSet = varname.UncheckedGet<std::string>();
+}
+@ Alpha cutouts. UsdPreviewSurface treats opacity in two ways. With an
+[[opacityThreshold]] greater than zero, a point is either fully present (opacity
+at or above the threshold) or fully absent: this is how leaves, fences and
+grass blades are cut out of simple quads. With a zero threshold, opacity means
+partial transparency, which a ray tracer could do but this one does not; such
+materials are drawn opaque, with a warning. Only an opacity that comes from a
+texture can cut anything out, so a constant opacity is ignored. The channel is
+named by the texture output the input is connected to: [[outputs:a]] for alpha,
+or one of the color channels.
+
+<<Read an alpha cutout of a surface>>=
+// alpha cutout from a texture channel (translucency is not supported)
+float threshold = 0.0f;
+inputValue(surface, "opacityThreshold", &threshold);
+const UsdAttribute opacity = sourceOutput(surface.GetInput(TfToken("opacity")));
+if (opacity && shaderId(UsdShadeShader(opacity.GetPrim())) == "UsdUVTexture")
+{
+    if (threshold > 0.0f)
+    {
+        const std::string channel = UsdShadeUtils::GetBaseNameAndType(opacity.GetName()).first.GetString();
+        m.opacityTexture = loadTexture(UsdShadeShader(opacity.GetPrim()));
+        m.opacityChannel = channel == "r" ? 0 : channel == "g" ? 1 : channel == "b" ? 2 : 3;
+        m.opacityThreshold = threshold;
+    }
+    else
+        warn("Translucent materials are rendered opaque (" + m.name + ")");
+}
+@ The specular parameters. Roughness and metallic are read by
+<<Read a float input that may come from a texture>>, the index of refraction
+is a plain number, and [[useSpecularWorkflow]] is an integer flag. In the
+specular workflow the [[specularColor]] may be a constant or a color texture,
+with the texture's scale and bias.
+
+<<Read the specular parameters of a surface>>=
+// specular: metallic or specular workflow
+m.roughness = scalarInput(surface, "roughness", 0.5f);
+m.metallic = scalarInput(surface, "metallic", 0.0f);
+inputValue(surface, "ior", &m.ior);
+int useSpecularWorkflow = 0;
+inputValue(surface, "useSpecularWorkflow", &useSpecularWorkflow);
+m.specularWorkflow = useSpecularWorkflow != 0;
+if (m.specularWorkflow)
+{
+    GfVec3f c;
+    if (inputValue(surface, "specularColor", &c))
+        m.specularColor = {c[0], c[1], c[2]};
+    const UsdShadeShader specular = sourceShader(surface.GetInput(TfToken("specularColor")));
+    if (specular && shaderId(specular) == "UsdUVTexture")
+    {
+        m.specularTexture = loadTexture(specular);
+        GfVec4f v;
+        if (inputValue(specular, "scale", &v))
+            m.specularScale = {v[0], v[1], v[2], v[3]};
+        if (inputValue(specular, "bias", &v))
+            m.specularBias = {v[0], v[1], v[2], v[3]};
+    }
+}
+@ Normal maps. A tangent-space normal map stores, in each texel, a direction
+relative to the surface: $x$ along the direction of increasing $s$, $y$ along
+increasing $t$, $z$ out of the surface. The texel values are data, not colors,
+so the image is decoded \emph{raw} unless the file insists on sRGB.
+
+<<Read the normal map of a surface>>=
+// tangent-space normal map
+const UsdShadeShader normal = sourceShader(surface.GetInput(TfToken("normal")));
+if (normal && shaderId(normal) == "UsdUVTexture")
+{
+    m.normalTexture = loadTexture(normal, /*srgbByDefault=*/false);
+    <<Decide how to decode the normal map>>
+    <<Find the primvar that holds the normal-map coordinates>>
+}
+else if (normal)
+    warn("Unsupported shader driving normal: " + shaderId(normal).GetString() + " (" + m.name + ")");
+@ The specification asks files to say, through the texture's scale and bias,
+how texels become vectors: for eight-bit images, scale $(2,2,2,1)$ and bias
+$(-1,-1,-1,0)$. We follow what is authored exactly. This is not pedantry:
+normal maps made for DirectX have the $y$ axis flipped, and well-made USD files
+compensate with scale $(2,-2,2)$ and bias $(-1,1,-1)$, as the McUsd sample
+asset does. If only one of the two is authored, the other keeps the
+[[UsdUVTexture]] default. If neither is authored, the file is not compliant
+(\texttt{usdchecker} complains about it), but such files are common, so rather
+than read the vectors as nonsense we assume the usual remapping and warn.
+
+<<Decide how to decode the normal map>>=
+GfVec4f scale, bias;
+const bool hasScale = inputValue(normal, "scale", &scale), hasBias = inputValue(normal, "bias", &bias);
+if (hasScale || hasBias)
+{
+    // as authored; UsdUVTexture defaults are scale 1, bias 0
+    m.normalScale = hasScale ? std::array<float, 4>{scale[0], scale[1], scale[2], scale[3]}
+                             : std::array<float, 4>{1, 1, 1, 1};
+    m.normalBias = hasBias ? std::array<float, 4>{bias[0], bias[1], bias[2], bias[3]}
+                           : std::array<float, 4>{0, 0, 0, 0};
+}
+else
+    warn("Normal map without scale/bias, assuming the usual 2x-1 remap (" + m.name + ")");
+@ A material has one [[uvSet]]. When it has a diffuse texture, that texture
+has already chosen it; otherwise the normal map's primvar reader decides.
+
+<<Find the primvar that holds the normal-map coordinates>>=
+// 'uvSet' is shared with the diffuse texture when there is one
+if (m.texture < 0)
+    if (const UsdShadeShader reader = sourceShader(normal.GetInput(TfToken("st"))))
+    {
+        VtValue varname;
+        if (inputValue(reader, "varname", &varname))
+        {
+            if (varname.IsHolding<TfToken>())
+                m.uvSet = varname.UncheckedGet<TfToken>().GetString();
+            else if (varname.IsHolding<std::string>())
+                m.uvSet = varname.UncheckedGet<std::string>();
+        }
+    }
+@ A float input such as roughness starts at its default, then takes the
+authored value, if any. If it is driven by a texture, we record which channel:
+the output [[outputs:g]] means green, and so on; [[outputs:r]] and anything
+else, such as [[outputs:rgb]], mean the first channel. Like normal maps,
+roughness and metallic maps are data and are decoded raw by default. The
+texture's scale and bias are reduced to those of the chosen channel, and if
+the image cannot be loaded, the texture's [[fallback]] for that channel
+replaces the constant.
+
+<<Read a float input that may come from a texture>>=
+ScalarInput Scene::scalarInput(const UsdShadeShader& surface, const char* name, float fallback)
+{
+    ScalarInput in;
+    in.value = fallback;
+    inputValue(surface, name, &in.value);
+    const UsdAttribute output = sourceOutput(surface.GetInput(TfToken(name)));
+    if (!output)
+        return in;
+    const UsdShadeShader texture(output.GetPrim());
+    if (shaderId(texture) != "UsdUVTexture")
+    {
+        warn("Unsupported shader driving " + std::string(name) + ": " + shaderId(texture).GetString());
+        return in;
+    }
+    const std::string channel = UsdShadeUtils::GetBaseNameAndType(output.GetName()).first.GetString();
+    in.channel = channel == "g" ? 1 : channel == "b" ? 2 : channel == "a" ? 3 : 0;
+    in.texture = loadTexture(texture, /*srgbByDefault=*/false);
+    GfVec4f v;
+    if (inputValue(texture, "scale", &v))
+        in.scale = v[in.channel];
+    if (inputValue(texture, "bias", &v))
+        in.bias = v[in.channel];
+    if (in.texture < 0 && inputValue(texture, "fallback", &v))
+        in.value = v[in.channel];
+    return in;
+}
+@* Textures. Loading a texture turns a [[UsdUVTexture]] node into an index
+into [[FlatGeometry::textures]], or $-1$ with a warning if anything goes
+wrong.
+
+<<Load a texture once>>=
+int Scene::loadTexture(const UsdShadeShader& shader, bool srgbByDefault)
+{
+    <<Resolve the file of a texture>>
+
+    <<Decide the color space and wrap modes, and consult the texture cache>>
+
+    <<Decode a texture through the asset resolver>>
+}
+@ The file is an \emph{asset path}. USD resolves asset paths when it composes
+the stage, relative to the layer that authored them, so
+[[GetResolvedPath]] already gives an absolute location. For a file inside a
+\lpfile{.usdz} package, that location has the form
+\lpfile{package.usdz[textures/image.png]}, which no ordinary file function can
+open; we shall see in a moment how it is read. UDIM textures, whose name
+contains the pattern \texttt{<UDIM>} and stands for a whole set of images, one
+per tile of texture space, are not supported.
+
+<<Resolve the file of a texture>>=
+SdfAssetPath file;
+if (!inputValue(shader, "file", &file) || file.GetAssetPath().empty())
+{
+    warn("Texture without a file: " + shader.GetPath().GetString());
+    return -1;
+}
+if (file.GetAssetPath().find("<UDIM>") != std::string::npos)
+{
+    warn("UDIM textures are not supported: " + file.GetAssetPath());
+    return -1;
+}
+const std::string resolved = file.GetResolvedPath();
+if (resolved.empty())
+{
+    warn("Texture not found: " + file.GetAssetPath());
+    return -1;
+}
+@ The color space. [[sourceColorSpace]] may be [[sRGB]], [[raw]] or [[auto]]
+(the default). An explicit choice is obeyed. For [[auto]] the decision should
+depend on the image; we let it depend on the use instead, which is the same
+thing in practice: colors are sRGB, data (normals, roughness, metallic) are
+raw. The caller says which.
+
+The renderer turns each [[Texture]] into a CUDA texture object, in which both
+the sRGB conversion and the wrap modes are fixed. The same image read in two
+different ways is therefore two textures, and the cache key contains all four
+properties: resolved path, color space and both wrap modes.
+
+<<Decide the color space and wrap modes, and consult the texture cache>>=
+TfToken colorSpace;
+inputValue(shader, "sourceColorSpace", &colorSpace);
+const bool srgb = colorSpace == "sRGB" || (colorSpace != "raw" && srgbByDefault);
+const TextureWrap wrapS = wrapMode(shader, "wrapS"), wrapT = wrapMode(shader, "wrapT");
+const auto key = std::make_tuple(resolved, srgb, int(wrapS), int(wrapT));
+if (auto it = m_textureCache.find(key); it != m_textureCache.end())
+    return it->second;
+@ The asset resolver, \emph{Ar}, is USD's layer between asset paths and
+bytes. Asking it to open the resolved path works for plain files and for files
+inside packages alike, and gives us the whole file in memory, which is exactly
+what the decoder \texttt{stb\_image} wants. We ask the decoder for four
+channels of eight bits whatever the file contains; grayscale and RGB images
+gain the missing channels, with an opaque alpha. Failures are remembered in
+the cache as well, so a missing or broken image is reported once, not once per
+material that reads it.
+
+<<Decode a texture through the asset resolver>>=
+// ArResolver also reads files packaged inside .usdz archives
+int index = -1;
+std::shared_ptr<ArAsset> asset = ArGetResolver().OpenAsset(ArResolvedPath(resolved));
+std::shared_ptr<const char> buffer = asset ? asset->GetBuffer() : nullptr;
+int w = 0, h = 0, channels = 0;
+unsigned char* pixels =
+    buffer ? stbi_load_from_memory(reinterpret_cast<const stbi_uc*>(buffer.get()), int(asset->GetSize()), &w, &h,
+                                   &channels, 4)
+           : nullptr;
+if (pixels)
+{
+    Texture t;
+    t.path = resolved;
+    t.width = w;
+    t.height = h;
+    t.rgba.assign(pixels, pixels + size_t(w) * h * 4);
+    t.srgb = srgb;
+    t.wrapS = wrapS;
+    t.wrapT = wrapT;
+    stbi_image_free(pixels);
+    m_geometry.textures.push_back(std::move(t));
+    index = int(m_geometry.textures.size() - 1);
+}
+else
+    warn("Could not load texture " + resolved + (buffer ? std::string(": ") + stbi_failure_reason() : ""));
+m_textureCache[key] = index;
+return index;
+@* Materials per face. Back in the flattening loop, each prim needs a
+material for each of its faces. The material bound to the prim is found by
+[[ComputeBoundMaterial]], which applies USD's binding rules for us: bindings
+are inherited from ancestors, and a binding marked ``stronger than
+descendants'' overrides those below it. A prim with no material falls back to
+its display color.
+
+A mesh may also be divided into \emph{GeomSubsets}, named sets of faces, and
+the subsets of the family [[materialBind]] can carry their own material
+binding. Those faces get the subset's material instead; indices outside the
+mesh are ignored. The count of such subsets is shown in the inspector.
+
+<<Assign a material to every face of a prim>>=
+// materials: the prim's own binding, overridden per face by GeomSubsets
+UsdShadeMaterialBindingAPI binding(p);
+const UsdShadeMaterial primMaterial = binding.ComputeBoundMaterial();
+const unsigned baseMaterial = primMaterial ? materialFor(primMaterial) : displayColorMaterial(p);
+std::vector<unsigned> faceMaterial(local.faceCount, baseMaterial);
+unsigned subsetMaterials = 0;
+for (const UsdGeomSubset& subset : binding.GetMaterialBindSubsets())
+{
+    const UsdShadeMaterial m = UsdShadeMaterialBindingAPI(subset.GetPrim()).ComputeBoundMaterial();
+    VtIntArray faces;
+    if (!m || !subset.GetIndicesAttr().Get(&faces, m_time))
+        continue;
+    const unsigned index = materialFor(m);
+    for (int f : faces)
+        if (f >= 0 && size_t(f) < faceMaterial.size())
+            faceMaterial[f] = index;
+    ++subsetMaterials;
+}
+@ Texture coordinates. Each prim gets one set of texture coordinates per
+triangle corner, read from one primvar. Which primvar? The one the material
+asks for: the prim's own material, unless some face uses a textured material,
+in which case the first such material decides. Prims whose subsets read
+different primvars are not handled, but they are rare.
+
+Primvars can be inherited: a primvar authored with [[constant]] interpolation
+on an ancestor applies to the whole subtree, which is why we use
+[[FindPrimvarWithInheritance]]. As with normals, [[ComputeFlattened]] resolves
+indexed primvars, and the lambda [[cornerUV]] picks the value of each corner by
+the same rules as <<Pick the shading normal of each triangle corner>>. A
+missing value gives the coordinates $(0,0)$.
+
+<<Read the texture coordinates of a prim>>=
+// texture coordinates, read from the primvar the material asks for
+std::string uvSet = g.materials[baseMaterial].uvSet;
+for (unsigned m : faceMaterial)
+    if (g.materials[m].usesTextures())
+    {
+        uvSet = g.materials[m].uvSet;
+        break;
+    }
+VtArray<GfVec2f> uvs;
+TfToken interpolation;
+if (const UsdGeomPrimvar pv = UsdGeomPrimvarsAPI(p).FindPrimvarWithInheritance(TfToken(uvSet));
+    pv && pv.ComputeFlattened(&uvs, m_time))
+    interpolation = pv.GetInterpolation();
+auto cornerUV = [&](unsigned tri, int corner) -> GfVec2f {
+    size_t i = 0;
+    if (interpolation == UsdGeomTokens->faceVarying)
+        i = local.cornerFv[3 * tri + corner];
+    else if (interpolation == UsdGeomTokens->vertex || interpolation == UsdGeomTokens->varying)
+        i = local.indices[3 * tri + corner];
+    else if (interpolation == UsdGeomTokens->uniform)
+        i = local.faceOfTri[tri];
+    return i < uvs.size() ? uvs[i] : GfVec2f(0.0f);
+};
+@* World space. The local-to-world matrix $M$ of the prim moves its points.
+USD's matrices act on row vectors, $p' = pM$, and [[Transform]] includes the
+translation. The points are transformed in double precision and stored as
+floats, and the bounds of the scene grow to include them. [[baseVertex]] is
+the index that the prim's first point receives in the shared array.
+
+Normals cannot be transformed with $M$ itself: under a non-uniform scale, a
+vector perpendicular to the surface would stop being perpendicular. The
+correct matrix is the inverse transpose, $(M^{-1})^{\mathsf T}$, applied
+without translation ([[TransformDir]]). It keeps the transformed normal
+perpendicular to every transformed tangent, because for a tangent $u$ and a
+normal $n$ with $u\cdot n=0$ we have $(uM)\cdot\bigl(n(M^{-1})^{\mathsf
+T}\bigr)= u\,M M^{-1}\,n^{\mathsf T} = u\cdot n = 0$.
+
+<<Transform the points of a prim to world space>>=
+const GfMatrix4d toWorld = xformCache.GetLocalToWorldTransform(p);
+const GfMatrix4d normalToWorld = toWorld.GetInverse().GetTranspose();
+const unsigned baseVertex = unsigned(g.vertices.size() / 3);
+for (const GfVec3f& pt : local.points)
+{
+    const GfVec3d w = toWorld.Transform(GfVec3d(pt));
+    for (int k = 0; k < 3; ++k)
+    {
+        g.vertices.push_back(float(w[k]));
+        lo[k] = std::min(lo[k], float(w[k]));
+        hi[k] = std::max(hi[k], float(w[k]));
+    }
+}
+@ Appending the triangles. The prim's mesh id is the next free one; its
+triangles start where the previous prim's ended. The point indices are offset
+by [[baseVertex]]. Every triangle is tagged with the mesh id.
+
+<<Append the triangles of a prim to the flat geometry>>=
+const unsigned meshId = unsigned(g.meshEntity.size());
+const unsigned firstTri = unsigned(g.indices.size() / 3);
+const unsigned triCount = unsigned(local.indices.size() / 3);
+for (unsigned idx : local.indices)
+    g.indices.push_back(baseVertex + idx);
+g.triMesh.insert(g.triMesh.end(), triCount, meshId);
+<<Append the material, texture coordinates and normals of each triangle>>
+<<Record the mesh in the registry>>
+@ Then come the per-triangle attributes: the material of the triangle's
+face, and for each corner its texture coordinates and its shading normal in
+world space. Normals are normalized here, after the transformation, which
+also takes care of the unnormalized sums of the smooth normals and of the
+sphere's points. A degenerate normal is left at zero, and a flat mesh stores
+zeros throughout: both mean ``use the triangle's own normal''.
+
+<<Append the material, texture coordinates and normals of each triangle>>=
+for (unsigned t = 0; t < triCount; ++t)
+{
+    g.triMaterial.push_back(faceMaterial[local.faceOfTri[t]]);
+    for (int c = 0; c < 3; ++c)
+    {
+        const GfVec2f uv = cornerUV(t, c);
+        g.triUVs.insert(g.triUVs.end(), {uv[0], uv[1]});
+        GfVec3d n(0.0);
+        if (!local.cornerNormals.empty())
+        {
+            n = normalToWorld.TransformDir(GfVec3d(local.cornerNormals[3 * t + c]));
+            if (n.GetLength() > 1e-12)
+                n.Normalize();
+        }
+        g.triNormals.insert(g.triNormals.end(), {float(n[0]), float(n[1]), float(n[2])});
+    }
+}
+@ The entity learns where its triangles are. Adding a [[MeshGeometry]]
+component while we iterate over the [[PrimInfo]] components is safe in EnTT,
+because each component type has its own storage and the view walks only the
+[[PrimInfo]] storage.
+
+<<Record the mesh in the registry>>=
+g.meshEntity.push_back(e);
+m_registry.emplace<MeshGeometry>(e, meshId, firstTri, triCount, baseMaterial, subsetMaterials,
+                                 !uvs.empty());
+@ A prim whose material reads textures but which has no texture coordinates
+would show one texel stretched over the whole surface. Better to say so.
+
+<<Warn about textured prims without texture coordinates>>=
+bool textured = false;
+for (unsigned m : faceMaterial)
+    textured = textured || g.materials[m].usesTextures();
+if (textured && uvs.empty())
+    warn("Textured prim without '" + uvSet + "' texture coordinates: " + info.path.GetString());
+@ When the loop is over, the bounds are stored, but only if some geometry was
+found; an empty scene keeps the zero box rather than an inverted infinite one.
+
+<<Record the bounds of the scene>>=
+if (!g.empty())
+    for (int k = 0; k < 3; ++k)
+    {
+        g.boundsMin[k] = lo[k];
+        g.boundsMax[k] = hi[k];
+    }

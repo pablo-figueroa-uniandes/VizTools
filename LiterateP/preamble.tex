@@ -1,0 +1,86 @@
+% Preamble of the woven book (lp.py weave). Typesetting conventions follow
+% Knuth's WEB/CWEB: numbered sections, <Chunk name n> = code, bold keywords,
+% italic identifiers, roman comments, cross-references after each chunk.
+\documentclass[10pt]{article}
+\usepackage[a4paper,margin=2.2cm,top=2.4cm,bottom=2.6cm]{geometry}
+\usepackage{fontspec}
+\usepackage{amsmath,amssymb}
+\usepackage{xcolor}
+\usepackage[hidelinks]{hyperref}
+\usepackage{fancyhdr}
+
+% Code font: Latin Modern Roman without TeX ligatures (so -- stays two
+% hyphens) and without hyphenation.
+\newfontfamily\lpcodefont{lmroman10}[Extension=.otf, UprightFont=*-regular, BoldFont=*-bold,
+  ItalicFont=*-italic, BoldItalicFont=*-bolditalic, HyphenChar=None]
+\newfontfamily\lpttfont{lmmono10}[Extension=.otf, UprightFont=*-regular, HyphenChar=None]
+
+% underscore as a short rule (plain TeX's \_), with a permitted break after it
+\newcommand{\lpus}{\leavevmode\kern.06em\vbox{\hrule width.35em}\kern.06em\allowbreak}
+\newlength{\lpspace}\setlength{\lpspace}{0.42em}
+\newcommand{\lpkw}[1]{\textbf{#1}}
+\newcommand{\lpid}[1]{\textit{#1}}
+\newcommand{\lpstr}[1]{{\lpttfont\small #1}}
+\newcommand{\lpcom}[1]{{\upshape\mdseries\color{black!75}#1}}
+\newcommand{\lpcommark}[1]{{\lpttfont\small #1}}
+\newcommand{\lpfile}[1]{{\ttfamily #1}}
+\newcommand{\lpinline}[1]{{\lpcodefont #1}}
+\newcommand{\lpsecref}[1]{\hyperlink{lpsec.#1}{#1}}
+\newcommand{\lpref}[2]{\ensuremath{\langle}{\upshape\mdseries #1}\ \lpsecref{#2}\ensuremath{\rangle}}
+
+% \lpsection{number}{level}{title}: level 0 plain, 1 starred group, 2 part
+\newcommand{\lpsection}[3]{%
+  \ifnum#2=2
+    \clearpage
+    \phantomsection\addcontentsline{toc}{section}{#3}%
+    {\noindent\LARGE\bfseries #3\par}\vspace{1.2em}%
+  \fi
+  \par\addvspace{\ifnum#2=0 0.9em\else 1.6em\fi}%
+  \ifnum#2=1 \phantomsection\addcontentsline{toc}{subsection}{#1.\enspace #3}\fi
+  \noindent\hypertarget{lpsec.#1}{}\textbf{#1.\ifnum#2=1 \enspace #3.\fi}\enspace\ignorespaces}
+
+% code display: \begin{lpchunk}{<name n>}{+ or empty}
+\newenvironment{lpchunk}[2]{%
+  \par\addvspace{0.5em}%
+  \begingroup\lpcodefont\small\raggedright\parskip=0pt\relax
+  \hyphenpenalty=10000\exhyphenpenalty=10000\frenchspacing
+  \noindent #1\ \ensuremath{\mathrel{#2}\equiv}\par\nopagebreak}%
+  {\par\endgroup\addvspace{0.2em}}
+\newcommand{\lpline}[2]{\par\noindent\hangindent=\dimexpr#1\lpspace+5em\relax\hangafter=1
+  \hspace*{\dimexpr#1\lpspace+1.5em\relax}#2}
+\newcommand{\lpblank}{\par\vspace{1.1ex}}
+\newcommand{\lpnotes}[1]{\par\vspace{0.15em}{\footnotesize\noindent\hspace*{1.5em}#1\par}\addvspace{0.3em}}
+
+\newcommand{\lpindexheading}{\clearpage
+  \phantomsection\addcontentsline{toc}{section}{Names of the sections}%
+  {\noindent\LARGE\bfseries Names of the sections\par}\vspace{1em}\small}
+\newcommand{\lpindexentry}[1]{\par\noindent\hangindent=2em\hangafter=1 #1\par\vspace{0.3ex}}
+
+\setlength{\parindent}{1.2em}
+\setlength{\parskip}{0.3ex}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small\itshape UsdOptixViewer: a literate program}
+\fancyhead[R]{\small\thepage}
+\renewcommand{\headrulewidth}{0.3pt}
+
+\begin{document}
+\pagenumbering{alph}
+\begin{titlepage}
+  \centering
+  \vspace*{5cm}
+  {\Huge\bfseries UsdOptixViewer\par}
+  \vspace{0.8em}
+  {\Large A Literate Program\par}
+  \vspace{2.5em}
+  {\large Pablo Figueroa\par}
+  \vfill
+  {\small Written in the style of Donald E.\ Knuth's \emph{Literate Programming}.\par
+   The source files of the program are tangled from this document; \texttt{lp.py check}\par
+   verifies that the tangled output is identical to the files in the repository.\par}
+  \vspace{2cm}
+\end{titlepage}
+\pagenumbering{roman}
+\tableofcontents
+\clearpage
+\pagenumbering{arabic}

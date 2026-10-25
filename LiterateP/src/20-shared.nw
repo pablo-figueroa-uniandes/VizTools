@@ -1,0 +1,214 @@
+@** Shared parameters. The CPU and the GPU must agree on one thing above all:
+the layout of the data that the host hands to every OptiX launch. That data is
+described once, in \lpfile{LaunchParams.h}, and the header is compiled twice:
+by the host C++ compiler for \lpfile{OptixRenderer.cpp}, which fills the
+structures in, and by \texttt{nvcc} for \lpfile{devicePrograms.cu}, which reads
+them. Because both sides see the very same declarations, a field added here
+cannot be forgotten on one side; it can only be left unset.
+
+<<UsdOptixViewer/src/LaunchParams.h>>=
+<<Opening of the shared parameters header>>
+
+<<The background mesh id and the ray types>>
+
+<<The camera frame>>
+
+<<Scalar material inputs>>
+
+<<Material data on the device>>
+
+<<The launch parameters>>
+@ The header includes only CUDA and OptiX type definitions, never their
+function declarations. From OptiX we take [[OptixTraversableHandle]], from
+CUDA's texture types [[cudaTextureObject_t]], and from CUDA's vector types
+[[float3]], [[float4]], [[uchar4]] and friends. These headers declare the
+same sizes and the same alignments for the host compiler and for
+\texttt{nvcc}, which is what makes a byte-for-byte copy from one side to the
+other legitimate.
+
+<<Opening of the shared parameters header>>=
+// Data shared between the host (OptixRenderer.cpp) and the OptiX programs
+// (devicePrograms.cu).
+#pragma once
+
+#include <optix_types.h>
+#include <texture_types.h>
+#include <vector_types.h>
+@ When a camera ray hits nothing, the pixel belongs to no mesh. We mark such
+pixels with the largest unsigned integer, [[kNoMesh]], which can never be a
+valid mesh index. The application reads these ids back to implement picking:
+a click on the background clears the selection.
+
+The renderer traces two kinds of rays. \emph{Radiance} rays ask ``what colour
+arrives along this ray?''; \emph{shadow} rays only ask ``is the light visible
+from here?''. OptiX selects the program that handles a miss, and the record
+that handles a hit, by an index into the shader binding table; the enumeration
+gives these indices names, and [[RAY_TYPE_COUNT]] is the stride between the
+records of consecutive geometries.
+
+<<The background mesh id and the ray types>>=
+constexpr unsigned int kNoMesh = 0xffffffffu;
+
+enum RayType { RAY_TYPE_RADIANCE = 0, RAY_TYPE_SHADOW = 1, RAY_TYPE_COUNT };
+@ The camera is a pinhole. Rather than storing a field of view and an aspect
+ratio, the host precomputes three vectors: [[w]] points from the eye to the
+centre of the image plane, while [[u]] and [[v]] point from that centre to the
+middle of the right and top edges of the image. A point of the image with
+normalized device coordinates $(x,y)\in[-1,1]^2$ then lies in the direction
+$w + x\,u + y\,v$, and the ray generation program needs no trigonometry at all.
+If $\phi$ is the vertical field of view and $a$ the aspect ratio, the host
+sets $|w|=1$, $|v|=\tan(\phi/2)$ and $|u|=a\tan(\phi/2)$.
+
+<<The camera frame>>=
+struct Camera
+{
+    float3 eye;
+    float3 u, v, w;  // right, up and forward scaled to the image plane
+};
+@ Many inputs of a UsdPreviewSurface material, such as roughness or metallic,
+are single numbers that may either be constant or come from one channel of a
+texture. A [[ScalarParam]] holds both possibilities. When [[texture]] is
+negative the value is [[value]]; otherwise it is channel [[channel]] (0 to 3
+for red, green, blue and alpha) of the texture, mapped through the
+[[scale]] and [[bias]] that the UsdUVTexture node specifies for that channel.
+Keeping the channel number lets one texture carry several inputs, as in the
+common ``packed'' maps where green is roughness and blue is metallic.
+
+<<Scalar material inputs>>=
+// A float input: `value`, or texture[channel] * scale + bias when texture >= 0.
+struct ScalarParam
+{
+    float value;
+    int   texture;
+    int   channel;
+    float scale, bias;
+};
+@ Materials. The scene part of the program reduces every UsdPreviewSurface it
+meets to one [[MaterialData]], and each triangle refers to one of them by
+index. The comment summarizes how the closest-hit program interprets the
+fields; we shall see each formula again when it is used.
+
+The order of the fields is not accidental. A [[float4]] must be aligned on a
+16-byte boundary, while a [[float3]] needs only 4 bytes. Putting the six
+[[float4]] members first, and pairing each [[float3]] with a following
+[[int]], fills every 16-byte line exactly, so the compiler inserts no padding
+and the structure has the same size on both sides of the bus. Texture
+references are indices into the array of CUDA texture objects of
+<<The scene as seen by the device>>, with $-1$ meaning ``no texture''.
+
+<<Material data on the device>>=
+// UsdPreviewSurface subset.
+//   diffuse  = texture(st) * texScale + texBias, or `color` when untextured
+//   cutout   = hits where opacityTexture(st)[opacityChannel] < opacityThreshold are ignored
+//   normal   = normalTexture(st) * normalScale + normalBias (tangent space)
+//   specular = GGX; F0 from metallic + ior, or specColor in the specular workflow
+struct MaterialData
+{
+    <<Texture remapping coefficients of a material>>
+    <<Colors, textures and inputs of a material>>
+};
+@ The six vectors are the [[scale]] and [[bias]] inputs of the UsdUVTexture
+nodes that feed the diffuse color, the normal and the specular color. They
+are applied componentwise to every texel, $c = s\cdot t + b$. For a normal map
+the specification asks for $s=(2,2,2)$ and $b=(-1,-1,-1)$, which maps the
+stored range $[0,1]$ to the vector range $[-1,1]$; files that use the
+DirectX convention flip the green channel through these same coefficients.
+
+<<Texture remapping coefficients of a material>>=
+float4 texScale;
+float4 texBias;
+float4 normalScale;
+float4 normalBias;
+float4 specScale;
+float4 specBias;
+@ Then come the remaining inputs. [[color]] is the diffuse color of an
+untextured material. [[specColor]] and [[specTexture]] are used only in the
+\emph{specular workflow}, where [[specularWorkflow]] is nonzero and the
+reflectance at normal incidence is given directly; otherwise the
+\emph{metallic workflow} derives it from [[metallic]] and the index of
+refraction [[ior]]. The opacity fields describe an alpha cutout: the
+[[opacityChannel]] of [[opacityTexture]] is compared with
+[[opacityThreshold]].
+
+<<Colors, textures and inputs of a material>>=
+float3 color;
+int    texture;  // index into LaunchParams::textures, -1 for none
+float3 specColor;
+int    specTexture;
+ScalarParam roughness;
+ScalarParam metallic;
+int    opacityTexture;
+int    opacityChannel;
+float  opacityThreshold;
+int    normalTexture;
+int    specularWorkflow;
+float  ior;
+@* The launch parameters. Everything a launch needs is gathered in a single
+structure. The host copies it to a small device buffer before each launch,
+and OptiX makes it visible to all programs as the [[__constant__]] variable
+[[params]]. Constant memory is cached and broadcast to all threads of a warp,
+which suits data that every ray reads and no ray writes; the output buffers it
+points to, of course, live in ordinary global memory.
+
+<<The launch parameters>>=
+struct LaunchParams
+{
+    <<Output buffers of a launch>>
+
+    <<Camera, light and rendering switches>>
+
+    <<The scene as seen by the device>>
+};
+@ The output of a launch. Rendering is progressive: each launch traces one new
+sample per pixel. [[accumBuffer]] keeps, for every pixel, the running sum of
+the samples in its first three components and their number in the fourth, and
+[[colorBuffer]] receives their average, encoded for display. [[frameIndex]]
+counts the samples already taken; the host sets it back to zero whenever the
+camera, the scene or any option changes, and the next launch then overwrites
+the sums instead of adding to them. [[meshIdBuffer]] records which mesh each
+pixel shows; it is written only on frame~0, whose rays go through the pixel
+centres.
+
+<<Output buffers of a launch>>=
+// output: colorBuffer = accumBuffer / (frameIndex + 1); meshIdBuffer is written on frame 0
+uchar4*       colorBuffer;
+float4*       accumBuffer;
+unsigned int* meshIdBuffer;  // mesh under each pixel (kNoMesh for background)
+unsigned int  width, height;
+unsigned int  frameIndex;    // progressive sample index, reset to 0 after any change
+@ Next come the camera, the single directional light, and the switches of
+the \emph{View} menu, each an integer used as a boolean. Turning a switch off
+does not change the scene, only how it is drawn, which is handy for comparing
+the effect of a feature. [[selectedMesh]] is the mesh highlighted in orange,
+or [[kNoMesh]].
+
+<<Camera, light and rendering switches>>=
+Camera camera;
+float3 lightDir;  // direction towards the light, normalized
+unsigned int shadows;
+unsigned int mipmaps;      // 0: always sample the finest texture level
+unsigned int normalMaps;   // 0: ignore normal maps
+unsigned int reflections;  // 0: reflect the sky only, without tracing rays
+unsigned int selectedMesh;
+@ The scene. All geometry is flattened into one list of world-space triangles
+and stored in a single geometry acceleration structure (GAS), whose handle is
+what [[optixTrace]] needs. Alongside it, plain arrays indexed by the
+primitive number that OptiX reports for a hit give everything the shading code
+wants to know about a triangle: its vertices, its mesh, its material, the
+texture coordinates and shading normals of its three corners. Storing UVs and
+normals per corner rather than per vertex wastes some memory, but it handles
+face-varying data, where one vertex has different values on different faces,
+without any special case. A zero normal at the first corner means ``no shading
+normals, use the flat geometric one''.
+
+<<The scene as seen by the device>>=
+// scene: one GAS with all triangles in world space
+OptixTraversableHandle handle;
+const float3*       vertices;
+const uint3*        indices;
+const unsigned int* triMesh;      // mesh id of each triangle
+const unsigned int* triMaterial;  // material of each triangle
+const float2*       triUVs;       // st of the 3 corners of each triangle
+const float3*       triNormals;   // shading normal of the 3 corners (zero: flat)
+const MaterialData* materials;
+const cudaTextureObject_t* textures;

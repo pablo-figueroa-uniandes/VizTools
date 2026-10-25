@@ -1,0 +1,1522 @@
+@** The application. We have a scene that knows how to read a USD stage and a
+renderer that knows how to turn triangles into pixels. What remains is the
+program that a person actually sees: a window with a menu bar, a tree of prims
+on the left, an inspector on the right, the ray-traced image in the middle and
+a status line at the bottom. This part builds that program with SDL3, which
+gives us a window, input events and a simple 2D renderer, and Dear ImGui, an
+``immediate mode'' user interface library in which the whole interface is
+described anew in every frame by ordinary function calls.
+
+The immediate-mode style shapes the code that follows. There are no widget
+objects to create, connect and destroy; instead, each frame the application
+asks ImGui to draw, say, a menu item, and ImGui answers whether it was clicked.
+The state of the interface therefore lives in a handful of plain member
+variables of one class, [[App]], and every panel is a member function that
+reads them and changes them.
+
+@* The main program. The entry point is as short as it can be: it creates the
+application, initializes it with the command-line arguments, and runs it until
+the window is closed. Everything interesting happens inside [[App]].
+
+<<UsdOptixViewer/src/main.cpp>>=
+// USD OptiX Viewer: loads a USD stage, shows its prim hierarchy and
+// properties, and ray traces its geometry with OptiX.
+//
+//   UsdOptixViewer [file.usd]
+#include "App.h"
+
+int main(int argc, char** argv)
+{
+    App app;
+    if (!app.init(argc, argv))
+        return 1;
+    app.run();
+    return 0;
+}
+@* The application class. The header \lpfile{App.h} declares the class. Its
+public face is tiny: initialization, the main loop, and one function,
+[[requestOpen]], that other threads may call. All the rest is private, and
+falls into two groups: the functions that draw the parts of the interface or
+act on the scene, and the state they share.
+
+<<UsdOptixViewer/src/App.h>>=
+// Application: SDL3 window, Dear ImGui panels (hierarchy, inspector,
+// viewport) and the OptiX renderer.
+#pragma once
+
+#include <mutex>
+#include <string>
+#include <unordered_set>
+
+#include <SDL3/SDL.h>
+
+#include "OptixRenderer.h"
+#include "Scene.h"
+
+class App
+{
+public:
+    <<Public interface of the application>>
+
+private:
+    <<Private member functions of the application>>
+
+    <<Window and SDL objects of the application>>
+
+    <<Scene and renderer of the application>>
+
+    <<Camera and display options of the application>>
+
+    <<Selection and hierarchy filter state>>
+
+    <<Text input and dialog state>>
+
+    <<File requests from other threads>>
+};
+@ The destructor releases ImGui and SDL in the reverse order of their
+creation. The file dialog of SDL may run its callback on a thread of its own,
+which is why [[requestOpen]] is public and documented as thread-safe.
+
+<<Public interface of the application>>=
+~App();
+bool init(int argc, char** argv);
+void run();
+
+// Called from the SDL file dialog callback (possibly on another thread).
+void requestOpen(const std::string& path);
+@ The private functions follow the layout of the screen: one function per
+panel, plus a few actions on the camera and the selection. Each is presented
+below, in the section that deals with its panel.
+
+<<Private member functions of the application>>=
+void loadFile(const std::string& path);
+void processEvent(const SDL_Event& event);
+void drawUi();
+void drawMenuBar();
+void drawHierarchy();
+void drawHierarchyNode(entt::entity e);
+void drawInspector();
+void drawViewport();
+void drawStatusBar();
+void drawPopups();
+
+void select(entt::entity e, bool reveal);
+void frameBounds(const float lo[3], const float hi[3]);
+void frameSelection();
+void updateFilter();
+void updateCamera();
+void openFileDialog();
+@ SDL gives us three objects: the window, a 2D renderer attached to it, and a
+texture that holds the latest ray-traced image. The flag [[m_running]] is
+cleared when the user asks to quit.
+
+<<Window and SDL objects of the application>>=
+SDL_Window* m_window = nullptr;
+SDL_Renderer* m_sdlRenderer = nullptr;
+SDL_Texture* m_texture = nullptr;
+bool m_running = true;
+@ The scene and the OptiX renderer are plain members. [[m_rendererOk]] stays
+false if OptiX could not be initialized, for instance on a machine without a
+suitable GPU; the rest of the interface still works, so the program can at
+least be used to inspect a stage. [[m_needsRender]] is the one flag through
+which every part of the interface says ``something that affects the image has
+changed''.
+
+<<Scene and renderer of the application>>=
+Scene m_scene;
+OptixRenderer m_renderer;
+bool m_rendererOk = false;
+bool m_needsRender = true;
+@ The camera is an \emph{orbit} camera: it always looks at a target point,
+from a given distance, along a direction given by two angles, the yaw around
+the up axis and the pitch above the horizon. The field of view is vertical and
+measured in degrees. The light direction and the four switches of the View
+menu complete the parameters of the image.
+
+<<Camera and display options of the application>>=
+// orbit camera
+float m_target[3] = {0, 0, 0};
+float m_distance = 5.0f, m_yaw = 0.6f, m_pitch = 0.4f, m_fovY = 45.0f;
+float m_light[3] = {0.4f, 0.8f, 0.45f};
+bool m_shadows = true;
+bool m_mipmaps = true;
+bool m_normalMaps = true;
+bool m_reflections = true;
+@ The selection is an EnTT entity, one of those created by the scene for each
+prim. When a prim is selected by clicking on the image, the tree must open
+all its ancestors so that it becomes visible; [[m_reveal]] holds them until the
+tree has been drawn once. The filter of the tree keeps the text being typed,
+the text for which the filter was last computed, and the resulting set of
+entities to show.
+
+<<Selection and hierarchy filter state>>=
+entt::entity m_selected = entt::null;
+bool m_revealSelection = false;
+std::unordered_set<entt::entity> m_reveal;  // ancestors to open in the tree
+char m_filter[128] = "";
+std::string m_appliedFilter;
+std::unordered_set<entt::entity> m_visibleByFilter;
+@ ImGui's text fields edit fixed character buffers in place, hence the
+[[char]] arrays. [[m_error]] holds a message to be shown in a modal popup; an
+empty string means there is none.
+
+<<Text input and dialog state>>=
+char m_pathInput[1024] = "";
+std::string m_error;
+bool m_showAbout = false;
+@ A path to open, posted by the file dialog or by a dropped file, waits here
+until the main loop picks it up. The mutex protects it against the dialog's
+thread.
+
+<<File requests from other threads>>=
+std::mutex m_pendingMutex;
+std::string m_pendingOpen;
+@* The implementation. The file \lpfile{App.cpp} contains, after its headers
+and two helper functions, the member functions in the order of the life of the
+program: creation, the main loop, and then the panels from left to right.
+
+<<UsdOptixViewer/src/App.cpp>>=
+<<Headers of the application>>
+
+PXR_NAMESPACE_USING_DIRECTIVE
+
+namespace {
+
+<<Constants of the application>>
+
+<<Format an attribute value for the inspector>>
+
+<<Search a name ignoring case>>
+
+}  // namespace
+
+<<Destroy the application>>
+
+<<Initialize the application>>
+
+<<Request a file to be opened>>
+
+<<Load a USD file into the scene and the renderer>>
+
+<<The main loop of the application>>
+
+<<Handle an SDL event>>
+
+// ---- layout ---------------------------------------------------------------
+<<Lay out the panels and handle shortcuts>>
+
+<<Draw the menu bar>>
+
+<<Show the file dialog>>
+
+// ---- hierarchy ------------------------------------------------------------
+<<Recompute the hierarchy filter>>
+
+<<Draw the hierarchy panel>>
+
+<<Draw one node of the hierarchy>>
+
+<<Select an entity>>
+
+// ---- inspector ------------------------------------------------------------
+<<Draw the inspector>>
+
+// ---- viewport -------------------------------------------------------------
+<<Send the camera and the options to the renderer>>
+
+<<Frame a bounding box>>
+
+<<Frame the selection>>
+
+<<Draw the viewport>>
+
+<<Draw the status bar>>
+
+<<Draw the popups>>
+@ Besides ImGui and its two back ends, the implementation needs a few pieces
+of OpenUSD for the inspector, and \lpfile{optix.h} only for the version number
+that the status bar and the About box display. The macro
+[[PXR_NAMESPACE_USING_DIRECTIVE]] brings OpenUSD's versioned namespace into
+scope, as everywhere else in the program.
+
+<<Headers of the application>>=
+#include "App.h"
+
+#include <algorithm>
+#include <cmath>
+
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_sdlrenderer3.h>
+#include <pxr/base/tf/stringUtils.h>
+#include <pxr/usd/usd/attribute.h>
+#include <pxr/usd/usd/modelAPI.h>
+#include <pxr/usd/usd/relationship.h>
+#include <pxr/usd/usdGeom/metrics.h>
+#include <optix.h>
+@ Two constants govern the whole interface. The renderer is progressive: it
+adds one sample per pixel and frame and averages them. After [[kMaxSamples]]
+samples the image has converged well enough, antialiased edges and glossy
+reflections included, and we stop spending the GPU's time on it. At the
+display's refresh rate of 60 frames per second, 256 samples take a little over
+four seconds.
+
+The panels are not meant to be moved, resized or folded by the user; their
+places are computed every frame from the size of the window
+(<<Lay out the panels and handle shortcuts>>). [[kPanelFlags]] says so, and also
+asks ImGui not to save their positions in a settings file.
+
+<<Constants of the application>>=
+constexpr unsigned int kMaxSamples = 256;  // progressive samples per pixel
+
+constexpr ImGuiWindowFlags kPanelFlags =
+    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+@* Creation and destruction. Initialization proceeds in four steps: the
+window, the user interface library, the ray tracer, and finally whatever the
+command line asks for. A failure of SDL is fatal, but a failure of OptiX is
+not; it is reported in a popup and the viewport stays empty.
+
+<<Initialize the application>>=
+bool App::init(int argc, char** argv)
+{
+    <<Create the window and the SDL renderer>>
+
+    <<Set up Dear ImGui>>
+
+    <<Create the OptiX renderer>>
+
+    <<Parse the command line>>
+    <<Open the requested file and select the requested prim>>
+    return true;
+}
+@ On a high-density display, a window of 1600 by 960 \emph{logical} units may
+cover twice as many physical pixels. SDL reports the ratio the desktop uses
+for its own text as the display's \emph{content scale}; we size the window by
+it so that it occupies the same fraction of the screen everywhere, and ask for
+a framebuffer at full pixel density with
+[[SDL_WINDOW_HIGH_PIXEL_DENSITY]].
+
+For drawing we use SDL's own 2D renderer rather than OpenGL. The interface is
+just textured triangles, which [[SDL_Renderer]] draws with whatever back end
+the platform offers, and our one large image---the ray-traced view---arrives
+as an ordinary array of pixels in main memory (the renderer copies it there
+anyway, because it also reads back the mesh identifiers used for picking). A
+streaming SDL texture is the simplest home for such an array; sharing a buffer
+between CUDA and OpenGL would avoid one copy per frame, but would tie the
+program to one graphics API for a saving that does not matter at these
+resolutions. Vertical synchronization paces the main loop at the display's
+refresh rate, which also paces the progressive rendering.
+
+<<Create the window and the SDL renderer>>=
+if (!SDL_Init(SDL_INIT_VIDEO))
+{
+    SDL_Log("SDL_Init failed: %s", SDL_GetError());
+    return false;
+}
+const float scale = SDL_GetDisplayContentScale(SDL_GetPrimaryDisplay());
+m_window = SDL_CreateWindow("USD OptiX Viewer", int(1600 * scale), int(960 * scale),
+                            SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+if (!m_window)
+{
+    SDL_Log("SDL_CreateWindow failed: %s", SDL_GetError());
+    return false;
+}
+m_sdlRenderer = SDL_CreateRenderer(m_window, nullptr);
+if (!m_sdlRenderer)
+{
+    SDL_Log("SDL_CreateRenderer failed: %s", SDL_GetError());
+    return false;
+}
+SDL_SetRenderVSync(m_sdlRenderer, 1);
+@ ImGui is set up as in its SDL3 example, with three changes. Keyboard
+navigation is enabled; the settings file \lpfile{imgui.ini} is disabled
+([[IniFilename]] set to null), since our panels have fixed places and there is
+nothing worth remembering; and window corners are square, because the panels
+tile the window. The same content scale enlarges all sizes and fonts, so that
+the interface is as legible on a high-density screen as on an ordinary one.
+The two back ends connect ImGui to SDL's events and to SDL's renderer.
+
+<<Set up Dear ImGui>>=
+IMGUI_CHECKVERSION();
+ImGui::CreateContext();
+ImGuiIO& io = ImGui::GetIO();
+io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+io.IniFilename = nullptr;
+ImGui::StyleColorsDark();
+ImGuiStyle& style = ImGui::GetStyle();
+style.ScaleAllSizes(scale);
+style.FontScaleDpi = scale;
+style.WindowRounding = 0.0f;
+ImGui_ImplSDL3_InitForSDLRenderer(m_window, m_sdlRenderer);
+ImGui_ImplSDLRenderer3_Init(m_sdlRenderer);
+@ If OptiX cannot start, the message goes into [[m_error]], which the next
+frame shows in a popup (<<Draw the popups>>).
+
+<<Create the OptiX renderer>>=
+std::string error;
+m_rendererOk = m_renderer.init(error);
+if (!m_rendererOk)
+    m_error = "OptiX initialization failed: " + error;
+@ The command line names at most one file, and may add options. Three of them
+switch off a feature of the renderer from the start, exactly as the
+corresponding items of the View menu do; they make it easy to compare images
+with and without mipmaps, normal maps or traced reflections.
+
+The fourth, \texttt{--select}, selects a prim by its path and frames the
+camera on it. It exists mostly for testing: while this program was developed,
+synthetic mouse clicks sent to its window by \texttt{xdotool} never reached
+SDL on the development machine's display, so the only way to check the
+selection, the tree and the inspector from a script was to select a prim from
+the command line and take a screenshot.
+
+<<Parse the command line>>=
+// UsdOptixViewer [file.usd] [--select /Prim/Path] [--no-mipmaps] [--no-normal-maps] [--no-reflections]
+std::string file, selectPath;
+for (int i = 1; i < argc; ++i)
+{
+    const std::string arg = argv[i];
+    if (arg == "--select" && i + 1 < argc)
+        selectPath = argv[++i];
+    else if (arg == "--no-mipmaps")
+        m_mipmaps = false;
+    else if (arg == "--no-normal-maps")
+        m_normalMaps = false;
+    else if (arg == "--no-reflections")
+        m_reflections = false;
+    else
+        file = arg;
+}
+@ The prim to select is looked up among the scene's entities by its USD path,
+after checking that the string is a valid path at all (the constructor of
+[[SdfPath]] would complain loudly otherwise). Selecting with [[reveal]] set
+opens its ancestors in the tree, and [[frameSelection]] points the camera at
+it.
+
+<<Open the requested file and select the requested prim>>=
+if (!file.empty())
+    loadFile(file);
+if (!selectPath.empty() && m_scene.loaded() && SdfPath::IsValidPathString(selectPath))
+{
+    const SdfPath path(selectPath);
+    for (auto [e, info] : m_scene.registry().view<PrimInfo>().each())
+        if (info.path == path)
+        {
+            select(e, true);
+            frameSelection();
+        }
+}
+@ Destruction undoes initialization in reverse. ImGui is shut down only if it
+was created, because [[init]] may have failed before reaching that point. The
+scene and the OptiX renderer are members and clean up after themselves when
+the object's lifetime ends.
+
+<<Destroy the application>>=
+App::~App()
+{
+    if (ImGui::GetCurrentContext())
+    {
+        ImGui_ImplSDLRenderer3_Shutdown();
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+    }
+    if (m_texture)
+        SDL_DestroyTexture(m_texture);
+    if (m_sdlRenderer)
+        SDL_DestroyRenderer(m_sdlRenderer);
+    if (m_window)
+        SDL_DestroyWindow(m_window);
+    SDL_Quit();
+}
+@* Opening files. A file may be requested in four ways: on the command line,
+through the file dialog, by typing a path in the File menu, or by dropping it
+on the window. All but the first go through [[requestOpen]], which merely
+records the path; the main loop loads it at a quiet moment, between two
+frames. This matters for the file dialog: SDL shows it asynchronously and may
+call us back on another thread, and loading a stage there would race with the
+drawing of the interface. A mutex makes the hand-over safe. If two requests
+arrive in the same frame, the later one wins, which is what a user who changes
+their mind expects.
+
+<<Request a file to be opened>>=
+void App::requestOpen(const std::string& path)
+{
+    std::lock_guard<std::mutex> lock(m_pendingMutex);
+    m_pendingOpen = path;
+}
+@ Loading forgets everything that belonged to the previous stage: the
+selection, the entities to reveal and the filter of the tree. If the scene
+cannot open the file, its message is shown in the error popup. Otherwise the
+path is copied into the text field of the File menu (so that it can be edited
+and reloaded), the window title names the file, the flattened geometry is sent
+to the renderer, and the camera frames the whole stage.
+
+<<Load a USD file into the scene and the renderer>>=
+void App::loadFile(const std::string& path)
+{
+    std::string error;
+    m_selected = entt::null;
+    m_reveal.clear();
+    m_appliedFilter.clear();
+    m_filter[0] = '\0';
+    if (!m_scene.load(path, error))
+    {
+        m_error = error;
+        return;
+    }
+    SDL_strlcpy(m_pathInput, path.c_str(), sizeof(m_pathInput));
+    SDL_SetWindowTitle(m_window, ("USD OptiX Viewer - " + path).c_str());
+    if (m_rendererOk)
+    {
+        m_renderer.setGeometry(m_scene.geometry());
+        m_renderer.setSelectedMesh(kNoMesh);
+    }
+    const FlatGeometry& g = m_scene.geometry();
+    frameBounds(g.boundsMin, g.boundsMax);
+}
+@ The dialog is SDL's portable one; it uses the desktop's native dialog where
+there is one. Its callback receives a list of chosen files, an empty list if
+the user cancelled, or a null pointer if something went wrong. The filter
+list offers the four USD extensions first.
+
+<<Show the file dialog>>=
+void App::openFileDialog()
+{
+    static const SDL_DialogFileFilter filters[] = {{"USD files", "usd;usda;usdc;usdz"}, {"All files", "*"}};
+    SDL_ShowOpenFileDialog(
+        [](void* userdata, const char* const* files, int) {
+            if (files && files[0])
+                static_cast<App*>(userdata)->requestOpen(files[0]);
+            else if (!files)
+                SDL_Log("File dialog error: %s", SDL_GetError());
+        },
+        this, m_window, filters, 2, nullptr, false);
+}
+@* The main loop. Each turn of the loop handles the pending events, loads a
+requested file if there is one, and then draws one frame. The pending path is
+taken out under the lock by swapping it with an empty string, and loaded
+after the lock has been released, so that the dialog's thread never waits for
+a stage to load. While the window is minimized we draw nothing and sleep a
+little, rather than spin.
+
+Drawing a frame is ImGui's usual ritual: start a new frame in both back ends
+and in ImGui, describe the whole interface (<<Lay out the panels and handle shortcuts>>),
+let ImGui turn the description into triangles, and have SDL draw
+them. On a high-density display, ImGui works in logical units and SDL must
+scale its drawing by the framebuffer scale to match.
+
+<<The main loop of the application>>=
+void App::run()
+{
+    while (m_running)
+    {
+        SDL_Event event;
+        while (SDL_PollEvent(&event))
+            processEvent(event);
+
+        std::string pending;
+        {
+            std::lock_guard<std::mutex> lock(m_pendingMutex);
+            pending.swap(m_pendingOpen);
+        }
+        if (!pending.empty())
+            loadFile(pending);
+
+        if (SDL_GetWindowFlags(m_window) & SDL_WINDOW_MINIMIZED)
+        {
+            SDL_Delay(10);
+            continue;
+        }
+
+        ImGui_ImplSDLRenderer3_NewFrame();
+        ImGui_ImplSDL3_NewFrame();
+        ImGui::NewFrame();
+        drawUi();
+        ImGui::Render();
+
+        const ImGuiIO& io = ImGui::GetIO();
+        SDL_SetRenderScale(m_sdlRenderer, io.DisplayFramebufferScale.x, io.DisplayFramebufferScale.y);
+        SDL_SetRenderDrawColorFloat(m_sdlRenderer, 0.08f, 0.08f, 0.09f, 1.0f);
+        SDL_RenderClear(m_sdlRenderer);
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), m_sdlRenderer);
+        SDL_RenderPresent(m_sdlRenderer);
+    }
+}
+@ Every event goes first to ImGui, which keeps its own record of the mouse
+and the keyboard. Only three events concern the application itself: quitting,
+closing the window, and a file dropped on it. A dropped file takes the same
+road as a file chosen in the dialog.
+
+<<Handle an SDL event>>=
+void App::processEvent(const SDL_Event& event)
+{
+    ImGui_ImplSDL3_ProcessEvent(&event);
+    switch (event.type)
+    {
+    case SDL_EVENT_QUIT:
+        m_running = false;
+        break;
+    case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        if (event.window.windowID == SDL_GetWindowID(m_window))
+            m_running = false;
+        break;
+    case SDL_EVENT_DROP_FILE:
+        if (event.drop.data)
+            requestOpen(event.drop.data);
+        break;
+    default:
+        break;
+    }
+}
+@* The layout. The window is divided into fixed regions. The menu bar sits on
+top, and ImGui reports the rest of the window as the main viewport's
+\emph{work area}, whose top edge [[WorkPos.y]] is just below the menu. A status
+bar one line high takes the bottom. Between them, the hierarchy takes 22\% of
+the width (but at least 260 units), the inspector 28\% (at least 320), and the
+viewport the rest. Each panel's position and size are set just before it is
+drawn.
+
+<<Lay out the panels and handle shortcuts>>=
+void App::drawUi()
+{
+    drawMenuBar();
+
+    <<Compute the regions of the window>>
+
+    <<Place and draw the four panels>>
+
+    drawPopups();
+
+    <<Handle the keyboard shortcuts>>
+}
+@
+<<Compute the regions of the window>>=
+const ImGuiViewport* vp = ImGui::GetMainViewport();
+const float statusH = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y;
+const float top = vp->WorkPos.y, bottom = vp->Pos.y + vp->Size.y - statusH;
+const float leftW = std::max(260.0f, vp->Size.x * 0.22f), rightW = std::max(320.0f, vp->Size.x * 0.28f);
+@
+<<Place and draw the four panels>>=
+ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, top));
+ImGui::SetNextWindowSize(ImVec2(leftW, bottom - top));
+drawHierarchy();
+
+ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x - rightW, top));
+ImGui::SetNextWindowSize(ImVec2(rightW, bottom - top));
+drawInspector();
+
+ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + leftW, top));
+ImGui::SetNextWindowSize(ImVec2(vp->Size.x - leftW - rightW, bottom - top));
+drawViewport();
+
+ImGui::SetNextWindowPos(ImVec2(vp->Pos.x, bottom));
+ImGui::SetNextWindowSize(ImVec2(vp->Size.x, statusH));
+drawStatusBar();
+@ Three keys act on the whole application: \textsf{F} frames the selection
+(or the whole stage when nothing is selected), \textsf{Esc} clears the
+selection, and \textsf{Ctrl+O} opens the file dialog. They must not fire while
+the user is typing in a text field---typing ``foo'' in the filter of the tree
+should not move the camera---so ImGui's [[WantTextInput]] guards them.
+
+<<Handle the keyboard shortcuts>>=
+if (!ImGui::GetIO().WantTextInput)
+{
+    if (ImGui::IsKeyPressed(ImGuiKey_F))
+        frameSelection();
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape))
+        select(entt::null, false);
+    if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_O))
+        openFileDialog();
+}
+@* Menus. The menu bar has three menus.
+
+<<Draw the menu bar>>=
+void App::drawMenuBar()
+{
+    if (!ImGui::BeginMainMenuBar())
+        return;
+    <<The File menu>>
+    <<The View menu>>
+    <<The Help menu>>
+    ImGui::EndMainMenuBar();
+}
+@ The File menu offers the dialog, a submenu with a text field in which a
+path can be typed or pasted (useful when no desktop dialog is available),
+reloading the current file, and quitting. The text field returns true when
+Enter is pressed, which counts as pressing Load. Reloading reads the file
+again from disk, which is handy while editing a \texttt{.usda} file in another
+window.
+
+<<The File menu>>=
+if (ImGui::BeginMenu("File"))
+{
+    if (ImGui::MenuItem("Open...", "Ctrl+O"))
+        openFileDialog();
+    if (ImGui::BeginMenu("Open path"))
+    {
+        ImGui::SetNextItemWidth(420.0f);
+        const bool enter = ImGui::InputText("##path", m_pathInput, sizeof(m_pathInput),
+                                            ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if ((ImGui::Button("Load") || enter) && m_pathInput[0])
+            requestOpen(m_pathInput);
+        ImGui::EndMenu();
+    }
+    if (ImGui::MenuItem("Reload", nullptr, false, m_scene.loaded()))
+        requestOpen(m_scene.filePath());
+    ImGui::Separator();
+    if (ImGui::MenuItem("Quit"))
+        m_running = false;
+    ImGui::EndMenu();
+}
+@ The View menu frames the stage or the selection and controls the image:
+shadows, texture mipmaps, normal maps, traced reflections, the direction of
+the light and the field of view. ImGui's check-mark items toggle the [[bool]]
+they are given and report the change, and every change sets
+[[m_needsRender]], so that the progressive rendering starts over with the new
+settings.
+
+<<The View menu>>=
+if (ImGui::BeginMenu("View"))
+{
+    if (ImGui::MenuItem("Frame all"))
+    {
+        const FlatGeometry& g = m_scene.geometry();
+        frameBounds(g.boundsMin, g.boundsMax);
+    }
+    if (ImGui::MenuItem("Frame selection", "F", false, m_selected != entt::null))
+        frameSelection();
+    if (ImGui::MenuItem("Shadows", nullptr, &m_shadows))
+        m_needsRender = true;
+    if (ImGui::MenuItem("Texture mipmaps", nullptr, &m_mipmaps))
+        m_needsRender = true;
+    if (ImGui::MenuItem("Normal maps", nullptr, &m_normalMaps))
+        m_needsRender = true;
+    if (ImGui::MenuItem("Reflections", nullptr, &m_reflections))
+        m_needsRender = true;
+    if (ImGui::SliderFloat3("Light direction", m_light, -1.0f, 1.0f))
+        m_needsRender = true;
+    if (ImGui::SliderFloat("Field of view", &m_fovY, 15.0f, 100.0f))
+        m_needsRender = true;
+    ImGui::EndMenu();
+}
+@ The About box cannot be opened from inside the menu, because ImGui's popups
+are identified by the stack of windows that opens them; the menu only raises a
+flag, and <<Draw the popups>> opens the box at the top level.
+
+<<The Help menu>>=
+if (ImGui::BeginMenu("Help"))
+{
+    if (ImGui::MenuItem("About"))
+        m_showAbout = true;
+    ImGui::EndMenu();
+}
+@* The hierarchy. The left panel shows the prims of the stage as a tree. The
+scene has already mirrored the stage into the EnTT registry: every prim is an
+entity with a [[PrimInfo]] component (path, name, type) and a [[Hierarchy]]
+component (parent and children). The tree is drawn by a recursive function,
+starting from the children of the pseudo-root, the invisible prim at the top
+of every USD stage.
+
+Above the tree, a text field filters the prims by name. The filter is
+recomputed only when its text changes (<<Recompute the hierarchy filter>>), not
+in every frame.
+
+<<Draw the hierarchy panel>>=
+void App::drawHierarchy()
+{
+    ImGui::Begin("Hierarchy", nullptr, kPanelFlags);
+    if (!m_scene.loaded())
+    {
+        ImGui::TextWrapped("No stage loaded.\n\nUse File > Open, drop a .usd/.usda/.usdc/.usdz file on the "
+                           "window, or pass a file on the command line.");
+        ImGui::End();
+        return;
+    }
+    ImGui::SetNextItemWidth(-FLT_MIN);
+    ImGui::InputTextWithHint("##filter", "Filter by name", m_filter, sizeof(m_filter));
+    updateFilter();
+    ImGui::Separator();
+    ImGui::BeginChild("tree");
+    for (entt::entity child : m_scene.registry().get<Hierarchy>(m_scene.root()).children)
+        drawHierarchyNode(child);
+    m_revealSelection = false;
+    ImGui::EndChild();
+    ImGui::End();
+}
+@ A filtered tree must show not only the prims whose names match, but also
+every ancestor of each match; otherwise the matches would have no branch to
+hang from. So for each matching entity we walk up the parents, inserting each
+one in the set. The walk stops at the root, or as soon as an insertion fails:
+an entity already in the set has had its own ancestors inserted before, by the
+same walk, so there is no point in climbing further. The total work is
+therefore proportional to the number of prims, however many of them match.
+
+<<Recompute the hierarchy filter>>=
+void App::updateFilter()
+{
+    if (m_appliedFilter == m_filter)
+        return;
+    m_appliedFilter = m_filter;
+    m_visibleByFilter.clear();
+    if (m_appliedFilter.empty())
+        return;
+    entt::registry& reg = m_scene.registry();
+    for (auto [e, info] : reg.view<PrimInfo>().each())
+    {
+        if (!containsCaseInsensitive(info.name, m_appliedFilter))
+            continue;
+        for (entt::entity a = e; a != entt::null && m_visibleByFilter.insert(a).second;)
+            a = reg.get<Hierarchy>(a).parent;
+    }
+}
+@ Names are compared without regard to case, which is what one expects of a
+search field. The standard library has no such function, but
+[[std::search]] with a predicate that compares lowered characters does the
+job. (The cast to [[unsigned char]] keeps [[std::tolower]] defined for bytes
+above 127.)
+
+<<Search a name ignoring case>>=
+bool containsCaseInsensitive(const std::string& text, const std::string& pattern)
+{
+    return std::search(text.begin(), text.end(), pattern.begin(), pattern.end(), [](char a, char b) {
+               return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
+           }) != text.end();
+}
+@ Drawing a node. A node is skipped if a filter is active and the node is not
+in its set. Otherwise we compute the flags of ImGui's tree node: it opens
+only with its arrow or a double click (so that a single click on the label
+selects), it spans the width of the panel, it is a leaf if it has no children,
+and it is highlighted if it is the selection.
+
+<<Draw one node of the hierarchy>>=
+void App::drawHierarchyNode(entt::entity e)
+{
+    if (!m_appliedFilter.empty() && !m_visibleByFilter.contains(e))
+        return;
+    entt::registry& reg = m_scene.registry();
+    const PrimInfo& info = reg.get<PrimInfo>(e);
+    const Hierarchy& h = reg.get<Hierarchy>(e);
+
+    <<Choose the flags of the tree node>>
+
+    <<Draw the tree node and react to clicks>>
+
+    if (open && !h.children.empty())
+    {
+        for (entt::entity child : h.children)
+            drawHierarchyNode(child);
+        ImGui::TreePop();
+    }
+}
+@ Leaves get [[ImGuiTreeNodeFlags_NoTreePushOnOpen]], so that they need no
+matching [[TreePop]]; that is why the recursion above pops only nodes with
+children.
+
+Two situations open a node from the program rather than by the user's
+hand. When the selection must be revealed, every ancestor of the selected
+prim is forced open, once. When a filter is active, every visible node is
+opened when it first appears, so that all matches can be seen; the condition
+[[ImGuiCond_Appearing]] still lets the user fold a branch afterwards.
+
+<<Choose the flags of the tree node>>=
+ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
+                           ImGuiTreeNodeFlags_SpanAvailWidth;
+if (h.children.empty())
+    flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+if (e == m_selected)
+    flags |= ImGuiTreeNodeFlags_Selected;
+if (m_revealSelection && m_reveal.contains(e))
+    ImGui::SetNextItemOpen(true);
+if (!m_appliedFilter.empty())
+    ImGui::SetNextItemOpen(true, ImGuiCond_Appearing);
+@ Prims that produced triangles for the renderer are drawn in light blue, so
+that the geometry stands out among transforms, scopes and materials. ImGui
+identifies tree nodes by an ID; prim names are not unique (many prims are
+called ``Mesh''), but the entity is, so we pass its integer value as a pointer
+ID and the name only as the label.
+
+A click on the label selects the prim, while a click on the arrow merely
+opens or closes the node; the function [[IsItemToggledOpen]] tells the two
+apart. When the selection is being revealed, the function [[SetScrollHereY]]
+scrolls the panel to the selected node. The type of the prim follows its name,
+in grey.
+
+<<Draw the tree node and react to clicks>>=
+const bool hasMesh = reg.all_of<MeshGeometry>(e);
+if (hasMesh)
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
+const bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(entt::to_integral(e))), flags,
+                                    "%s", info.name.c_str());
+if (hasMesh)
+    ImGui::PopStyleColor();
+if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
+    select(e, false);
+if (m_revealSelection && e == m_selected)
+    ImGui::SetScrollHereY();
+if (!info.typeName.empty())
+{
+    ImGui::SameLine();
+    ImGui::TextDisabled("%s", info.typeName.c_str());
+}
+@ Selecting an entity informs the renderer, which tints the selected mesh,
+and restarts the rendering. A selection made in the tree needs no revealing;
+one made by clicking on the image does, so in that case we collect the
+ancestors of the entity and raise [[m_revealSelection]]. The flag is lowered
+again at the end of the next drawing of the tree (<<Draw the hierarchy panel>>),
+so the forced opening and scrolling happen exactly once, and the user
+is free to fold the branches again.
+
+<<Select an entity>>=
+void App::select(entt::entity e, bool reveal)
+{
+    m_selected = e;
+    entt::registry& reg = m_scene.registry();
+    const MeshGeometry* mesh = reg.valid(e) ? reg.try_get<MeshGeometry>(e) : nullptr;
+    m_renderer.setSelectedMesh(mesh ? mesh->meshId : kNoMesh);
+    m_needsRender = true;
+    m_reveal.clear();
+    if (reveal && reg.valid(e))
+    {
+        for (entt::entity a = reg.get<Hierarchy>(e).parent; a != entt::null; a = reg.get<Hierarchy>(a).parent)
+            m_reveal.insert(a);
+        m_revealSelection = true;
+    }
+}
+@* The inspector. The right panel describes the selected prim; when nothing
+is selected, it describes the stage. For a prim it has three sections: the
+prim's identity, the geometry and material that the renderer made of it (if
+any), and a table of all its properties.
+
+<<Draw the inspector>>=
+void App::drawInspector()
+{
+    ImGui::Begin("Inspector", nullptr, kPanelFlags);
+    const UsdPrim prim = m_scene.prim(m_selected);
+    if (!prim)
+    {
+        <<Describe the stage when nothing is selected>>
+        ImGui::End();
+        return;
+    }
+
+    <<Describe the identity of the prim>>
+
+    <<Describe the rendered geometry and its material>>
+
+    <<List the properties of the prim>>
+    ImGui::End();
+}
+@ The stage summary gives the file, the stage's up axis and units, its time
+range if it is animated, its default prim, and how many materials and textures
+the scene found. Any warnings the scene collected while reading materials and
+textures (an unsupported shader, a missing file, a translucent material drawn
+opaque) are listed in orange; they explain why an image may differ from what
+another renderer would show.
+
+<<Describe the stage when nothing is selected>>=
+if (m_scene.loaded())
+{
+    const UsdStageRefPtr& stage = m_scene.stage();
+    ImGui::SeparatorText("Stage");
+    ImGui::TextWrapped("%s", m_scene.filePath().c_str());
+    ImGui::Text("Up axis: %s", m_scene.zUp() ? "Z" : "Y");
+    ImGui::Text("Meters per unit: %g", UsdGeomGetStageMetersPerUnit(stage));
+    if (stage->HasAuthoredTimeCodeRange())
+        ImGui::Text("Time codes: %g - %g", stage->GetStartTimeCode(), stage->GetEndTimeCode());
+    if (SdfPrimSpecHandle def = stage->GetRootLayer()->GetPrimAtPath(stage->GetDefaultPrim().GetPath()))
+        ImGui::Text("Default prim: %s", def->GetName().c_str());
+    const FlatGeometry& g = m_scene.geometry();
+    ImGui::Text("Materials: %zu   Textures: %zu", g.materials.size(), g.textures.size());
+    if (!m_scene.warnings().empty())
+    {
+        ImGui::SeparatorText("Warnings");
+        for (const std::string& w : m_scene.warnings())
+            ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s", w.c_str());
+    }
+    ImGui::Spacing();
+    ImGui::TextDisabled("Select a prim in the hierarchy or click on the viewport.");
+}
+@ The identity of a prim is shown as a two-column table of key and value,
+filled by a small local function [[row]]. Some rows appear only when they
+say something: the \emph{kind} of a model, instancing, references, applied API
+schemas. The specifier (def, over or class) is printed by OpenUSD as, for
+instance, ``SdfSpecifierDef''; we strip the prefix.
+
+<<Describe the identity of the prim>>=
+ImGui::SeparatorText("Prim");
+ImGui::TextWrapped("%s", prim.GetPath().GetText());
+if (ImGui::BeginTable("prim", 2, ImGuiTableFlags_SizingStretchProp))
+{
+    auto row = [](const char* key, const std::string& value) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", key);
+        ImGui::TableNextColumn();
+        ImGui::TextWrapped("%s", value.c_str());
+    };
+    row("Type", prim.GetTypeName().IsEmpty() ? "(typeless)" : prim.GetTypeName().GetString());
+    row("Specifier", TfStringReplace(TfStringify(prim.GetSpecifier()), "SdfSpecifier", ""));
+    TfToken kind;
+    if (UsdModelAPI(prim).GetKind(&kind) && !kind.IsEmpty())
+        row("Kind", kind.GetString());
+    row("Active", prim.IsActive() ? "yes" : "no");
+    if (prim.IsInstance() || prim.IsInstanceProxy())
+        row("Instancing", prim.IsInstance() ? "instance" : "instance proxy");
+    if (prim.HasAuthoredReferences())
+        row("Composition", "has references");
+    const std::vector<std::string> schemas = [&] {
+        std::vector<std::string> out;
+        for (const TfToken& t : prim.GetAppliedSchemas())
+            out.push_back(t.GetString());
+        return out;
+    }();
+    if (!schemas.empty())
+        row("API schemas", TfStringJoin(schemas, ", "));
+    ImGui::EndTable();
+}
+@ The second section exists only for prims that the scene turned into
+triangles, that is, entities with a [[MeshGeometry]] component. It shows what
+the \emph{renderer} sees, after the scene has resolved the bound material,
+which is often more useful than the raw attributes when an image looks wrong:
+the number of triangles, the material's path, and each of its inputs in turn.
+A button frames the prim.
+
+<<Describe the rendered geometry and its material>>=
+if (const MeshGeometry* mesh = m_scene.registry().try_get<MeshGeometry>(m_selected))
+{
+    ImGui::SeparatorText("Rendered geometry");
+    ImGui::Text("Triangles: %u", mesh->triangleCount);
+    const FlatGeometry& g = m_scene.geometry();
+    const Material& material = g.materials[mesh->material];
+    ImGui::TextWrapped("Material: %s", material.name.c_str());
+    <<Describe the diffuse color or texture>>
+    <<Describe the normal map>>
+    <<Describe roughness, metallic or specular color, and ior>>
+    if (mesh->subsetMaterials)
+        ImGui::Text("GeomSubsets with their own material: %u", mesh->subsetMaterials);
+    if (ImGui::Button("Frame (F)"))
+        frameSelection();
+}
+@ A diffuse texture is described by its resolved path (which may point inside
+a \texttt{.usdz} package), its size, its color space and the primvar that
+supplies its texture coordinates. If the prim lacks that primvar the texture
+cannot be applied, and we say so. Without a texture, the diffuse color is
+shown as a small swatch; the [[ColorEdit3]] widget is used only for display,
+with its inputs and picker disabled.
+
+<<Describe the diffuse color or texture>>=
+if (material.texture >= 0)
+{
+    const Texture& t = g.textures[material.texture];
+    ImGui::TextWrapped("Diffuse texture: %s", t.path.c_str());
+    ImGui::Text("  %d x %d, %s, uv set '%s'%s", t.width, t.height, t.srgb ? "sRGB" : "raw",
+                material.uvSet.c_str(), mesh->hasUVs ? "" : " (missing!)");
+}
+else
+{
+    float color[3] = {material.color[0], material.color[1], material.color[2]};
+    ImGui::ColorEdit3("Diffuse color", color, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoPicker);
+}
+@ For a normal map, the scale and bias matter as much as the image: they
+decide how the stored colors become tangent-space vectors, and an asset that
+flips the green channel (as many DirectX-style maps do) does it through them.
+
+<<Describe the normal map>>=
+if (material.normalTexture >= 0)
+{
+    const Texture& t = g.textures[material.normalTexture];
+    ImGui::TextWrapped("Normal map: %s", t.path.c_str());
+    ImGui::Text("  %d x %d, %s, scale (%g, %g, %g), bias (%g, %g, %g)", t.width, t.height,
+                t.srgb ? "sRGB" : "raw", material.normalScale[0], material.normalScale[1],
+                material.normalScale[2], material.normalBias[0], material.normalBias[1],
+                material.normalBias[2]);
+}
+@ Roughness and metallic are scalar inputs that may be constants or one
+channel of a texture; the local function [[scalarText]] prints either form,
+naming the channel by indexing the string \texttt{"rgba"}. Materials in the
+specular workflow have a specular color instead of a metallic value, so we
+show one or the other, followed by the index of refraction.
+
+<<Describe roughness, metallic or specular color, and ior>>=
+auto scalarText = [&](const char* label, const ScalarInput& in) {
+    if (in.texture >= 0)
+        ImGui::TextWrapped("%s: texture channel %c of %s (x%g %+g)", label, "rgba"[in.channel],
+                           g.textures[in.texture].path.c_str(), in.scale, in.bias);
+    else
+        ImGui::Text("%s: %g", label, in.value);
+};
+scalarText("Roughness", material.roughness);
+if (material.specularWorkflow)
+{
+    if (material.specularTexture >= 0)
+        ImGui::TextWrapped("Specular color: %s", g.textures[material.specularTexture].path.c_str());
+    else
+    {
+        float color[3] = {material.specularColor[0], material.specularColor[1], material.specularColor[2]};
+        ImGui::ColorEdit3("Specular color", color,
+                          ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoPicker);
+    }
+}
+else
+    scalarText("Metallic", material.metallic);
+ImGui::Text("IOR: %g", material.ior);
+@ The last section lists every property of the prim, attributes first and
+then relationships, in a table of three columns: name, type and value. The
+table takes the rest of the panel's height and scrolls by itself, keeping its
+header row in view ([[TableSetupScrollFreeze]]).
+
+<<List the properties of the prim>>=
+ImGui::SeparatorText("Properties");
+if (ImGui::BeginTable("props", 3,
+                      ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_Resizable |
+                          ImGuiTableFlags_ScrollY,
+                      ImVec2(0, ImGui::GetContentRegionAvail().y)))
+{
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.35f);
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthStretch, 0.2f);
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 0.45f);
+    ImGui::TableHeadersRow();
+    <<List the attributes of the prim>>
+    <<List the relationships of the prim>>
+    ImGui::EndTable();
+}
+@ An attribute's value is read at the default time. An attribute that has
+only time samples has no default value, so for it we show the value at the
+earliest sample, and note how many samples there are. The names of attributes
+whose value was authored in the file are drawn normally; those that merely
+report a fallback value defined by their schema are greyed out.
+
+<<List the attributes of the prim>>=
+for (const UsdAttribute& attr : prim.GetAttributes())
+{
+    VtValue value;
+    attr.Get(&value, UsdTimeCode::Default());
+    if (value.IsEmpty() && attr.GetNumTimeSamples() > 0)
+        attr.Get(&value, UsdTimeCode::EarliestTime());
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    if (attr.HasAuthoredValue())
+        ImGui::TextUnformatted(attr.GetName().GetText());
+    else
+        ImGui::TextDisabled("%s", attr.GetName().GetText());
+    ImGui::TableNextColumn();
+    ImGui::TextDisabled("%s", attr.GetTypeName().GetAsToken().GetText());
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", valueString(value).c_str());
+    if (attr.GetNumTimeSamples() > 0)
+    {
+        ImGui::SameLine();
+        ImGui::TextDisabled("(%zu samples)", attr.GetNumTimeSamples());
+    }
+}
+@ Any USD value can be turned into text by [[TfStringify]], but some values
+are long: the points of a mesh may run to megabytes. We cut the text at 160
+characters, which is enough to recognize a value and keeps the table
+responsive.
+
+<<Format an attribute value for the inspector>>=
+std::string valueString(const VtValue& value, size_t maxLength = 160)
+{
+    std::string s = value.IsEmpty() ? std::string("<no value>") : TfStringify(value);
+    if (s.size() > maxLength)
+        s = s.substr(0, maxLength) + " ...";
+    return s;
+}
+@ A relationship has no value but a list of target paths, such as the
+material bound to a prim.
+
+<<List the relationships of the prim>>=
+for (const UsdRelationship& rel : prim.GetRelationships())
+{
+    SdfPathVector targets;
+    rel.GetTargets(&targets);
+    std::vector<std::string> names;
+    for (const SdfPath& p : targets)
+        names.push_back(p.GetString());
+    ImGui::TableNextRow();
+    ImGui::TableNextColumn();
+    ImGui::TextUnformatted(rel.GetName().GetText());
+    ImGui::TableNextColumn();
+    ImGui::TextDisabled("rel");
+    ImGui::TableNextColumn();
+    ImGui::TextWrapped("%s", names.empty() ? "<none>" : TfStringJoin(names, ", ").c_str());
+}
+@* The camera. The orbit camera is described by a target point
+$\mathbf t$, a distance $d$, a yaw angle $\theta$ and a pitch angle $\varphi$.
+The eye is at $\mathbf e = \mathbf t + d\,\mathbf o$, where the unit vector
+$\mathbf o$ points from the target towards the eye. USD stages declare which
+axis is ``up'', $Y$ or $Z$, and the camera must follow suit, or a Z-up scene
+would lie on its side.
+
+For a Y-up stage, $\theta$ turns around $Y$ starting from the $+Z$ axis, and
+$\varphi$ lifts the eye above the $XZ$ plane:
+$$\mathbf o = (\cos\varphi\sin\theta,\ \sin\varphi,\ \cos\varphi\cos\theta).$$
+For a Z-up stage, $\theta$ turns around $Z$ starting from the $+X$ axis, and
+$\varphi$ lifts the eye above the $XY$ plane:
+$$\mathbf o = (\cos\varphi\cos\theta,\ \cos\varphi\sin\theta,\ \sin\varphi).$$
+In both cases the up vector given to the renderer is simply the world's up
+axis; the renderer builds an orthonormal frame from it and the viewing
+direction. This is also the place where all the settings of the View menu
+reach the renderer, because it is called whenever [[m_needsRender]] is set.
+
+<<Send the camera and the options to the renderer>>=
+void App::updateCamera()
+{
+    const float cp = std::cos(m_pitch), sp = std::sin(m_pitch), cy = std::cos(m_yaw), sy = std::sin(m_yaw);
+    float offset[3], up[3];
+    if (m_scene.zUp())
+    {
+        offset[0] = cp * cy, offset[1] = cp * sy, offset[2] = sp;
+        up[0] = 0, up[1] = 0, up[2] = 1;
+    }
+    else
+    {
+        offset[0] = cp * sy, offset[1] = sp, offset[2] = cp * cy;
+        up[0] = 0, up[1] = 1, up[2] = 0;
+    }
+    float eye[3];
+    for (int k = 0; k < 3; ++k)
+        eye[k] = m_target[k] + offset[k] * m_distance;
+    m_renderer.setCamera(eye, m_target, up, m_fovY);
+    m_renderer.setLightDir(m_light);
+    m_renderer.setShadows(m_shadows);
+    m_renderer.setMipmaps(m_mipmaps);
+    m_renderer.setNormalMaps(m_normalMaps);
+    m_renderer.setReflections(m_reflections);
+}
+@ Framing. To frame an axis-aligned box, we aim at its center and enclose it
+in a sphere whose radius $r$ is half the box's diagonal. A sphere of radius
+$r$ seen from distance $d$ subtends a half-angle $\alpha$ with
+$\sin\alpha = r/d$: the line of sight that grazes the sphere is tangent to it,
+and the radius to the point of tangency is perpendicular to that line. The
+sphere just fits the vertical field of view $\phi$ when $\alpha = \phi/2$,
+that is, when
+$$d = {r\over\sin(\phi/2)}.$$
+We add 15\% of margin. The viewport is wider than it is tall, so the
+horizontal direction then fits as well. A tiny lower bound on $r$ keeps an
+empty or flat scene from putting the eye on the target.
+
+<<Frame a bounding box>>=
+void App::frameBounds(const float lo[3], const float hi[3])
+{
+    float radius = 0.0f;
+    for (int k = 0; k < 3; ++k)
+    {
+        m_target[k] = 0.5f * (lo[k] + hi[k]);
+        radius += (hi[k] - lo[k]) * (hi[k] - lo[k]);
+    }
+    radius = std::max(0.5f * std::sqrt(radius), 1e-3f);
+    m_distance = 1.15f * radius / std::sin(0.5f * m_fovY * float(M_PI) / 180.0f);
+    m_needsRender = true;
+}
+@ The bounds of a selected mesh are not stored anywhere, but they are cheap to
+compute: the scene recorded the range of triangles each mesh contributed to
+the flattened geometry, so we visit their vertices, already in world space.
+Without a selected mesh we frame the whole stage, whose bounds the scene
+computed while flattening it.
+
+<<Frame the selection>>=
+void App::frameSelection()
+{
+    const FlatGeometry& g = m_scene.geometry();
+    const MeshGeometry* mesh =
+        m_scene.registry().valid(m_selected) ? m_scene.registry().try_get<MeshGeometry>(m_selected) : nullptr;
+    if (!mesh)
+    {
+        frameBounds(g.boundsMin, g.boundsMax);
+        return;
+    }
+    float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
+    for (unsigned t = mesh->firstTriangle; t < mesh->firstTriangle + mesh->triangleCount; ++t)
+        for (int c = 0; c < 3; ++c)
+        {
+            const float* v = &g.vertices[3 * size_t(g.indices[3 * size_t(t) + c])];
+            for (int k = 0; k < 3; ++k)
+                lo[k] = std::min(lo[k], v[k]), hi[k] = std::max(hi[k], v[k]);
+        }
+    frameBounds(lo, hi);
+}
+@* The viewport. The middle panel shows the ray-traced image and turns mouse
+actions into camera motion and selection. It is also where rendering happens:
+the viewport knows its own size, which is the size of the image to render.
+
+<<Draw the viewport>>=
+void App::drawViewport()
+{
+    <<Open the borderless viewport window>>
+
+    <<Cover the viewport with an invisible button>>
+
+    <<Orbit with the left mouse button>>
+    <<Pan with the right or middle mouse button>>
+    <<Zoom with the mouse wheel>>
+
+    <<Compute the resolution of the image>>
+
+    <<Pick the prim under a mouse click>>
+
+    <<Resize the image with the viewport>>
+    <<Restart or continue the progressive rendering>>
+    <<Show the image in the viewport>>
+    ImGui::End();
+}
+@ The viewport window has no title bar, no scroll bar and no padding, so that
+the image fills it to the edges. Without a working renderer, or while the
+window is too small to hold an image, it only shows a message (or nothing).
+
+<<Open the borderless viewport window>>=
+ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
+ImGui::Begin("Viewport", nullptr, kPanelFlags | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoTitleBar);
+ImGui::PopStyleVar();
+
+const ImVec2 size = ImGui::GetContentRegionAvail();
+const ImVec2 origin = ImGui::GetCursorScreenPos();
+if (!m_rendererOk || size.x < 4 || size.y < 4)
+{
+    ImGui::TextWrapped("%s", m_rendererOk ? "" : "OptiX renderer unavailable.");
+    ImGui::End();
+    return;
+}
+@ An image drawn by ImGui does not react to the mouse, and dragging across a
+window's empty space would move the window. So we cover the whole viewport
+with an invisible button that accepts all three mouse buttons. While the
+button is \emph{active}---a mouse button was pressed on it and is still
+held---the drag belongs to the viewport, even if the mouse leaves it.
+
+<<Cover the viewport with an invisible button>>=
+ImGui::InvisibleButton("viewport", size, ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonRight |
+                                             ImGuiButtonFlags_MouseButtonMiddle);
+const ImGuiIO& io = ImGui::GetIO();
+const bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
+@ Dragging with the left button orbits: horizontal motion changes the yaw and
+vertical motion the pitch, by 0.006 radians per unit, about a third of a
+degree. The pitch is kept within $\pm1.55$ radians, just short of
+$\pm\pi/2\approx\pm1.5708$: at exactly a right angle the viewing direction
+would be parallel to the up vector, and the camera frame built from their
+cross product would collapse. A drag must exceed two units before it counts,
+so that a click with a slightly unsteady hand still selects.
+
+<<Orbit with the left mouse button>>=
+// camera controls: left = orbit, right/middle = pan, wheel = zoom
+if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f))
+{
+    m_yaw -= io.MouseDelta.x * 0.006f;
+    m_pitch = std::clamp(m_pitch + io.MouseDelta.y * 0.006f, -1.55f, 1.55f);
+    m_needsRender = true;
+}
+@ Panning moves the target in the plane of the screen, so that the point under
+the mouse follows the mouse. We need the camera's right and up vectors in
+world space. With $\mathbf f = -\mathbf o$ the viewing direction and
+$\mathbf u_w$ the world's up axis, the right vector is
+$\mathbf r \propto \mathbf f\times\mathbf u_w$ and the camera's up vector is
+$\mathbf u = \mathbf r\times\mathbf f$. Working out the products with the two
+formulas for $\mathbf o$ gives, for a Y-up stage,
+$$\mathbf r = (\cos\theta,\ 0,\ -\sin\theta),\qquad
+  \mathbf u = (-\sin\varphi\sin\theta,\ \cos\varphi,\ -\sin\varphi\cos\theta),$$
+and for a Z-up stage,
+$$\mathbf r = (-\sin\theta,\ \cos\theta,\ 0),\qquad
+  \mathbf u = (-\sin\varphi\cos\theta,\ -\sin\varphi\sin\theta,\ \cos\varphi).$$
+
+How far should the target move for each unit the mouse moves? At distance $d$,
+a vertical field of view $\phi$ spans a height of $2d\tan(\phi/2)$ in the
+world, and this height fills the $H$ units of the viewport's height; one unit
+of mouse motion is therefore worth $k = 2d\tan(\phi/2)/H$ in the world at the
+target's depth. Moving the mouse to the right should drag the scene to the
+right, which means moving the target to the left, along $-\mathbf r$; screen
+coordinates grow downwards, so moving the mouse down moves the target along
+$+\mathbf u$ and the scene down.
+
+<<Pan with the right or middle mouse button>>=
+if (active && (ImGui::IsMouseDragging(ImGuiMouseButton_Right, 1.0f) ||
+               ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 1.0f)))
+{
+    // move the target in the camera plane
+    const float cp = std::cos(m_pitch), sp = std::sin(m_pitch), cy = std::cos(m_yaw), sy = std::sin(m_yaw);
+    float right[3], up[3];
+    if (m_scene.zUp())
+        right[0] = -sy, right[1] = cy, right[2] = 0, up[0] = -sp * cy, up[1] = -sp * sy, up[2] = cp;
+    else
+        right[0] = cy, right[1] = 0, right[2] = -sy, up[0] = -sp * sy, up[1] = cp, up[2] = -sp * cy;
+    const float k = m_distance * 2.0f * std::tan(0.5f * m_fovY * float(M_PI) / 180.0f) / size.y;
+    for (int i = 0; i < 3; ++i)
+        m_target[i] += (io.MouseDelta.y * up[i] - io.MouseDelta.x * right[i]) * k;
+    m_needsRender = true;
+}
+@ The wheel zooms by multiplying the distance by $0.88$ per notch forward and
+dividing by it per notch backward. A geometric step feels the same at every
+scale, from a whole city down to a screw, and the distance can approach the
+target but never reach or cross it.
+
+<<Zoom with the mouse wheel>>=
+if (hovered && io.MouseWheel != 0.0f)
+{
+    m_distance *= std::pow(0.88f, io.MouseWheel);
+    m_needsRender = true;
+}
+@ ImGui measures in logical units, but the image should have one ray per
+physical pixel. The framebuffer scale converts one into the other.
+
+<<Compute the resolution of the image>>=
+const float fbScale = io.DisplayFramebufferScale.x;
+const unsigned w = unsigned(size.x * fbScale), h = unsigned(size.y * fbScale);
+@ Picking. Clicking on the image selects the prim under the mouse. The
+renderer already knows which mesh each pixel shows: on the first sample of
+every image, which goes through the center of each pixel, it records a mesh
+identifier per pixel and copies that buffer back to the CPU. Picking is
+therefore a lookup, with no extra ray to trace.
+
+A click is a release of the left button that did not travel far: ImGui
+records the largest squared distance the mouse moved while the button was
+down, and we accept less than 16, that is, less than 4 units. Anything longer
+was an orbit, not a click. We also require that the renderer's buffer has the
+viewport's current width, so that pixel coordinates mean the same thing in
+both. The selection is revealed in the tree; a click on the background, which
+has no mesh, clears it.
+
+<<Pick the prim under a mouse click>>=
+// pick on click (left release without dragging)
+if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16.0f &&
+    m_renderer.width() == w)
+{
+    const unsigned px = unsigned((io.MousePos.x - origin.x) * fbScale);
+    const unsigned py = unsigned((io.MousePos.y - origin.y) * fbScale);
+    const unsigned meshId = m_renderer.meshIdAt(px, py);
+    const FlatGeometry& g = m_scene.geometry();
+    select(meshId < g.meshEntity.size() ? g.meshEntity[meshId] : entt::null, true);
+}
+@ When the viewport changes size, the renderer reallocates its buffers and we
+replace the SDL texture by one of the new size. The texture is a
+\emph{streaming} texture, meant to be rewritten often, in the pixel format
+[[SDL_PIXELFORMAT_RGBA32]], whose bytes are red, green, blue and alpha in
+memory order---exactly the layout of the renderer's [[uchar4]] pixels.
+
+<<Resize the image with the viewport>>=
+if (w != m_renderer.width() || h != m_renderer.height())
+{
+    m_renderer.resize(w, h);
+    if (m_texture)
+        SDL_DestroyTexture(m_texture);
+    m_texture = SDL_CreateTexture(m_sdlRenderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, int(w), int(h));
+    m_needsRender = true;
+}
+@ Progressive rendering is driven from here. Any change---camera, selection,
+settings, a new file, a new size---has set [[m_needsRender]]. We then pass the
+new camera and options to the renderer and reset its accumulation, which
+throws away the samples of the old image. In every frame, as long as fewer
+than [[kMaxSamples]] samples have been taken, the renderer adds one more
+sample to each pixel, and the averaged image is copied into the texture. While
+the user drags the camera, each frame thus shows a fresh one-sample image;
+when the user lets go, the image refines itself in a few seconds and then the
+GPU rests.
+
+A failure of the renderer, reported as an exception, disables it and shows the
+message in the error popup, rather than ending the program.
+
+<<Restart or continue the progressive rendering>>=
+// any change restarts the progressive accumulation; otherwise keep adding
+// samples until kMaxSamples (glossy reflections and antialiasing converge)
+if (m_needsRender)
+{
+    updateCamera();
+    m_renderer.resetAccumulation();
+    m_needsRender = false;
+}
+if (m_texture && m_rendererOk && m_renderer.samples() < kMaxSamples)
+{
+    try
+    {
+        m_renderer.render();
+        SDL_UpdateTexture(m_texture, nullptr, m_renderer.pixels().data(), int(w * 4));
+    }
+    catch (const std::exception& e)
+    {
+        m_error = std::string("Rendering failed: ") + e.what();
+        m_rendererOk = false;
+    }
+}
+@ Finally the texture is drawn over the invisible button. ImGui's SDL renderer
+back end interprets a texture identifier as a pointer to an
+[[SDL_Texture]]. If the stage has nothing the renderer can draw, a note says so
+in the corner, so that an empty viewport is not mistaken for a broken one.
+
+<<Show the image in the viewport>>=
+if (m_texture)
+    ImGui::GetWindowDrawList()->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(m_texture))), origin,
+                                         ImVec2(origin.x + size.x, origin.y + size.y));
+if (m_scene.loaded() && m_scene.geometry().empty())
+    ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x + 12, origin.y + 12), IM_COL32(220, 220, 220, 255),
+                                        "This stage has no renderable geometry (Mesh, Cube, Sphere).");
+@* The status bar and the popups. The status bar is a one-line window at the
+bottom. It counts the prims (minus one, for the pseudo-root, which is an
+entity like the others but not a prim anyone wrote), the meshes, the triangles
+and the textures, names the OptiX version and the GPU, and shows the progress
+of the rendering with the time of the last sample. [[OPTIX_VERSION]] encodes
+version 9.1.0 as 90100, so we take it apart with divisions.
+
+<<Draw the status bar>>=
+void App::drawStatusBar()
+{
+    ImGui::Begin("Status", nullptr, kPanelFlags | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
+    const FlatGeometry& g = m_scene.geometry();
+    ImGui::Text("%s  |  prims: %zu  meshes: %zu  triangles: %zu  textures: %zu  |  OptiX %d.%d.%d on %s  |  "
+                "samples %u/%u, %.2f ms",
+                m_scene.loaded() ? m_scene.filePath().c_str() : "no file",
+                m_scene.loaded() ? m_scene.registry().storage<PrimInfo>().size() - 1 : 0, g.meshEntity.size(),
+                g.indices.size() / 3, g.textures.size(), OPTIX_VERSION / 10000, (OPTIX_VERSION / 100) % 100, OPTIX_VERSION % 100,
+                m_renderer.deviceName().c_str(), m_renderer.samples(), kMaxSamples, m_renderer.lastRenderMs());
+    ImGui::End();
+}
+@ Two modal popups complete the interface. The error popup opens whenever
+[[m_error]] holds a message and stays until the user acknowledges it, which
+clears the message. The About box is opened here, at the top level of the
+window stack, when the Help menu has raised [[m_showAbout]]; it summarizes
+the tools and the mouse and keyboard controls.
+
+<<Draw the popups>>=
+void App::drawPopups()
+{
+    if (!m_error.empty() && !ImGui::IsPopupOpen("Error"))
+        ImGui::OpenPopup("Error");
+    if (ImGui::BeginPopupModal("Error", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::TextUnformatted(m_error.c_str());
+        if (ImGui::Button("OK"))
+        {
+            m_error.clear();
+            ImGui::CloseCurrentPopup();
+        }
+        ImGui::EndPopup();
+    }
+
+    if (m_showAbout)
+    {
+        ImGui::OpenPopup("About");
+        m_showAbout = false;
+    }
+    if (ImGui::BeginPopupModal("About", nullptr, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+        ImGui::Text("USD OptiX Viewer");
+        ImGui::Separator();
+        ImGui::Text("OpenUSD scene loading, EnTT scene graph, OptiX %d ray tracing,", OPTIX_VERSION / 10000);
+        ImGui::Text("SDL3 windowing and Dear ImGui %s user interface.", IMGUI_VERSION);
+        ImGui::Spacing();
+        ImGui::TextDisabled("Left drag: orbit   Right/middle drag: pan   Wheel: zoom");
+        ImGui::TextDisabled("Click: select   F: frame selection   Esc: clear selection");
+        if (ImGui::Button("Close"))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+}
+@* Decoding images. Our build of OpenUSD leaves out its imaging libraries,
+and with them OpenUSD's image readers, so the scene decodes textures with
+Sean Barrett's \lpfile{stb\_image.h}, a single-header library in the public
+domain. Such a header contains only declarations, unless a certain macro,
+\textit{STB\_\allowbreak IMAGE\_\allowbreak IMPLEMENTATION}, is defined before the header is included; then
+it contains the implementation as well. Exactly one source file of the program must
+do so, and this is it.
+
+<<UsdOptixViewer/src/StbImage.cpp>>=
+// Image decoding for textures (PNG, JPEG, TGA, BMP, HDR, ...).
+#define STB_IMAGE_IMPLEMENTATION
+#include "third_party/stb_image.h"

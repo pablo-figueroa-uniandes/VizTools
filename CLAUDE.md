@@ -75,6 +75,16 @@ Conventions: C++20, 4-space indent, braces on their own line, `m_` members,
 sparse comments that explain the why. Keep `-Wno-deprecated` for the USD headers,
 and keep builds warning-free.
 
+## Literate book (LiterateP/)
+
+`LiterateP/src/*.nw` contains every line of the 13 project source files
+(everything except stb_image.h) in noweb syntax, with Knuth-style prose.
+**When you change any source file, update the matching chunk in the book**,
+then run `python3 LiterateP/lp.py check`. It must print `ok` for all files.
+Rebuild the PDF with `LiterateP/build.sh` (needs tectonic in `~/.local/bin`).
+Chunk names are unique across the book. A chunk definition goes on its own
+line after `@`. Never hard-code section numbers: cite chunks as `<<Name>>`.
+
 ## Testing
 
 - Synthetic X input (xdotool) does not reach SDL on this display, so use

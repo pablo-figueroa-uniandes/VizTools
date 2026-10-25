@@ -70,6 +70,7 @@ cmake --install build
 | Path | Contents |
 |------|----------|
 | [UsdOptixViewer/](UsdOptixViewer/) | Viewer sources, CMake project and test scenes |
+| [LiterateP/](LiterateP/) | The whole program as a Knuth-style literate program: [PDF](LiterateP/UsdOptixViewer-literate.pdf) (102 pages), noweb sources, and the tool that tangles, checks and weaves them |
 | [logbook.md](logbook.md) | Task log: tool installation and every feature added, with how it was verified |
 | [summary.md](summary.md) | One-page summary of the work |
 | [install_all_users.sh](install_all_users.sh) | Script that moved the per-user tool installs to `/opt/viztools` and `/usr/local/cuda-13.2` |

@@ -133,3 +133,15 @@ Not supported yet: translucency, UsdTransform2d, UDIM, normal/roughness/metallic
   - McUsd's gold block renders as a reflective metal from its roughness/metallic textures.
   - The sample, texture, mipmap and normal-map scenes still look correct.
   - The build has no warnings, and the installed copy was updated.
+
+### Follow-up (October 24th): literate program
+
+- `LiterateP/` holds the whole program as a literate program in Knuth's style: `UsdOptixViewer-literate.pdf`, 102 pages, 293 sections and 286 chunks.
+- The book covers all 13 source files: the CMake files, every C++/CUDA file and the install script. The third-party stb_image.h is not covered.
+- Format:
+  - The sources are written in noweb syntax, one file per part (`src/*.nw`).
+  - `lp.py` tangles them back into the sources, and `lp.py check` compares the result byte for byte with the repository files.
+  - `lp.py weave` produces CWEB-style LaTeX: numbered sections, ⟨chunk n⟩ ≡ definitions with "used in" cross-references, bold keywords, italic identifiers, the ≠ ≤ ∧ → operators, and an index of chunk names.
+  - The PDF is typeset with Tectonic, installed in `~/.local/bin` (no TeX Live was available).
+- Status: `lp.py check` reports ok for all 13 files. The PDF builds with no TeX errors and no overfull lines.
+- The intro, build and install parts were written directly. The scene, renderer, device and application parts were written in parallel by four sub-agents, each verifying its own files with `check`, then merged and checked as a whole.
