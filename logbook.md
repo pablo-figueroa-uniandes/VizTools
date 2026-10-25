@@ -204,3 +204,8 @@ Not supported yet: translucency, UsdTransform2d, UDIM, normal/roughness/metallic
   - The PDF is typeset with Tectonic, installed in `~/.local/bin` (no TeX Live was available).
 - Status: `lp.py check` reports ok for all 13 files. The PDF builds with no TeX errors and no overfull lines.
 - The intro, build and install parts were written directly. The scene, renderer, device and application parts were written in parallel by four sub-agents, each verifying its own files with `check`, then merged and checked as a whole.
+
+### Follow-up (October 25th): slide presentation
+
+- `Docs/UsdOptixViewer-code.pptx` walks through the code in 24 slides: architecture, scene loading, OptiX, the application, USD cameras and the XR output. It has speaker notes and screenshots of the running viewer (`Docs/images/`), including the CloudXR left-eye mirror.
+- `Docs/make_slides.js` regenerates it with pptxgenjs (`npm install pptxgenjs@3.12.0`). It lives on the `cloudxr` branch, because it covers the XR code.
