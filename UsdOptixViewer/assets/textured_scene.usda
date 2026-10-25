@@ -1,0 +1,161 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# Texture test scene. textures/uv_grid.png has "UP" + an arrow pointing to the
+# top of the image, a red top-left corner and a blue bottom-left corner, so
+# every face below must show the arrow pointing up (the top face points to -Z).
+
+def Xform "World"
+{
+    def Scope "Looks"
+    {
+        # File path comes from a material interface input.
+        def Material "GridMat"
+        {
+            asset inputs:diffuseTexture = @./textures/uv_grid.png@
+            token outputs:surface.connect = </World/Looks/GridMat/Surface.outputs:surface>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (1, 0, 1)
+                color3f inputs:diffuseColor.connect = </World/Looks/GridMat/Texture.outputs:rgb>
+                token outputs:surface
+            }
+
+            def Shader "Reader"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                string inputs:varname = "st"
+                float2 outputs:result
+            }
+
+            def Shader "Texture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file.connect = </World/Looks/GridMat.inputs:diffuseTexture>
+                float2 inputs:st.connect = </World/Looks/GridMat/Reader.outputs:result>
+                token inputs:sourceColorSpace = "sRGB"
+                token inputs:wrapS = "repeat"
+                token inputs:wrapT = "repeat"
+                float3 outputs:rgb
+            }
+        }
+
+        # Same texture tinted with scale, read from a differently named primvar.
+        def Material "TintedMat"
+        {
+            token outputs:surface.connect = </World/Looks/TintedMat/Surface.outputs:surface>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor.connect = </World/Looks/TintedMat/Texture.outputs:rgb>
+                token outputs:surface
+            }
+
+            def Shader "Reader"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                string inputs:varname = "uv"
+                float2 outputs:result
+            }
+
+            def Shader "Texture"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @./textures/uv_grid.png@
+                float2 inputs:st.connect = </World/Looks/TintedMat/Reader.outputs:result>
+                float4 inputs:scale = (0.4, 0.7, 1, 1)
+                float4 inputs:bias = (0, 0.05, 0.1, 0)
+                float3 outputs:rgb
+            }
+        }
+
+        def Material "SolidRed"
+        {
+            token outputs:surface.connect = </World/Looks/SolidRed/Surface.outputs:surface>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.8, 0.1, 0.1)
+                token outputs:surface
+            }
+        }
+    }
+
+    def Mesh "Ground"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-7, 0, -5), (-7, 0, 5), (7, 0, 5), (7, 0, -5)]
+        color3f[] primvars:displayColor = [(0.5, 0.52, 0.55)]
+    }
+
+    # faceVarying, indexed st on a box; every side shows the arrow upright.
+    def Mesh "Box" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/GridMat>
+        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [0, 1, 2, 3, 1, 5, 6, 2, 5, 4, 7, 6, 4, 0, 3, 7, 3, 2, 6, 7, 4, 5, 1, 0]
+        point3f[] points = [(-1, 0, 1), (1, 0, 1), (1, 2, 1), (-1, 2, 1), (-1, 0, -1), (1, 0, -1), (1, 2, -1), (-1, 2, -1)]
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "faceVarying"
+        )
+        int[] primvars:st:indices = [0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3, 0, 1, 2, 3]
+        double3 xformOp:translate = (0, 0, 0)
+        float xformOp:rotateY = -30
+        uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateY"]
+    }
+
+    # vertex st going 0..2: the texture repeats 2x2.
+    def Mesh "RepeatWall" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/GridMat>
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-6.5, 0, -4), (-2.5, 0, -4), (-2.5, 4, -4), (-6.5, 4, -4)]
+        texCoord2f[] primvars:st = [(0, 0), (2, 0), (2, 2), (0, 2)] (
+            interpolation = "vertex"
+        )
+    }
+
+    # Two faces with different materials through GeomSubsets.
+    def Mesh "SubsetPanel" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/SolidRed>
+        int[] faceVertexCounts = [4, 4]
+        int[] faceVertexIndices = [0, 1, 4, 3, 1, 2, 5, 4]
+        point3f[] points = [(2.5, 0, -4), (4.5, 0, -4), (6.5, 0, -4), (2.5, 2, -4), (4.5, 2, -4), (6.5, 2, -4)]
+        texCoord2f[] primvars:uv = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "faceVarying"
+        )
+        int[] primvars:uv:indices = [0, 1, 2, 3, 0, 1, 2, 3]
+        uniform token subsetFamily:materialBind:familyType = "nonOverlapping"
+
+        def GeomSubset "TintedFace" (
+            prepend apiSchemas = ["MaterialBindingAPI"]
+        )
+        {
+            uniform token elementType = "face"
+            uniform token familyName = "materialBind"
+            int[] indices = [0]
+            rel material:binding = </World/Looks/TintedMat>
+        }
+    }
+}

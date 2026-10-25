@@ -1,0 +1,8 @@
+# build trees
+build/
+UsdOptixViewer/build/
+# editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

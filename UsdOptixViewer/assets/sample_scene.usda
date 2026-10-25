@@ -1,0 +1,64 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World" (
+    kind = "assembly"
+)
+{
+    def Mesh "Ground"
+    {
+        uniform token subdivisionScheme = "none"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-6, 0, -6), (-6, 0, 6), (6, 0, 6), (6, 0, -6)]
+        color3f[] primvars:displayColor = [(0.55, 0.57, 0.6)]
+    }
+
+    def Xform "Props" (
+        kind = "group"
+    )
+    {
+        def Cube "RedCube"
+        {
+            double size = 1.5
+            color3f[] primvars:displayColor = [(0.85, 0.2, 0.15)]
+            double3 xformOp:translate = (-2, 0.75, 0)
+            float xformOp:rotateY = 30
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateY"]
+        }
+
+        def Sphere "BlueSphere"
+        {
+            double radius = 1
+            color3f[] primvars:displayColor = [(0.2, 0.4, 0.9)]
+            double3 xformOp:translate = (1, 1, 0.5)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+
+        def Mesh "GreenPyramid"
+        {
+            uniform token subdivisionScheme = "none"
+            int[] faceVertexCounts = [4, 3, 3, 3, 3]
+            int[] faceVertexIndices = [0, 3, 2, 1, 0, 1, 4, 1, 2, 4, 2, 3, 4, 3, 0, 4]
+            point3f[] points = [(-0.8, 0, -0.8), (0.8, 0, -0.8), (0.8, 0, 0.8), (-0.8, 0, 0.8), (0, 1.6, 0)]
+            color3f[] primvars:displayColor = [(0.25, 0.75, 0.3)]
+            double3 xformOp:translate = (3.2, 0, -1.5)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+
+    def Xform "Hidden"
+    {
+        token visibility = "invisible"
+
+        def Cube "InvisibleCube"
+        {
+            double3 xformOp:translate = (0, 4, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+}

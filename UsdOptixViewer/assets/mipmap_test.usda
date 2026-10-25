@@ -1,0 +1,64 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# Mipmap test: a large floor with textures/uv_grid.png repeated 20x20, seen at
+# a grazing angle. With mipmaps the far checkerboard fades smoothly to gray;
+# without them (--no-mipmaps) it breaks into moire and noise.
+
+def Xform "World"
+{
+    def Material "GridMat"
+    {
+        token outputs:surface.connect = </World/GridMat/Surface.outputs:surface>
+
+        def Shader "Surface"
+        {
+            uniform token info:id = "UsdPreviewSurface"
+            color3f inputs:diffuseColor.connect = </World/GridMat/Texture.outputs:rgb>
+            token outputs:surface
+        }
+
+        def Shader "Reader"
+        {
+            uniform token info:id = "UsdPrimvarReader_float2"
+            string inputs:varname = "st"
+            float2 outputs:result
+        }
+
+        def Shader "Texture"
+        {
+            uniform token info:id = "UsdUVTexture"
+            asset inputs:file = @./textures/uv_grid.png@
+            float2 inputs:st.connect = </World/GridMat/Reader.outputs:result>
+            token inputs:wrapS = "repeat"
+            token inputs:wrapT = "repeat"
+            float3 outputs:rgb
+        }
+    }
+
+    def Mesh "Floor" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/GridMat>
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-20, 0, 20), (20, 0, 20), (20, 0, -20), (-20, 0, -20)]
+        texCoord2f[] primvars:st = [(0, 0), (20, 0), (20, 20), (0, 20)] (
+            interpolation = "vertex"
+        )
+    }
+
+    def Cube "Marker"
+    {
+        double size = 2
+        color3f[] primvars:displayColor = [(0.85, 0.3, 0.1)]
+        double3 xformOp:translate = (0, 1, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+    }
+}

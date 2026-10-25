@@ -1,0 +1,147 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+# Normal map test. textures/bumps_normal.png holds 4x4 hemispherical bumps in
+# OpenGL convention. The default light comes from above, so the UPPER half of
+# every bump must be the brighter one, on all three walls:
+#   Plain     - right-handed mesh, scale/bias authored
+#   LeftHand  - same wall with orientation = "leftHanded" and reversed winding
+#   Mirrored  - st mirrored horizontally (s runs right to left)
+# The floor combines uv_grid.png with the normal map.
+
+def Xform "World"
+{
+    def Scope "Looks"
+    {
+        def Material "Bumps"
+        {
+            token outputs:surface.connect = </World/Looks/Bumps/Surface.outputs:surface>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor = (0.75, 0.75, 0.75)
+                normal3f inputs:normal.connect = </World/Looks/Bumps/Normal.outputs:rgb>
+                token outputs:surface
+            }
+
+            def Shader "Reader"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                string inputs:varname = "st"
+                float2 outputs:result
+            }
+
+            def Shader "Normal"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @./textures/bumps_normal.png@
+                float2 inputs:st.connect = </World/Looks/Bumps/Reader.outputs:result>
+                token inputs:sourceColorSpace = "raw"
+                float4 inputs:scale = (2, 2, 2, 1)
+                float4 inputs:bias = (-1, -1, -1, 0)
+                float3 outputs:rgb
+            }
+        }
+
+        def Material "GridBumps"
+        {
+            token outputs:surface.connect = </World/Looks/GridBumps/Surface.outputs:surface>
+
+            def Shader "Surface"
+            {
+                uniform token info:id = "UsdPreviewSurface"
+                color3f inputs:diffuseColor.connect = </World/Looks/GridBumps/Color.outputs:rgb>
+                normal3f inputs:normal.connect = </World/Looks/GridBumps/Normal.outputs:rgb>
+                token outputs:surface
+            }
+
+            def Shader "Reader"
+            {
+                uniform token info:id = "UsdPrimvarReader_float2"
+                string inputs:varname = "st"
+                float2 outputs:result
+            }
+
+            def Shader "Color"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @./textures/uv_grid.png@
+                float2 inputs:st.connect = </World/Looks/GridBumps/Reader.outputs:result>
+                float3 outputs:rgb
+            }
+
+            def Shader "Normal"
+            {
+                uniform token info:id = "UsdUVTexture"
+                asset inputs:file = @./textures/bumps_normal.png@
+                float2 inputs:st.connect = </World/Looks/GridBumps/Reader.outputs:result>
+                token inputs:sourceColorSpace = "raw"
+                float4 inputs:scale = (2, 2, 2, 1)
+                float4 inputs:bias = (-1, -1, -1, 0)
+                float3 outputs:rgb
+            }
+        }
+    }
+
+    def Mesh "Floor" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/GridBumps>
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-7, 0, 4), (7, 0, 4), (7, 0, -2), (-7, 0, -2)]
+        texCoord2f[] primvars:st = [(0, 0), (3, 0), (3, 1.3), (0, 1.3)] (
+            interpolation = "vertex"
+        )
+    }
+
+    def Mesh "Plain" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/Bumps>
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(-6.5, 0, -2), (-2.5, 0, -2), (-2.5, 4, -2), (-6.5, 4, -2)]
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "vertex"
+        )
+    }
+
+    def Mesh "LeftHand" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/Bumps>
+        uniform token orientation = "leftHanded"
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 3, 2, 1]
+        point3f[] points = [(-2, 0, -2), (2, 0, -2), (2, 4, -2), (-2, 4, -2)]
+        texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (
+            interpolation = "vertex"
+        )
+    }
+
+    def Mesh "Mirrored" (
+        prepend apiSchemas = ["MaterialBindingAPI"]
+    )
+    {
+        uniform token subdivisionScheme = "none"
+        rel material:binding = </World/Looks/Bumps>
+        int[] faceVertexCounts = [4]
+        int[] faceVertexIndices = [0, 1, 2, 3]
+        point3f[] points = [(2.5, 0, -2), (6.5, 0, -2), (6.5, 4, -2), (2.5, 4, -2)]
+        texCoord2f[] primvars:st = [(1, 0), (0, 0), (0, 1), (1, 1)] (
+            interpolation = "vertex"
+        )
+    }
+}
