@@ -6,7 +6,8 @@ materials of the scene: it follows UsdShade connections to the inputs of the
 UsdPreviewSurface shader, and loads the textures they name. Third, it
 \emph{flattens} every visible piece of geometry into a few large arrays of
 world-space triangles, which is the only form of geometry the renderer
-understands.
+understands. Along the way it also collects the cameras of the stage, so that
+the viewer can look through them.
 
 The declarations live in \lpfile{Scene.h} and the code in \lpfile{Scene.cpp}.
 The header is short enough to be read as a table of contents for this part.
@@ -20,6 +21,8 @@ The header is short enough to be read as a table of contents for this part.
 
 <<The MeshGeometry component>>
 
+<<The CameraView component>>
+
 <<Texture wrap modes and decoded textures>>
 
 <<The ScalarInput material parameter>>
@@ -27,6 +30,8 @@ The header is short enough to be read as a table of contents for this part.
 <<The Material record>>
 
 <<The flattened world-space geometry>>
+
+<<A camera of the stage>>
 
 <<The Scene class>>
 @ The header needs the standard containers, EnTT, and two USD headers: the
@@ -100,10 +105,21 @@ struct MeshGeometry
     unsigned int subsetMaterials;  // number of GeomSubsets with their own material
     bool hasUVs;
 };
+@ Camera prims receive a [[CameraView]] component instead. It only holds the
+index of the camera in the scene's list of cameras (described with the
+cameras, at the end of this part), so that the inspector can offer to look
+through the selected prim.
+
+<<The CameraView component>>=
+// Present on UsdGeomCamera prims: index into Scene::cameras().
+struct CameraView
+{
+    unsigned int index;
+};
 @ The [[Scene]] class is small from the outside. A scene is either empty or
 holds one open stage; [[load]] replaces whatever was there. The accessors give
 the user interface the stage, the registry, the root entity, the flattened
-geometry and the list of warnings collected while reading the file. The up
+geometry, the cameras and the list of warnings collected while reading the file. The up
 axis matters to the camera, which must know whether ``up'' is $+y$ or $+z$.
 
 <<The Scene class>>=
@@ -128,6 +144,7 @@ const pxr::UsdStageRefPtr& stage() const { return m_stage; }
 entt::registry& registry() { return m_registry; }
 entt::entity root() const { return m_root; }
 const FlatGeometry& geometry() const { return m_geometry; }
+const std::vector<SceneCamera>& cameras() const { return m_cameras; }
 const std::vector<std::string>& warnings() const { return m_warnings; }
 bool zUp() const { return m_zUp; }
 
@@ -144,6 +161,7 @@ pxr::UsdTimeCode    m_time;
 entt::registry      m_registry;
 entt::entity        m_root = entt::null;
 FlatGeometry        m_geometry;
+std::vector<SceneCamera> m_cameras;
 std::vector<std::string> m_warnings;
 std::map<pxr::SdfPath, unsigned int> m_materialCache;
 std::map<std::tuple<std::string, bool, int, int>, int> m_textureCache;
@@ -154,6 +172,7 @@ sections below.
 <<Private helpers of the scene>>=
 entt::entity createEntities(const pxr::UsdPrim& prim, entt::entity parent);
 void extractGeometry();
+void extractCameras(entt::entity e);
 unsigned int materialFor(const pxr::UsdShadeMaterial& material);
 unsigned int displayColorMaterial(const pxr::UsdPrim& prim);
 // srgbByDefault: color space when sourceColorSpace is neither "raw" nor "sRGB"
@@ -207,7 +226,9 @@ namespace {
 <<Load a texture once>>
 
 <<Flatten the stage into world-space triangles>>
-@ Besides the USD schemas for geometry and shading, we need the asset
+
+<<Collect the cameras of the stage>>
+@ Besides the USD schemas for geometry, shading and cameras, we need the asset
 resolver (to read textures, even from inside \lpfile{.usdz} packages) and the
 image decoder. [[PXR_NAMESPACE_USING_DIRECTIVE]] lets us write [[UsdPrim]]
 instead of [[pxr::UsdPrim]] in this file.
@@ -218,9 +239,12 @@ instead of [[pxr::UsdPrim]] in this file.
 #include <algorithm>
 #include <cmath>
 
+#include <pxr/base/gf/camera.h>
+#include <pxr/base/gf/frustum.h>
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/usd/ar/asset.h>
 #include <pxr/usd/ar/resolver.h>
+#include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdGeom/cube.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/metrics.h>
@@ -243,7 +267,8 @@ Two global properties of the stage are recorded. The up axis is part of the
 stage metadata and defaults to $y$. The time is the start of the authored
 time range if there is one, and USD's \emph{default} time otherwise: the
 viewer shows a single moment, and for an animated file the first frame is the
-natural choice. Then we build the entities and flatten the geometry.
+natural choice. Then we build the entities, flatten the geometry and collect
+the cameras.
 
 <<Open a stage and build the scene>>=
 bool Scene::load(const std::string& path, std::string& error)
@@ -261,9 +286,10 @@ bool Scene::load(const std::string& path, std::string& error)
     m_time = stage->HasAuthoredTimeCodeRange() ? UsdTimeCode(stage->GetStartTimeCode()) : UsdTimeCode::Default();
     m_root = createEntities(stage->GetPseudoRoot(), entt::null);
     extractGeometry();
+    extractCameras(m_root);
     return true;
 }
-@ Clearing destroys every entity and empties both caches. Releasing the
+@ Clearing destroys every entity, forgets the cameras and empties both caches. Releasing the
 stage pointer closes the stage, unless somebody else still holds it.
 
 <<Forget the current stage>>=
@@ -272,6 +298,7 @@ void Scene::clear()
     m_registry.clear();
     m_root = entt::null;
     m_geometry = FlatGeometry{};
+    m_cameras.clear();
     m_warnings.clear();
     m_materialCache.clear();
     m_textureCache.clear();
@@ -340,6 +367,20 @@ use the flat normal of the triangle''. Materials and textures are kept in
 arrays and referred to by index. Finally, [[meshEntity]] maps a [[meshId]] back
 to its entity, and the bounds let the camera frame the whole scene.
 
+The cameras of the stage are kept next to the geometry, in a list of
+[[SceneCamera]] records, one per [[UsdGeomCamera]] prim. Like the geometry,
+each is evaluated once, at the scene's time, and stored in world space. A USD
+camera is described by its transform and by physical lens parameters: a focal
+length and the size of the film back (the \emph{aperture}), in tenths of a
+scene unit for orthographic cameras. What the renderer wants is simpler: an
+eye point, a forward and an up direction, and the half size of the
+\emph{window}, the part of the image plane that the camera sees. For a
+perspective camera the window lies at distance 1, so its half height is the
+tangent of half the vertical field of view; for an orthographic camera it is
+measured in scene units. The viewport rarely has the shape of the camera's
+film back, so the window is fitted to it later, in the application. The
+vertical field of view is kept for the inspector.
+
 <<The flattened world-space geometry>>=
 // Geometry flattened to world space, ready to upload to the renderer.
 struct FlatGeometry
@@ -357,6 +398,21 @@ struct FlatGeometry
     float boundsMax[3] = {0, 0, 0};
 
     bool empty() const { return indices.empty(); }
+};
+@
+<<A camera of the stage>>=
+// A UsdGeomCamera at the stage's start time, in world space. The window is
+// the image plane at distance 1 (perspective) or the view size in scene
+// units (orthographic); the viewer fits it to the viewport's aspect ratio.
+struct SceneCamera
+{
+    entt::entity entity = entt::null;
+    std::string path;
+    std::array<float, 3> eye = {0, 0, 0}, forward = {0, 0, -1}, up = {0, 1, 0};
+    float halfWidth = 1.0f, halfHeight = 1.0f;
+    bool orthographic = false;
+    float clipNear = 0.0f, clipFar = 1e16f;
+    float fovYDeg = 0.0f;  // vertical field of view of a perspective camera
 };
 @ Flattening is one pass over the entities. For each prim that should be
 drawn we produce its triangles in local space, decide the material of each
@@ -1401,3 +1457,60 @@ if (!g.empty())
         g.boundsMin[k] = lo[k];
         g.boundsMax[k] = hi[k];
     }
+@* Cameras. USD already knows how to turn a camera prim into the quantities
+we need. The method [[GetCamera]] of the [[UsdGeomCamera]] schema evaluates
+the prim's attributes and its full transform into a [[GfCamera]], and the camera's [[GfFrustum]] gives the
+eye position, the view and up directions, the window and the clipping range.
+The frustum also discards any scale in the transform, which USD requires: a
+camera under a scaled parent must still see with its own lens. An aperture
+offset moves the window off centre (a shifted lens); the renderer has no use
+for it yet, so it is reported rather than silently dropped.
+
+The cameras are collected by a depth-first walk over the [[Hierarchy]]
+components rather than a view of the registry, because a view does not visit
+the entities in stage order and the camera menu should list the cameras as the
+file does.
+
+<<Collect the cameras of the stage>>=
+// ---- cameras ----------------------------------------------------------------
+// Walks the hierarchy depth first, so cameras keep the order of the stage.
+void Scene::extractCameras(entt::entity e)
+{
+    if (const UsdPrim p = prim(e); p && p.IsA<UsdGeomCamera>())
+    {
+        // GfFrustum drops any scale in the camera's transform, as USD requires
+        const GfCamera camera = UsdGeomCamera(p).GetCamera(m_time);
+        const GfFrustum frustum = camera.GetFrustum();
+        const GfVec3d eye = frustum.GetPosition(), forward = frustum.ComputeViewDirection(),
+                      up = frustum.ComputeUpVector();
+        SceneCamera c;
+        c.entity = e;
+        c.path = p.GetPath().GetString();
+        for (int k = 0; k < 3; ++k)
+        {
+            c.eye[k] = float(eye[k]);
+            c.forward[k] = float(forward[k]);
+            c.up[k] = float(up[k]);
+        }
+        <<Read the window and the clipping range of a camera>>
+        m_registry.emplace<CameraView>(e, unsigned(m_cameras.size()));
+        m_cameras.push_back(c);
+    }
+    for (entt::entity child : m_registry.get<Hierarchy>(e).children)
+        extractCameras(child);
+}
+@ [[GfCamera::GetFrustum]] already divides the aperture by the focal length
+for a perspective camera, and converts it to scene units for an orthographic
+one, so the window can be used as it is.
+
+<<Read the window and the clipping range of a camera>>=
+const GfRange2d window = frustum.GetWindow();
+c.halfWidth = float(0.5 * window.GetSize()[0]);
+c.halfHeight = float(0.5 * window.GetSize()[1]);
+c.orthographic = frustum.GetProjectionType() == GfFrustum::Orthographic;
+c.clipNear = float(frustum.GetNearFar().GetMin());
+c.clipFar = float(frustum.GetNearFar().GetMax());
+if (!c.orthographic)
+    c.fovYDeg = camera.GetFieldOfView(GfCamera::FOVVertical);
+if (window.GetMidpoint() != GfVec2d(0.0))
+    warn("Camera aperture offsets are ignored: " + c.path);

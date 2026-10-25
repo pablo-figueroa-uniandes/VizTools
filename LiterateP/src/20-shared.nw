@@ -50,20 +50,34 @@ records of consecutive geometries.
 constexpr unsigned int kNoMesh = 0xffffffffu;
 
 enum RayType { RAY_TYPE_RADIANCE = 0, RAY_TYPE_SHADOW = 1, RAY_TYPE_COUNT };
-@ The camera is a pinhole. Rather than storing a field of view and an aspect
-ratio, the host precomputes three vectors: [[w]] points from the eye to the
-centre of the image plane, while [[u]] and [[v]] point from that centre to the
-middle of the right and top edges of the image. A point of the image with
-normalized device coordinates $(x,y)\in[-1,1]^2$ then lies in the direction
-$w + x\,u + y\,v$, and the ray generation program needs no trigonometry at all.
-If $\phi$ is the vertical field of view and $a$ the aspect ratio, the host
-sets $|w|=1$, $|v|=\tan(\phi/2)$ and $|u|=a\tan(\phi/2)$.
+@ The camera is usually a pinhole. Rather than storing a field of view and an
+aspect ratio, the host precomputes three vectors: [[w]] is the unit vector
+from the eye towards the centre of the image plane, while [[u]] and [[v]]
+point from that centre to the middle of the right and top edges of the image
+when the plane is at distance 1. A point of the image with normalized device
+coordinates $(x,y)\in[-1,1]^2$ then lies in the direction $w + x\,u + y\,v$,
+and the ray generation program needs no trigonometry at all. If $\phi$ is the
+vertical field of view and $a$ the aspect ratio, the host sets $|w|=1$,
+$|v|=\tan(\phi/2)$ and $|u|=a\tan(\phi/2)$.
+
+A USD camera may also be orthographic. Then all rays are parallel to [[w]] and
+the image point moves the origin instead: the ray leaves $e + x\,u + y\,v$,
+and $|u|$, $|v|$ are half the width and height of the view in scene units.
+USD cameras also carry a clipping range. The renderer honours it for camera
+rays, as a depth measured along [[w]], so that a near plane can cut away the
+wall in front of an interior shot. The orbit camera uses $[0, 10^{16}]$.
 
 <<The camera frame>>=
+// Perspective: rays leave `eye` through w + u * x + v * y, for x, y in [-1, 1]
+// (u, v span the image plane at distance 1). Orthographic: rays leave
+// eye + u * x + v * y along w (u, v are half the view size in scene units).
+// Camera rays only see hits between clipNear and clipFar along w.
 struct Camera
 {
     float3 eye;
-    float3 u, v, w;  // right, up and forward scaled to the image plane
+    float3 u, v, w;  // right, up and forward (w normalized)
+    unsigned int orthographic;
+    float clipNear, clipFar;
 };
 @ Many inputs of a UsdPreviewSurface material, such as roughness or metallic,
 are single numbers that may either be constant or come from one channel of a

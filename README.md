@@ -25,6 +25,8 @@ graph, a Dear ImGui interface and an OptiX ray-traced viewport.
     shadows, and smooth or authored shading normals.
 - **Interaction**: orbit, pan and zoom, click to select (highlighted in the
   viewport and revealed in the tree), and frame selection.
+- **Cameras**: look through any USD camera (perspective or orthographic, with
+  its clipping range) from the Camera menu or `--camera`.
 
 See [UsdOptixViewer/README.md](UsdOptixViewer/README.md) for the full feature
 list, controls, command-line options and test scenes.
@@ -70,7 +72,7 @@ cmake --install build
 | Path | Contents |
 |------|----------|
 | [UsdOptixViewer/](UsdOptixViewer/) | Viewer sources, CMake project and test scenes |
-| [LiterateP/](LiterateP/) | The whole program as a Knuth-style literate program: [PDF](LiterateP/UsdOptixViewer-literate.pdf) (102 pages), noweb sources, and the tool that tangles, checks and weaves them |
+| [LiterateP/](LiterateP/) | The whole program as a Knuth-style literate program: [PDF](LiterateP/UsdOptixViewer-literate.pdf) (108 pages), noweb sources, and the tool that tangles, checks and weaves them |
 | [logbook.md](logbook.md) | Task log: tool installation and every feature added, with how it was verified |
 | [summary.md](summary.md) | One-page summary of the work |
 | [install_all_users.sh](install_all_users.sh) | Script that moved the per-user tool installs to `/opt/viztools` and `/usr/local/cuda-13.2` |

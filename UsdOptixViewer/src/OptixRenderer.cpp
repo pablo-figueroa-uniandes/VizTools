@@ -40,7 +40,6 @@ struct alignas(OPTIX_SBT_RECORD_ALIGNMENT) SbtRecord
 struct Empty {};
 
 float3 make3(const float v[3]) { return make_float3(v[0], v[1], v[2]); }
-float3 sub(float3 a, float3 b) { return make_float3(a.x - b.x, a.y - b.y, a.z - b.z); }
 float3 scale(float3 a, float s) { return make_float3(a.x * s, a.y * s, a.z * s); }
 float3 cross(float3 a, float3 b) { return make_float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x); }
 float3 normalize(float3 a)
@@ -439,15 +438,22 @@ void OptixRenderer::resize(unsigned int width, unsigned int height)
     m_meshIds.resize(size_t(width) * height);
 }
 
-void OptixRenderer::setCamera(const float eyeIn[3], const float targetIn[3], const float upIn[3], float fovYDeg)
+void OptixRenderer::setCamera(const float eye[3], const float target[3], const float up[3], float fovYDeg)
 {
-    const float3 eye = make3(eyeIn);
-    const float3 w = normalize(sub(make3(targetIn), eye));
-    const float3 u = normalize(cross(w, make3(upIn)));
-    const float3 v = cross(u, w);
+    const float forward[3] = {target[0] - eye[0], target[1] - eye[1], target[2] - eye[2]};
     const float halfH = std::tan(fovYDeg * 0.5f * float(M_PI) / 180.0f);
     const float aspect = m_params.height ? float(m_params.width) / float(m_params.height) : 1.0f;
-    m_params.camera = {eye, scale(u, halfH * aspect), scale(v, halfH), w};
+    setCameraView(eye, forward, up, halfH * aspect, halfH, false, 0.0f, 1e16f);
+}
+
+void OptixRenderer::setCameraView(const float eye[3], const float forward[3], const float up[3], float halfWidth,
+                                  float halfHeight, bool orthographic, float clipNear, float clipFar)
+{
+    const float3 w = normalize(make3(forward));
+    const float3 u = normalize(cross(w, make3(up)));
+    const float3 v = cross(u, w);
+    m_params.camera = {make3(eye), scale(u, halfWidth), scale(v, halfHeight), w, orthographic ? 1u : 0u,
+                       clipNear, clipFar};
 }
 
 void OptixRenderer::setLightDir(const float dir[3])

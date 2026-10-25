@@ -10,10 +10,16 @@ constexpr unsigned int kNoMesh = 0xffffffffu;
 
 enum RayType { RAY_TYPE_RADIANCE = 0, RAY_TYPE_SHADOW = 1, RAY_TYPE_COUNT };
 
+// Perspective: rays leave `eye` through w + u * x + v * y, for x, y in [-1, 1]
+// (u, v span the image plane at distance 1). Orthographic: rays leave
+// eye + u * x + v * y along w (u, v are half the view size in scene units).
+// Camera rays only see hits between clipNear and clipFar along w.
 struct Camera
 {
     float3 eye;
-    float3 u, v, w;  // right, up and forward scaled to the image plane
+    float3 u, v, w;  // right, up and forward (w normalized)
+    unsigned int orthographic;
+    float clipNear, clipFar;
 };
 
 // A float input: `value`, or texture[channel] * scale + bias when texture >= 0.

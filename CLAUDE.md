@@ -49,12 +49,14 @@ Architecture (`src/`):
   `Hierarchy`, `MeshGeometry`). It also flattens geometry to world space
   (`FlatGeometry`: per-triangle mesh id, material and corner UVs), resolves
   UsdPreviewSurface materials and loads textures through `ArResolver`, so
-  `.usdz` works.
+  `.usdz` works. `UsdGeomCamera` prims become `SceneCamera` records
+  (world-space eye/forward/up, window, clipping) plus a `CameraView` component.
 - `OptixRenderer.*`: OptiX context, pipeline, SBT and a single GAS. Textures
   are mipmapped CUDA texture objects (CPU-built mip chain, anisotropic
   filtering). It renders to a host RGBA buffer plus a per-pixel
   mesh-id buffer, which is used for picking.
-- `devicePrograms.cu`: raygen (progressive, jittered after frame 0, which is
+- `devicePrograms.cu`: raygen (pinhole or orthographic camera, clipping range
+  as a depth along w; progressive, jittered after frame 0, which is
   also the picking frame), two miss programs (radiance, shadow), closest-hit
   (Lambert + GGX for the directional light, shadow ray, one VNDF-sampled glossy
   reflection ray at depth 0, firefly clamp on its result) and any-hit (alpha
@@ -68,8 +70,9 @@ Architecture (`src/`):
 - `LaunchParams.h`: shared by host and device. Keep both sides in sync when
   changing it.
 - `App.*`: SDL3 window, ImGui panels (hierarchy, inspector, viewport,
-  status bar) and an orbit camera. Setting `m_needsRender` restarts the
-  accumulation; the app then adds a sample every frame until kMaxSamples (256).
+  status bar), an orbit camera and a Camera menu to look through USD cameras
+  (`m_camera`; any mouse move hands the view back to the orbit camera).
+  Setting `m_needsRender` restarts the accumulation; the app then adds a sample every frame until kMaxSamples (256).
 
 Conventions: C++20, 4-space indent, braces on their own line, `m_` members,
 sparse comments that explain the why. Keep `-Wno-deprecated` for the USD headers,
@@ -88,8 +91,8 @@ line after `@`. Never hard-code section numbers: cite chunks as `<<Name>>`.
 ## Testing
 
 - Synthetic X input (xdotool) does not reach SDL on this display, so use
-  `--select <primPath>` (which selects and frames) to drive the UI from the
-  command line.
+  `--select <primPath>` (which selects and frames) and `--camera <cameraPath>`
+  to drive the UI from the command line.
 - Screenshots: launch the app in the background, then
   `xwd -id $(xdotool search --name "USD OptiX Viewer" | head -1) -silent`.
   The XWD pixels are packed 24-bit BGR: convert with PIL using
@@ -98,8 +101,9 @@ line after `@`. Never hard-code section numbers: cite chunks as `<<Name>>`.
   `assets/textured_scene.usda` (on every face, the "UP" arrow must point up) and
   `assets/mipmap_test.usda` (compare with and without `--no-mipmaps`),
   `assets/normalmap_test.usda` (every bump lit on its upper right),
-  `assets/material_test.usda` (roughness/metallic chart). Wait about 9 s
-  before taking screenshots so the 256 samples converge. Hard-surface test
+  `assets/material_test.usda` (roughness/metallic chart),
+  `assets/camera_test.usda` (USD cameras; use `--camera /World/Cameras/Front`).
+  Wait about 9 s before taking screenshots so the 256 samples converge. Hard-surface test
   meshes need `subdivisionScheme = "none"`, or they shade smooth.
   Validate new scenes with `usdchecker`. `McUsd.usdz` from
   github.com/usd-wg/assets is a good real-world texture and cutout test.
@@ -111,4 +115,5 @@ line after `@`. Never hard-code section numbers: cite chunks as `<<Name>>`.
 Translucency, UsdTransform2d, UDIM, emission/clearcoat/displacement/occlusion,
 indirect diffuse (only an ambient fill), USD lights (one fixed directional
 light), subdivision refinement (only smooth normals), curves/points/instancers other than instance proxies, and
-time-sampled animation (only the start time code is shown).
+time-sampled animation (only the start time code is shown), camera aperture
+offsets and depth of field.

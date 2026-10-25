@@ -38,6 +38,9 @@ private:
     void frameSelection();
     void updateFilter();
     void updateCamera();
+    void lookThrough(int camera);
+    void orbitFromUsdCamera();
+    void fittedWindow(const SceneCamera& camera, float& halfWidth, float& halfHeight) const;
     void openFileDialog();
 
     SDL_Window* m_window = nullptr;
@@ -53,6 +56,7 @@ private:
     // orbit camera
     float m_target[3] = {0, 0, 0};
     float m_distance = 5.0f, m_yaw = 0.6f, m_pitch = 0.4f, m_fovY = 45.0f;
+    int m_camera = -1;  // USD camera we look through (index into Scene::cameras()), -1 for the orbit camera
     float m_light[3] = {0.4f, 0.8f, 0.45f};
     bool m_shadows = true;
     bool m_mipmaps = true;

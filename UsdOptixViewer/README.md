@@ -70,9 +70,19 @@ users in `/opt/viztools` (CUDA in `/usr/local/cuda-13.2`):
     implemented.
 - Click on the viewport to select the prim under the cursor. The selection is
   highlighted and revealed in the hierarchy.
+- USD cameras: the *Camera* menu lists every `UsdGeomCamera` of the stage (and
+  the orbit camera). The inspector of a camera prim has a *Look through*
+  button, and `--camera /Path` starts with that camera. Perspective and
+  orthographic projections, the focal length and aperture, the clipping range
+  and the full transform (scale ignored, as USD requires) are honoured, at the
+  stage's start time. The camera's film back is fitted inside the viewport
+  (usdview's "fit" policy). Orbiting, panning or zooming switches to the
+  orbit camera, which starts from the USD camera's position and direction.
+  Aperture offsets are ignored with a warning.
 
 Controls: left-drag to orbit, right/middle-drag to pan, wheel to zoom, `F` to
-frame the selection, `Esc` to clear the selection.
+frame the selection, `Esc` to clear the selection, *Camera* menu to look
+through a USD camera.
 
 ## Build and install
 
@@ -89,10 +99,16 @@ setting `LD_LIBRARY_PATH`:
 ```bash
 ~/.local/opt/UsdOptixViewer/bin/UsdOptixViewer \
     ~/.local/opt/UsdOptixViewer/share/UsdOptixViewer/assets/sample_scene.usda \
-    [--select /World/Props/BlueSphere] [--no-mipmaps] [--no-normal-maps] [--no-reflections]
+    [--select /World/Props/BlueSphere] [--camera /World/Cameras/Front] [--no-mipmaps] [--no-normal-maps] \
+    [--no-reflections]
 ```
 
-`--select` selects and frames a prim. `assets/textured_scene.usda` is a
+`--select` selects and frames a prim, `--camera` looks through a USD camera.
+`assets/camera_test.usda` references the sample scene and adds five cameras:
+*Front* (cube left, pyramid right), *Telephoto*, an orthographic *Top* (the
+12-unit ground fits inside its 14-unit view), *Clipped* (the near plane cuts
+the scene in half) and *Rig/Side* (under a rotated, scaled parent, at
+(16, 3, 0) looking along -X). `assets/textured_scene.usda` is a
 texture test scene: on every face the "UP" arrow must point up, with red at
 the top-left of the image. `assets/mipmap_test.usda` is a large floor with a
 repeated texture: with mipmaps its far end fades smoothly to gray, and with
@@ -122,3 +138,4 @@ Dependency locations can be overridden with `CMAKE_PREFIX_PATH`,
 - `assets/mipmap_test.usda`: texture minification and aliasing test
 - `assets/normalmap_test.usda`, `assets/textures/bumps_normal.png`: normal map test
 - `assets/material_test.usda`, `assets/textures/roughness_checker.png`: roughness/metallic test
+- `assets/camera_test.usda`: USD camera test (references `sample_scene.usda`)

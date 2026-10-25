@@ -1,4 +1,4 @@
-// OptiX programs: progressive pinhole camera, UsdPreviewSurface-style shading
+// OptiX programs: progressive pinhole or orthographic camera, UsdPreviewSurface-style shading
 // (Lambert diffuse + GGX specular) with a directional light, hard shadows,
 // one glossy reflection bounce and a gradient sky.
 #include <optix.h>
@@ -86,27 +86,39 @@ static __forceinline__ __device__ float4 sampleTexture(int texture, unsigned int
         const float3 o = optixGetWorldRayOrigin();
         const float3 p = o + optixGetWorldRayDirection() * optixGetRayTmax();
 
-        const uint3 idx = optixGetLaunchIndex();
-        const float nx = 2.0f * (idx.x + 0.5f) / params.width - 1.0f;
-        const float ny = 1.0f - 2.0f * (idx.y + 0.5f) / params.height;
+        // neighbouring rays: shifted origins (orthographic) or directions (perspective)
         const Camera& cam = params.camera;
-        const float3 dirX = cam.w + cam.u * (nx + 2.0f / params.width) + cam.v * ny;
-        const float3 dirY = cam.w + cam.u * nx + cam.v * (ny - 2.0f / params.height);
+        const float3 du = cam.u * (2.0f / params.width), dv = cam.v * (-2.0f / params.height);
+        float3 oX = o, oY = o, dirX, dirY;
+        if (cam.orthographic)
+        {
+            oX = o + du;
+            oY = o + dv;
+            dirX = dirY = cam.w;
+        }
+        else
+        {
+            const uint3 idx = optixGetLaunchIndex();
+            const float nx = 2.0f * (idx.x + 0.5f) / params.width - 1.0f;
+            const float ny = 1.0f - 2.0f * (idx.y + 0.5f) / params.height;
+            dirX = cam.w + cam.u * nx + cam.v * ny + du;
+            dirY = cam.w + cam.u * nx + cam.v * ny + dv;
+        }
 
         const float d00 = dot(e1, e1), d01 = dot(e1, e2), d11 = dot(e2, e2);
         const float denom = d00 * d11 - d01 * d01;
-        auto gradient = [&](float3 dir) {
+        auto gradient = [&](float3 origin, float3 dir) {
             const float dn = dot(dir, n);
             if (fabsf(dn) < 1e-20f || fabsf(denom) < 1e-30f)
                 return make_float2(0.0f, 0.0f);
-            const float3 offset = o + dir * (dot(p - o, n) / dn) - p;
+            const float3 offset = origin + dir * (dot(p - origin, n) / dn) - p;
             const float d20 = dot(offset, e1), d21 = dot(offset, e2);
             const float b1 = (d11 * d20 - d01 * d21) / denom, b2 = (d00 * d21 - d01 * d20) / denom;
             return make_float2(b1 * (uv[1].x - uv[0].x) + b2 * (uv[2].x - uv[0].x),
                                -(b1 * (uv[1].y - uv[0].y) + b2 * (uv[2].y - uv[0].y)));  // t is flipped
         };
-        dx = gradient(dirX);
-        dy = gradient(dirY);
+        dx = gradient(oX, dirX);
+        dy = gradient(oY, dirY);
     }
     return tex2DGrad<float4>(params.textures[texture], s, 1.0f - t, dx, dy);
 }
@@ -183,11 +195,19 @@ extern "C" __global__ void __raygen__renderFrame()
     const float2 ndc = make_float2(2.0f * (idx.x + jx) / params.width - 1.0f,
                                    1.0f - 2.0f * (idx.y + jy) / params.height);
     const Camera& cam = params.camera;
-    const float3 dir = normalize(cam.w + cam.u * ndc.x + cam.v * ndc.y);
+    float3 origin = cam.eye, dir;
+    if (cam.orthographic)
+    {
+        origin = cam.eye + cam.u * ndc.x + cam.v * ndc.y;
+        dir = cam.w;
+    }
+    else
+        dir = normalize(cam.w + cam.u * ndc.x + cam.v * ndc.y);
+    const float depthPerT = dot(dir, cam.w);  // the clipping range is a depth along w, not a ray distance
 
     unsigned int r, g, b, meshId, depth = 0;
-    optixTrace(params.handle, cam.eye, dir, 0.0f, 1e16f, 0.0f, OptixVisibilityMask(255),
-               OPTIX_RAY_FLAG_NONE, RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
+    optixTrace(params.handle, origin, dir, cam.clipNear / depthPerT, cam.clipFar / depthPerT, 0.0f,
+               OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
                r, g, b, meshId, depth, seed);
 
     const float4 sample = make_float4(__uint_as_float(r), __uint_as_float(g), __uint_as_float(b), 1.0f);

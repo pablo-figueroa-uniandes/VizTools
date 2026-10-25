@@ -97,13 +97,16 @@ bool App::init(int argc, char** argv)
     if (!m_rendererOk)
         m_error = "OptiX initialization failed: " + error;
 
-    // UsdOptixViewer [file.usd] [--select /Prim/Path] [--no-mipmaps] [--no-normal-maps] [--no-reflections]
-    std::string file, selectPath;
+    // UsdOptixViewer [file.usd] [--select /Prim/Path] [--camera /Camera/Path] [--no-mipmaps] [--no-normal-maps]
+    //                [--no-reflections]
+    std::string file, selectPath, cameraPath;
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
         if (arg == "--select" && i + 1 < argc)
             selectPath = argv[++i];
+        else if (arg == "--camera" && i + 1 < argc)
+            cameraPath = argv[++i];
         else if (arg == "--no-mipmaps")
             m_mipmaps = false;
         else if (arg == "--no-normal-maps")
@@ -125,6 +128,16 @@ bool App::init(int argc, char** argv)
                 frameSelection();
             }
     }
+    if (!cameraPath.empty())
+    {
+        const std::vector<SceneCamera>& cameras = m_scene.cameras();
+        const auto it = std::find_if(cameras.begin(), cameras.end(),
+                                     [&](const SceneCamera& c) { return c.path == cameraPath; });
+        if (it != cameras.end())
+            lookThrough(int(it - cameras.begin()));
+        else
+            m_error = "No camera at " + cameraPath;
+    }
     return true;
 }
 
@@ -137,6 +150,7 @@ void App::requestOpen(const std::string& path)
 void App::loadFile(const std::string& path)
 {
     std::string error;
+    m_camera = -1;  // camera indices refer to the previous stage
     m_selected = entt::null;
     m_reveal.clear();
     m_appliedFilter.clear();
@@ -298,8 +312,24 @@ void App::drawMenuBar()
             m_needsRender = true;
         if (ImGui::SliderFloat3("Light direction", m_light, -1.0f, 1.0f))
             m_needsRender = true;
+        ImGui::BeginDisabled(m_camera >= 0);  // a USD camera has its own field of view
         if (ImGui::SliderFloat("Field of view", &m_fovY, 15.0f, 100.0f))
             m_needsRender = true;
+        ImGui::EndDisabled();
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("Camera"))
+    {
+        if (ImGui::MenuItem("Orbit camera", nullptr, m_camera < 0))
+            orbitFromUsdCamera();
+        const std::vector<SceneCamera>& cameras = m_scene.cameras();
+        if (cameras.empty())
+            ImGui::TextDisabled("This stage has no cameras.");
+        else
+            ImGui::SeparatorText("USD cameras");
+        for (size_t i = 0; i < cameras.size(); ++i)
+            if (ImGui::MenuItem(cameras[i].path.c_str(), nullptr, m_camera == int(i)))
+                lookThrough(int(i));
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Help"))
@@ -444,7 +474,8 @@ void App::drawInspector()
             if (SdfPrimSpecHandle def = stage->GetRootLayer()->GetPrimAtPath(stage->GetDefaultPrim().GetPath()))
                 ImGui::Text("Default prim: %s", def->GetName().c_str());
             const FlatGeometry& g = m_scene.geometry();
-            ImGui::Text("Materials: %zu   Textures: %zu", g.materials.size(), g.textures.size());
+            ImGui::Text("Materials: %zu   Textures: %zu   Cameras: %zu", g.materials.size(), g.textures.size(),
+                        m_scene.cameras().size());
             if (!m_scene.warnings().empty())
             {
                 ImGui::SeparatorText("Warnings");
@@ -488,6 +519,22 @@ void App::drawInspector()
         if (!schemas.empty())
             row("API schemas", TfStringJoin(schemas, ", "));
         ImGui::EndTable();
+    }
+
+    if (const CameraView* view = m_scene.registry().try_get<CameraView>(m_selected))
+    {
+        const SceneCamera& c = m_scene.cameras()[view->index];
+        ImGui::SeparatorText("Camera");
+        if (c.orthographic)
+            ImGui::Text("Orthographic, %g x %g units", 2.0f * c.halfWidth, 2.0f * c.halfHeight);
+        else
+            ImGui::Text("Perspective, vertical field of view %.1f deg", c.fovYDeg);
+        ImGui::Text("Clipping range: %g - %g", c.clipNear, c.clipFar);
+        const bool active = m_camera == int(view->index);
+        ImGui::BeginDisabled(active);
+        if (ImGui::Button(active ? "Looking through this camera" : "Look through"))
+            lookThrough(int(view->index));
+        ImGui::EndDisabled();
     }
 
     if (const MeshGeometry* mesh = m_scene.registry().try_get<MeshGeometry>(m_selected))
@@ -602,22 +649,33 @@ void App::drawInspector()
 // ---- viewport -------------------------------------------------------------
 void App::updateCamera()
 {
-    const float cp = std::cos(m_pitch), sp = std::sin(m_pitch), cy = std::cos(m_yaw), sy = std::sin(m_yaw);
-    float offset[3], up[3];
-    if (m_scene.zUp())
+    if (m_camera >= 0)
     {
-        offset[0] = cp * cy, offset[1] = cp * sy, offset[2] = sp;
-        up[0] = 0, up[1] = 0, up[2] = 1;
+        const SceneCamera& c = m_scene.cameras()[m_camera];
+        float halfW, halfH;
+        fittedWindow(c, halfW, halfH);
+        m_renderer.setCameraView(c.eye.data(), c.forward.data(), c.up.data(), halfW, halfH, c.orthographic,
+                                 c.clipNear, c.clipFar);
     }
     else
     {
-        offset[0] = cp * sy, offset[1] = sp, offset[2] = cp * cy;
-        up[0] = 0, up[1] = 1, up[2] = 0;
+        const float cp = std::cos(m_pitch), sp = std::sin(m_pitch), cy = std::cos(m_yaw), sy = std::sin(m_yaw);
+        float offset[3], up[3];
+        if (m_scene.zUp())
+        {
+            offset[0] = cp * cy, offset[1] = cp * sy, offset[2] = sp;
+            up[0] = 0, up[1] = 0, up[2] = 1;
+        }
+        else
+        {
+            offset[0] = cp * sy, offset[1] = sp, offset[2] = cp * cy;
+            up[0] = 0, up[1] = 1, up[2] = 0;
+        }
+        float eye[3];
+        for (int k = 0; k < 3; ++k)
+            eye[k] = m_target[k] + offset[k] * m_distance;
+        m_renderer.setCamera(eye, m_target, up, m_fovY);
     }
-    float eye[3];
-    for (int k = 0; k < 3; ++k)
-        eye[k] = m_target[k] + offset[k] * m_distance;
-    m_renderer.setCamera(eye, m_target, up, m_fovY);
     m_renderer.setLightDir(m_light);
     m_renderer.setShadows(m_shadows);
     m_renderer.setMipmaps(m_mipmaps);
@@ -625,8 +683,69 @@ void App::updateCamera()
     m_renderer.setReflections(m_reflections);
 }
 
+// The camera's window grown along one axis to the viewport's aspect ratio, so
+// the whole window stays visible (the "fit" conform policy of usdview).
+void App::fittedWindow(const SceneCamera& camera, float& halfWidth, float& halfHeight) const
+{
+    const float aspect = float(m_renderer.width()) / float(std::max(m_renderer.height(), 1u));
+    halfWidth = camera.halfWidth;
+    halfHeight = camera.halfHeight;
+    if (aspect > halfWidth / halfHeight)
+        halfWidth = halfHeight * aspect;
+    else
+        halfHeight = halfWidth / aspect;
+}
+
+void App::lookThrough(int camera)
+{
+    m_camera = camera;
+    m_needsRender = true;
+}
+
+// Hands the view over to the orbit camera, which starts where the USD camera
+// is, looking the same way. It orbits a point in front of the camera at the
+// depth of the scene's center. Roll is lost, and an orthographic camera
+// becomes a perspective one that shows the same size at that point.
+void App::orbitFromUsdCamera()
+{
+    if (m_camera < 0)
+        return;
+    const SceneCamera& c = m_scene.cameras()[m_camera];
+    float halfW, halfH;
+    fittedWindow(c, halfW, halfH);
+    m_camera = -1;
+    m_needsRender = true;
+
+    const FlatGeometry& g = m_scene.geometry();
+    const float* f = c.forward.data();
+    float depth = 0.0f, radius = 0.0f;
+    for (int k = 0; k < 3; ++k)
+    {
+        depth += (0.5f * (g.boundsMin[k] + g.boundsMax[k]) - c.eye[k]) * f[k];
+        radius += (g.boundsMax[k] - g.boundsMin[k]) * (g.boundsMax[k] - g.boundsMin[k]);
+    }
+    if (depth < 1e-3f)
+        depth = std::max(0.5f * std::sqrt(radius), 1.0f);
+    for (int k = 0; k < 3; ++k)
+        m_target[k] = c.eye[k] + f[k] * depth;
+    if (c.orthographic)
+        m_distance = halfH / std::tan(0.5f * m_fovY * float(M_PI) / 180.0f);
+    else
+    {
+        m_distance = depth;
+        m_fovY = 2.0f * std::atan(halfH) * 180.0f / float(M_PI);
+    }
+    // the orbit offset (from the target to the eye) is -forward
+    if (m_scene.zUp())
+        m_pitch = std::asin(std::clamp(-f[2], -1.0f, 1.0f)), m_yaw = std::atan2(-f[1], -f[0]);
+    else
+        m_pitch = std::asin(std::clamp(-f[1], -1.0f, 1.0f)), m_yaw = std::atan2(-f[0], -f[2]);
+    m_pitch = std::clamp(m_pitch, -1.55f, 1.55f);
+}
+
 void App::frameBounds(const float lo[3], const float hi[3])
 {
+    orbitFromUsdCamera();
     float radius = 0.0f;
     for (int k = 0; k < 3; ++k)
     {
@@ -679,7 +798,13 @@ void App::drawViewport()
     const ImGuiIO& io = ImGui::GetIO();
     const bool hovered = ImGui::IsItemHovered(), active = ImGui::IsItemActive();
 
-    // camera controls: left = orbit, right/middle = pan, wheel = zoom
+    // camera controls: left = orbit, right/middle = pan, wheel = zoom; they
+    // leave a USD camera for the orbit camera
+    const bool dragging = active && (ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f) ||
+                                     ImGui::IsMouseDragging(ImGuiMouseButton_Right, 1.0f) ||
+                                     ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 1.0f));
+    if (dragging || (hovered && io.MouseWheel != 0.0f))
+        orbitFromUsdCamera();
     if (active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 2.0f))
     {
         m_yaw -= io.MouseDelta.x * 0.006f;
@@ -763,11 +888,12 @@ void App::drawStatusBar()
 {
     ImGui::Begin("Status", nullptr, kPanelFlags | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
     const FlatGeometry& g = m_scene.geometry();
-    ImGui::Text("%s  |  prims: %zu  meshes: %zu  triangles: %zu  textures: %zu  |  OptiX %d.%d.%d on %s  |  "
-                "samples %u/%u, %.2f ms",
+    ImGui::Text("%s  |  prims: %zu  meshes: %zu  triangles: %zu  textures: %zu  |  camera: %s  |  "
+                "OptiX %d.%d.%d on %s  |  samples %u/%u, %.2f ms",
                 m_scene.loaded() ? m_scene.filePath().c_str() : "no file",
                 m_scene.loaded() ? m_scene.registry().storage<PrimInfo>().size() - 1 : 0, g.meshEntity.size(),
-                g.indices.size() / 3, g.textures.size(), OPTIX_VERSION / 10000, (OPTIX_VERSION / 100) % 100, OPTIX_VERSION % 100,
+                g.indices.size() / 3, g.textures.size(), m_camera >= 0 ? m_scene.cameras()[m_camera].path.c_str() : "orbit",
+                OPTIX_VERSION / 10000, (OPTIX_VERSION / 100) % 100, OPTIX_VERSION % 100,
                 m_renderer.deviceName().c_str(), m_renderer.samples(), kMaxSamples, m_renderer.lastRenderMs());
     ImGui::End();
 }
@@ -801,6 +927,7 @@ void App::drawPopups()
         ImGui::Spacing();
         ImGui::TextDisabled("Left drag: orbit   Right/middle drag: pan   Wheel: zoom");
         ImGui::TextDisabled("Click: select   F: frame selection   Esc: clear selection");
+        ImGui::TextDisabled("Camera menu: look through a USD camera (moving returns to the orbit camera)");
         if (ImGui::Button("Close"))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();

@@ -1,6 +1,34 @@
-# New Visualization Tools in Ginebra
+# New Visualization Tools in ginebra
 
 This file describes the advances in visualization tools for this computer.
+
+## October 25th
+
+1. Add a way to change the viewpoint to one of the cameras in the USD file
+2. create a new branch and add support for CloudXR. Create a document that explains the differences between the main branch and this one
+
+### Results (October 25th): task 1, USD cameras
+
+**Done, on `main`.**
+- Scene: every `UsdGeomCamera` becomes a `SceneCamera`, evaluated at the stage's start time through `GfCamera`/`GfFrustum`. It stores the world-space eye, forward and up, the window, the projection and the clipping range. The full transform is used, with scale dropped as USD requires. The prim also gets a `CameraView` component. Cameras keep stage order.
+- Renderer: the camera can now be orthographic, and camera rays honour the clipping range as a depth along the view axis. The new `setCameraView` takes these settings, and `setCamera` (the orbit camera) is built on it. The ray differentials used for mipmapping handle orthographic cameras: the neighbouring rays get shifted origins instead of new directions.
+- UI:
+  - A new *Camera* menu lists the orbit camera and every USD camera.
+  - Camera prims have a *Look through* button and a summary (projection, field of view or view size, clipping range) in the inspector.
+  - `--camera /Path` starts with a USD camera.
+  - The status bar names the active camera.
+  - The film back is fitted inside the viewport, like usdview's "fit" policy.
+  - While a USD camera is active, the field-of-view slider is disabled.
+- Moving the view (orbit, pan, zoom, frame) hands it to the orbit camera, which starts at the USD camera's position, direction and field of view, so the image doesn't jump. Roll is lost. An orthographic camera becomes a perspective one that shows the same size at the orbit target.
+- New test scene `assets/camera_test.usda`. It references `sample_scene.usda` and adds Front, Telephoto, an orthographic Top, Clipped (its near plane cuts the scene) and Rig/Side (under a rotated and scaled parent). usdchecker passes.
+- Verified:
+  - All five cameras show the expected views: object order, the 12-unit ground inside the 14-unit orthographic view, the clipped half and the scale-independent field of view.
+  - The hand-off to the orbit camera gives an identical image for perspective cameras. A temporary debug build was used for this, because mouse input can't be scripted here.
+  - The texture, mipmap, normal-map and material scenes are pixel-identical (max difference 1/255) to the previous build.
+  - Mipmapping still filters under an orthographic camera.
+  - The build has no warnings, and the installed copy was updated.
+- Literate book: updated in every part that changed (shared, scene, renderer, device, app). It now has 307 sections, 300 chunks and 108 pages. `lp.py check` is ok for all 13 files.
+- Not supported: aperture offsets (ignored, with a warning), depth of field and animated cameras (only the start time is used).
 
 ## October 24th
 

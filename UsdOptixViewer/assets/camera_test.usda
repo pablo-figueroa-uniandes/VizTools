@@ -1,0 +1,87 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    upAxis = "Y"
+    metersPerUnit = 1
+)
+
+def Xform "World" (
+    kind = "assembly"
+)
+{
+    def "Scene" (
+        references = @./sample_scene.usda@
+    )
+    {
+    }
+
+    def Scope "Cameras"
+    {
+        # Straight ahead, slightly from above: the pyramid is on the right, the cube on the left.
+        def Camera "Front"
+        {
+            float focalLength = 35
+            float horizontalAperture = 36
+            float verticalAperture = 24
+            float2 clippingRange = (0.1, 1000)
+            double3 xformOp:translate = (0, 3, 10)
+            float3 xformOp:rotateXYZ = (-16.7, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+
+        # Telephoto from the front-right corner, looking at the props.
+        def Camera "Telephoto"
+        {
+            float focalLength = 120
+            float horizontalAperture = 36
+            float verticalAperture = 24
+            float2 clippingRange = (0.1, 1000)
+            double3 xformOp:translate = (8, 4, 8)
+            float3 xformOp:rotateXYZ = (-16, 45, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+
+        # Orthographic, straight down; the image's top is -Z (the back of the ground).
+        def Camera "Top"
+        {
+            token projection = "orthographic"
+            float horizontalAperture = 140
+            float verticalAperture = 140
+            float2 clippingRange = (1, 100)
+            double3 xformOp:translate = (0, 20, 0)
+            float3 xformOp:rotateXYZ = (-90, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+
+        # Same view as Front, but the near clipping plane cuts the scene in half.
+        def Camera "Clipped"
+        {
+            float focalLength = 35
+            float horizontalAperture = 36
+            float verticalAperture = 24
+            float2 clippingRange = (10.4, 1000)
+            double3 xformOp:translate = (0, 3, 10)
+            float3 xformOp:rotateXYZ = (-16.7, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate", "xformOp:rotateXYZ"]
+        }
+
+        # A camera under a rotated and scaled parent: it ends up at (16, 3, 0)
+        # looking along -X. The scale must not change its field of view.
+        def Xform "Rig"
+        {
+            float xformOp:rotateY = 90
+            float3 xformOp:scale = (2, 2, 2)
+            uniform token[] xformOpOrder = ["xformOp:rotateY", "xformOp:scale"]
+
+            def Camera "Side"
+            {
+                float focalLength = 50
+                float horizontalAperture = 36
+                float verticalAperture = 24
+                float2 clippingRange = (0.1, 1000)
+                double3 xformOp:translate = (0, 1.5, 8)
+                uniform token[] xformOpOrder = ["xformOp:translate"]
+            }
+        }
+    }
+}

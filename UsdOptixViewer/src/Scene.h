@@ -37,6 +37,12 @@ struct MeshGeometry
     bool hasUVs;
 };
 
+// Present on UsdGeomCamera prims: index into Scene::cameras().
+struct CameraView
+{
+    unsigned int index;
+};
+
 // ---- render data ----------------------------------------------------------
 enum class TextureWrap { Repeat, Mirror, Clamp, Black };
 
@@ -115,6 +121,20 @@ struct FlatGeometry
     bool empty() const { return indices.empty(); }
 };
 
+// A UsdGeomCamera at the stage's start time, in world space. The window is
+// the image plane at distance 1 (perspective) or the view size in scene
+// units (orthographic); the viewer fits it to the viewport's aspect ratio.
+struct SceneCamera
+{
+    entt::entity entity = entt::null;
+    std::string path;
+    std::array<float, 3> eye = {0, 0, 0}, forward = {0, 0, -1}, up = {0, 1, 0};
+    float halfWidth = 1.0f, halfHeight = 1.0f;
+    bool orthographic = false;
+    float clipNear = 0.0f, clipFar = 1e16f;
+    float fovYDeg = 0.0f;  // vertical field of view of a perspective camera
+};
+
 class Scene
 {
 public:
@@ -127,6 +147,7 @@ public:
     entt::registry& registry() { return m_registry; }
     entt::entity root() const { return m_root; }
     const FlatGeometry& geometry() const { return m_geometry; }
+    const std::vector<SceneCamera>& cameras() const { return m_cameras; }
     const std::vector<std::string>& warnings() const { return m_warnings; }
     bool zUp() const { return m_zUp; }
 
@@ -135,6 +156,7 @@ public:
 private:
     entt::entity createEntities(const pxr::UsdPrim& prim, entt::entity parent);
     void extractGeometry();
+    void extractCameras(entt::entity e);
     unsigned int materialFor(const pxr::UsdShadeMaterial& material);
     unsigned int displayColorMaterial(const pxr::UsdPrim& prim);
     // srgbByDefault: color space when sourceColorSpace is neither "raw" nor "sRGB"
@@ -148,6 +170,7 @@ private:
     entt::registry      m_registry;
     entt::entity        m_root = entt::null;
     FlatGeometry        m_geometry;
+    std::vector<SceneCamera> m_cameras;
     std::vector<std::string> m_warnings;
     std::map<pxr::SdfPath, unsigned int> m_materialCache;
     std::map<std::tuple<std::string, bool, int, int>, int> m_textureCache;

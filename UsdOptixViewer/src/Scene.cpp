@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <cmath>
 
+#include <pxr/base/gf/camera.h>
+#include <pxr/base/gf/frustum.h>
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/usd/ar/asset.h>
 #include <pxr/usd/ar/resolver.h>
+#include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdGeom/cube.h>
 #include <pxr/usd/usdGeom/mesh.h>
 #include <pxr/usd/usdGeom/metrics.h>
@@ -220,6 +223,7 @@ bool Scene::load(const std::string& path, std::string& error)
     m_time = stage->HasAuthoredTimeCodeRange() ? UsdTimeCode(stage->GetStartTimeCode()) : UsdTimeCode::Default();
     m_root = createEntities(stage->GetPseudoRoot(), entt::null);
     extractGeometry();
+    extractCameras(m_root);
     return true;
 }
 
@@ -228,6 +232,7 @@ void Scene::clear()
     m_registry.clear();
     m_root = entt::null;
     m_geometry = FlatGeometry{};
+    m_cameras.clear();
     m_warnings.clear();
     m_materialCache.clear();
     m_textureCache.clear();
@@ -615,4 +620,41 @@ void Scene::extractGeometry()
             g.boundsMin[k] = lo[k];
             g.boundsMax[k] = hi[k];
         }
+}
+
+// ---- cameras ----------------------------------------------------------------
+// Walks the hierarchy depth first, so cameras keep the order of the stage.
+void Scene::extractCameras(entt::entity e)
+{
+    if (const UsdPrim p = prim(e); p && p.IsA<UsdGeomCamera>())
+    {
+        // GfFrustum drops any scale in the camera's transform, as USD requires
+        const GfCamera camera = UsdGeomCamera(p).GetCamera(m_time);
+        const GfFrustum frustum = camera.GetFrustum();
+        const GfVec3d eye = frustum.GetPosition(), forward = frustum.ComputeViewDirection(),
+                      up = frustum.ComputeUpVector();
+        SceneCamera c;
+        c.entity = e;
+        c.path = p.GetPath().GetString();
+        for (int k = 0; k < 3; ++k)
+        {
+            c.eye[k] = float(eye[k]);
+            c.forward[k] = float(forward[k]);
+            c.up[k] = float(up[k]);
+        }
+        const GfRange2d window = frustum.GetWindow();
+        c.halfWidth = float(0.5 * window.GetSize()[0]);
+        c.halfHeight = float(0.5 * window.GetSize()[1]);
+        c.orthographic = frustum.GetProjectionType() == GfFrustum::Orthographic;
+        c.clipNear = float(frustum.GetNearFar().GetMin());
+        c.clipFar = float(frustum.GetNearFar().GetMax());
+        if (!c.orthographic)
+            c.fovYDeg = camera.GetFieldOfView(GfCamera::FOVVertical);
+        if (window.GetMidpoint() != GfVec2d(0.0))
+            warn("Camera aperture offsets are ignored: " + c.path);
+        m_registry.emplace<CameraView>(e, unsigned(m_cameras.size()));
+        m_cameras.push_back(c);
+    }
+    for (entt::entity child : m_registry.get<Hierarchy>(e).children)
+        extractCameras(child);
 }

@@ -28,6 +28,11 @@ public:
     void setGeometry(const FlatGeometry& geometry);
     void resize(unsigned int width, unsigned int height);
     void setCamera(const float eye[3], const float target[3], const float up[3], float fovYDeg);
+    // halfWidth/halfHeight: the image plane at distance 1 (perspective) or half
+    // the view size in scene units (orthographic). Camera rays are clipped to
+    // [clipNear, clipFar] along `forward`.
+    void setCameraView(const float eye[3], const float forward[3], const float up[3], float halfWidth,
+                       float halfHeight, bool orthographic, float clipNear, float clipFar);
     void setLightDir(const float dir[3]);
     void setShadows(bool on) { m_params.shadows = on ? 1u : 0u; }
     void setMipmaps(bool on) { m_params.mipmaps = on ? 1u : 0u; }
