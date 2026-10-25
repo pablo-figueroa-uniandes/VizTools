@@ -44,6 +44,8 @@ location can also be overridden from the command line or the environment.
 <<Find the Dear ImGui sources>>
 
 <<Find SDL3, EnTT, OpenUSD and CUDA>>
+
+<<Fetch the OpenXR loader and the Vulkan headers>>
 @ The variable [[VIZ_PREFIX]] records the root of the tools. CUDA has its own
 rule: an explicit [[CUDAToolkit_ROOT]] wins, then the [[CUDA_HOME]] variable
 set by the login scripts, then the standard system directory.
@@ -96,6 +98,31 @@ find_package(CUDAToolkit 12 REQUIRED)
 find_package(SDL3 REQUIRED CONFIG)
 find_package(EnTT REQUIRED CONFIG)
 find_package(pxr REQUIRED CONFIG)
+@ The XR output of this branch needs two more things, neither of which is
+installed on the machine: the OpenXR loader, which finds the active OpenXR
+runtime and forwards calls to it, and the Vulkan headers, because the runtime
+talks to the application in Vulkan terms. Rather than installing them for all
+users, the project fetches both from Khronos at configure time with
+[[FetchContent]], pinned to fixed releases. The loader is built as a static
+library, so the installed binary carries it and needs no extra shared
+library. Vulkan itself is not linked at all: the program opens the driver's
+\lpfile{libvulkan.so.1} at run time (see the part on the XR output), and the CloudXR runtime is likewise loaded from
+a CloudXR SDK when it is asked for. Without a headset nothing of this is used.
+
+<<Fetch the OpenXR loader and the Vulkan headers>>=
+
+# XR output: the OpenXR loader (built static) and the Vulkan headers are
+# fetched with the project. Vulkan itself is loaded at run time from the
+# driver's libvulkan.so.1, and the CloudXR runtime from a CloudXR SDK.
+include(FetchContent)
+FetchContent_Declare(VulkanHeaders
+  GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git GIT_TAG v1.3.275 GIT_SHALLOW TRUE)
+FetchContent_Declare(OpenXR
+  GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git GIT_TAG release-1.1.58 GIT_SHALLOW TRUE)
+set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(VulkanHeaders OpenXR)
 @* Device code. The programs that run on the GPU (described in the part on
 device programs) are written in CUDA
 C++, but OptiX does not take machine code: it takes PTX, NVIDIA's portable
@@ -133,10 +160,14 @@ add_custom_command(
   COMMENT "Embedding PTX")
 @* The executable. Dear ImGui and its two back ends (SDL3 for input,
 SDL\_Renderer for drawing) become a static library. The viewer itself consists
-of five C++ files plus the generated PTX source. It links the parts of OpenUSD
+of seven C++ files plus the generated PTX source. It links the parts of OpenUSD
 it uses: \texttt{usd} for stages, \texttt{usdGeom} for geometry,
 \texttt{usdShade} for materials, \texttt{ar} for resolving and opening assets,
 and the base libraries \texttt{sdf}, \texttt{tf}, \texttt{gf} and~\texttt{vt}.
+It also links the OpenXR loader and uses the Vulkan headers. Two definitions
+apply to every file: [[VK_NO_PROTOTYPES]], because Vulkan functions are looked
+up at run time instead of linked, and [[XR_USE_GRAPHICS_API_VULKAN]], which
+makes \lpfile{openxr\_platform.h} declare the Vulkan binding.
 
 <<Build Dear ImGui and the viewer executable>>=
 # ---------------------------------------------------------------------------
@@ -150,11 +181,13 @@ target_include_directories(imgui PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 target_link_libraries(imgui PUBLIC SDL3::SDL3)
 
 add_executable(UsdOptixViewer
-  src/main.cpp src/App.cpp src/Scene.cpp src/OptixRenderer.cpp src/StbImage.cpp "${PTX_CPP}")
+  src/main.cpp src/App.cpp src/Scene.cpp src/OptixRenderer.cpp src/StbImage.cpp src/XrOutput.cpp
+  src/CloudXrService.cpp "${PTX_CPP}")
 target_include_directories(UsdOptixViewer PRIVATE src ${OptiX_INCLUDE_DIR})
 target_link_libraries(UsdOptixViewer PRIVATE
   imgui SDL3::SDL3 EnTT::EnTT usd usdGeom usdShade ar sdf tf gf vt
-  CUDA::cudart CUDA::cuda_driver ${CMAKE_DL_LIBS})
+  CUDA::cudart CUDA::cuda_driver OpenXR::openxr_loader Vulkan::Headers ${CMAKE_DL_LIBS})
+target_compile_definitions(UsdOptixViewer PRIVATE VK_NO_PROTOTYPES XR_USE_GRAPHICS_API_VULKAN)
 # USD headers trigger a few deprecation warnings under C++20
 target_compile_options(UsdOptixViewer PRIVATE -Wno-deprecated -Wno-deprecated-declarations)
 @ Installation copies the executable and the test scenes. The libraries it

@@ -67,6 +67,15 @@ Architecture (`src/`):
   outside (Scene.cpp rewinds left-handed meshes), so `cross(e1, e2)` is the
   outward normal. It is compiled to PTX by nvcc and embedded
   via `cmake/EmbedFile.cmake`.
+- `XrOutput.*` (branch `cloudxr`): OpenXR client. The runtime creates the
+  Vulkan instance/device (`XR_KHR_vulkan_enable2`); eye buffers are Vulkan
+  memory exported as opaque fds and imported into CUDA, copied to the
+  swapchain images on the Vulkan queue. Vulkan is dlopened (`VK_NO_PROTOTYPES`).
+  `CloudXrService.*` dlopens `libcloudxr.so` from a CloudXR SDK and restores
+  SDL's SIGINT/SIGTERM handlers after starting it. `OptixRenderer` can move to
+  the runtime's GPU (`release()` + `init(error, uuid)`) and renders eyes with
+  `renderView`. The differences from `main` are listed in `CLOUDXR.md`; keep
+  it current.
 - `LaunchParams.h`: shared by host and device. Keep both sides in sync when
   changing it.
 - `App.*`: SDL3 window, ImGui panels (hierarchy, inspector, viewport,
@@ -80,8 +89,8 @@ and keep builds warning-free.
 
 ## Literate book (LiterateP/)
 
-`LiterateP/src/*.nw` contains every line of the 13 project source files
-(everything except stb_image.h) in noweb syntax, with Knuth-style prose.
+`LiterateP/src/*.nw` contains every line of the 17 project source files
+(everything except stb_image.h and cxrServiceAPI.h) in noweb syntax, with Knuth-style prose.
 **When you change any source file, update the matching chunk in the book**,
 then run `python3 LiterateP/lp.py check`. It must print `ok` for all files.
 Rebuild the PDF with `LiterateP/build.sh` (needs tectonic in `~/.local/bin`).
@@ -107,6 +116,12 @@ line after `@`. Never hard-code section numbers: cite chunks as `<<Name>>`.
   meshes need `subdivisionScheme = "none"`, or they shade smooth.
   Validate new scenes with `usdchecker`. `McUsd.usdz` from
   github.com/usd-wg/assets is a good real-world texture and cutout test.
+- XR without a headset: `--cloudxr --cloudxr-sdk
+  /srv/isaac-shared/cxr/cloudxr-lovr-sample/build/cloudxr/CloudXR-6.2.1-Linux-sdk
+  --cloudxr-profile apple-vision-pro --xr-mirror` gives a running session (a
+  static profile needs no client); the mirror and the status bar show the
+  result. Stop it with SIGTERM so the session ends before the service. Only
+  one app can hold a CloudXR session.
 - Kill only the app's PID. `pkill -f` patterns can match and kill the shell
   running them.
 

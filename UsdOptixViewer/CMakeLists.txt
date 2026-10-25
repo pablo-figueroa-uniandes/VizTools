@@ -50,6 +50,19 @@ find_package(SDL3 REQUIRED CONFIG)
 find_package(EnTT REQUIRED CONFIG)
 find_package(pxr REQUIRED CONFIG)
 
+# XR output: the OpenXR loader (built static) and the Vulkan headers are
+# fetched with the project. Vulkan itself is loaded at run time from the
+# driver's libvulkan.so.1, and the CloudXR runtime from a CloudXR SDK.
+include(FetchContent)
+FetchContent_Declare(VulkanHeaders
+  GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git GIT_TAG v1.3.275 GIT_SHALLOW TRUE)
+FetchContent_Declare(OpenXR
+  GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git GIT_TAG release-1.1.58 GIT_SHALLOW TRUE)
+set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(VulkanHeaders OpenXR)
+
 # ---------------------------------------------------------------------------
 # OptiX device code: compiled to PTX with nvcc and embedded into the binary.
 # ---------------------------------------------------------------------------
@@ -82,11 +95,13 @@ target_include_directories(imgui PUBLIC ${IMGUI_DIR} ${IMGUI_DIR}/backends)
 target_link_libraries(imgui PUBLIC SDL3::SDL3)
 
 add_executable(UsdOptixViewer
-  src/main.cpp src/App.cpp src/Scene.cpp src/OptixRenderer.cpp src/StbImage.cpp "${PTX_CPP}")
+  src/main.cpp src/App.cpp src/Scene.cpp src/OptixRenderer.cpp src/StbImage.cpp src/XrOutput.cpp
+  src/CloudXrService.cpp "${PTX_CPP}")
 target_include_directories(UsdOptixViewer PRIVATE src ${OptiX_INCLUDE_DIR})
 target_link_libraries(UsdOptixViewer PRIVATE
   imgui SDL3::SDL3 EnTT::EnTT usd usdGeom usdShade ar sdf tf gf vt
-  CUDA::cudart CUDA::cuda_driver ${CMAKE_DL_LIBS})
+  CUDA::cudart CUDA::cuda_driver OpenXR::openxr_loader Vulkan::Headers ${CMAKE_DL_LIBS})
+target_compile_definitions(UsdOptixViewer PRIVATE VK_NO_PROTOTYPES XR_USE_GRAPHICS_API_VULKAN)
 # USD headers trigger a few deprecation warnings under C++20
 target_compile_options(UsdOptixViewer PRIVATE -Wno-deprecated -Wno-deprecated-declarations)
 

@@ -1,0 +1,1546 @@
+@** XR output. Everything so far draws on a monitor. This part sends the same
+ray-traced scene to a head-mounted display, one image per eye, through
+\emph{OpenXR}, the Khronos standard that sits between an application and the
+\emph{runtime} of a headset. The runtime we have in mind is NVIDIA CloudXR,
+which does not drive a headset cable at all: it encodes the eye images as
+video and streams them over the network to an Apple Vision Pro or a Meta
+Quest, which send their head poses back. To the application CloudXR is an
+ordinary OpenXR runtime, so nothing below is specific to it except the small
+class that can start it inside our own process.
+
+Two classes do the work. [[CloudXrService]] (in \lpfile{CloudXrService.h}
+and \lpfile{CloudXrService.cpp}) loads the CloudXR runtime from a CloudXR SDK
+and starts it, so that a single command brings up both the viewer and the
+streaming server. [[XrOutput]] (in \lpfile{XrOutput.h} and
+\lpfile{XrOutput.cpp}) is the OpenXR client proper: it finds the headset,
+creates the session, and every frame hands the application the eye cameras
+and two buffers to render into, then passes the finished images to the
+runtime. The application, in the previous part, decides when to call it.
+
+The guiding constraint is that the eye images must not cross the PCI bus. The
+renderer produces them in GPU memory with CUDA; the runtime wants them in
+Vulkan images. Rather than downloading the pixels to the host and uploading
+them again---some 35~MB per frame for two eyes of 2400 by 1920 pixels, ninety
+times a second---the eye buffers are allocated by Vulkan, \emph{exported} to
+CUDA, and written by OptiX directly. A copy on the GPU then moves each buffer
+into the image the runtime gave us.
+
+@* The CloudXR service. CloudXR comes as a set of shared libraries. The OpenXR runtime, which the
+OpenXR loader opens when an application creates an instance, is one of them:
+\lpfile{libopenxr\_cloudxr.so}. It does not do the
+streaming itself: it talks, through a local pipe, to the CloudXR
+\emph{service}, which owns the network connection to the headset and the
+video encoder. The service lives in \lpfile{libcloudxr.so} and is driven by a
+small C API, \lpfile{cxrServiceAPI.h}, that the SDK ships under a permissive
+license; we keep a copy of the header among the third-party sources.
+
+The service can run in a process of its own (NVIDIA's Isaac Teleop starts it
+that way, and then any OpenXR application on the machine can use it), or in
+the application's process, which is what [[CloudXrService]] does. Either way
+it must be running \emph{before} the OpenXR instance is created, because
+creating the instance is when the runtime library connects to it. The class
+therefore sits apart from [[XrOutput]], and the application starts it first.
+
+<<UsdOptixViewer/src/CloudXrService.h>>=
+<<Opening of the CloudXR service header>>
+
+class CloudXrService
+{
+public:
+    <<Public interface of the CloudXR service>>
+
+private:
+    <<State and entry points of the CloudXR service>>
+};
+@ The header names the class's purpose and includes the SDK's API header.
+
+<<Opening of the CloudXR service header>>=
+// Runs the NVIDIA CloudXR runtime inside this process, from the libraries of
+// a CloudXR SDK, and points the OpenXR loader at it. The service must be
+// started before the OpenXR instance is created.
+#pragma once
+
+#include <string>
+
+#include "third_party/cxrServiceAPI.h"
+@ The SDK is found at run time, from a directory given on the command line,
+so the program neither links against CloudXR nor needs it to build. The
+\emph{device profile} tells the service what kind of client to expect, and
+with it the eye resolution and frame rate: [[apple-vision-pro]] and
+[[quest3]] are static profiles, whose OpenXR system exists as soon as the
+service starts, while the [[auto-*]] profiles wait for a client to connect
+and then adopt its parameters.
+
+<<Public interface of the CloudXR service>>=
+CloudXrService() = default;
+~CloudXrService();
+CloudXrService(const CloudXrService&) = delete;
+CloudXrService& operator=(const CloudXrService&) = delete;
+
+// sdkDir holds libcloudxr.so and openxr_cloudxr.json. deviceProfile is a
+// CloudXR device profile ("apple-vision-pro", "auto-webrtc", ...), or empty
+// for the runtime's default.
+bool start(const std::string& sdkDir, const std::string& deviceProfile, std::string& error);
+void stop();
+bool running() const { return m_service != nullptr; }
+const std::string& version() const { return m_version; }
+
+// Drains the service's events; true while a CloudXR client is connected.
+bool clientConnected();
+@ The service is a handle into the loaded library. The library's functions
+are reached through pointers that [[start]] resolves with [[dlsym]]; their
+types come from the SDK header.
+
+<<State and entry points of the CloudXR service>>=
+void* m_library = nullptr;
+nv_cxr_service* m_service = nullptr;
+std::string m_version;
+bool m_clientConnected = false;
+
+PFN_nv_cxr_get_runtime_version m_getRuntimeVersion = nullptr;
+PFN_nv_cxr_service_create m_create = nullptr;
+PFN_nv_cxr_service_set_string_property m_setStringProperty = nullptr;
+PFN_nv_cxr_service_start m_start = nullptr;
+PFN_nv_cxr_service_stop m_stop = nullptr;
+PFN_nv_cxr_service_join m_join = nullptr;
+PFN_nv_cxr_service_destroy m_destroy = nullptr;
+PFN_nv_cxr_service_poll_event m_pollEvent = nullptr;
+@ The implementation file holds the five member functions, in the order of
+the service's life.
+
+<<UsdOptixViewer/src/CloudXrService.cpp>>=
+<<Headers of the CloudXR service>>
+
+<<Destroy the CloudXR service>>
+
+<<Start the CloudXR service>>
+
+<<Stop the CloudXR service>>
+
+<<Poll the events of the CloudXR service>>
+@ It needs the file-system library to build paths, the signal functions for
+a reason explained below, and [[dlopen]].
+
+<<Headers of the CloudXR service>>=
+#include "CloudXrService.h"
+
+#include <cstdlib>
+#include <filesystem>
+#include <type_traits>
+
+#include <csignal>
+
+#include <dlfcn.h>
+@ A running service must be stopped before the library that contains it is
+unloaded, and the destructor sees to it.
+
+<<Destroy the CloudXR service>>=
+CloudXrService::~CloudXrService()
+{
+    stop();
+}
+@ Starting the service is a sequence of steps, any of which can fail; each
+failure leaves an explanation in [[error]] and everything released.
+
+<<Start the CloudXR service>>=
+bool CloudXrService::start(const std::string& sdkDir, const std::string& deviceProfile, std::string& error)
+{
+    <<Find and load the CloudXR library>>
+    <<Resolve the entry points of the CloudXR service>>
+
+    <<Create the CloudXR service and choose its device profile>>
+    <<Start the CloudXR service, keeping our signal handlers>>
+    <<Report a failed CloudXR start, or point OpenXR at the runtime>>
+}
+@ An SDK directory is recognized by its OpenXR manifest,
+\lpfile{openxr\_cloudxr.json}, which we shall later hand to the loader. The
+service library depends on several others in the same directory (the
+streaming engine, a private OpenSSL, a CUDA runtime); its \emph{run path} is
+[[$ORIGIN]], so loading it by its full path is enough for the dynamic linker
+to find them all. [[RTLD_LOCAL]] keeps its symbols out of the global
+namespace: the SDK's CUDA runtime, version 12, must not be confused with the
+version 13 runtime that the renderer is linked against.
+
+<<Find and load the CloudXR library>>=
+const std::filesystem::path dir(sdkDir);
+const std::filesystem::path manifest = dir / "openxr_cloudxr.json";
+if (!std::filesystem::exists(manifest))
+{
+    error = "No CloudXR SDK in " + sdkDir + " (openxr_cloudxr.json not found)";
+    return false;
+}
+// the library finds its own dependencies next to it (RUNPATH $ORIGIN)
+m_library = dlopen((dir / "libcloudxr.so").c_str(), RTLD_NOW | RTLD_LOCAL);
+if (!m_library)
+{
+    error = std::string("Could not load libcloudxr.so: ") + dlerror();
+    return false;
+}
+@ The generic lambda [[resolve]] looks a symbol up and casts it to the type
+of the pointer it is given, which saves repeating every function type. Once
+the functions are known we ask for the runtime's version; the XR menu shows
+it, and its major number is the streaming protocol a client must speak.
+
+<<Resolve the entry points of the CloudXR service>>=
+auto resolve = [&](auto& fn, const char* name) {
+    fn = reinterpret_cast<std::remove_reference_t<decltype(fn)>>(dlsym(m_library, name));
+    if (!fn)
+        error = std::string("libcloudxr.so lacks ") + name;
+    return fn != nullptr;
+};
+if (!resolve(m_getRuntimeVersion, "nv_cxr_get_runtime_version") || !resolve(m_create, "nv_cxr_service_create") ||
+    !resolve(m_setStringProperty, "nv_cxr_service_set_string_property") ||
+    !resolve(m_start, "nv_cxr_service_start") || !resolve(m_stop, "nv_cxr_service_stop") ||
+    !resolve(m_join, "nv_cxr_service_join") || !resolve(m_destroy, "nv_cxr_service_destroy") ||
+    !resolve(m_pollEvent, "nv_cxr_service_poll_event"))
+{
+    stop();
+    return false;
+}
+uint32_t major = 0, minor = 0, patch = 0;
+m_getRuntimeVersion(&major, &minor, &patch);
+m_version = std::to_string(major) + "." + std::to_string(minor) + "." + std::to_string(patch);
+@ Properties can only be set between creating and starting the service. The
+only one we set is the device profile, and only when the user named one.
+
+<<Create the CloudXR service and choose its device profile>>=
+nv_cxr_result_t result = m_create(&m_service);
+if (result == NV_CXR_SUCCESS && !deviceProfile.empty())
+{
+    const std::string name = "device-profile";
+    result = m_setStringProperty(m_service, name.data(), name.size(), deviceProfile.data(), deviceProfile.size());
+}
+@ Starting the service has a side effect that took some finding. The
+service, like the Monado runtime it is built on, installs handlers for
+[[SIGINT]] and [[SIGTERM]] that stop it. In a process of its own that is
+right; in ours it is not, because a signal would pull the runtime away while
+our session is still submitting frames, the next OpenXR call would fail, and
+SDL, whose own handlers were replaced, would never learn that it should quit.
+So we remember the handlers that were in place---SDL's, which turn the
+signals into a quit event---and put them back as soon as the service has
+started. A [[SIGTERM]] then takes the normal way out: the main loop ends, the
+session is destroyed, and only then the service stops.
+
+<<Start the CloudXR service, keeping our signal handlers>>=
+if (result == NV_CXR_SUCCESS)
+{
+    // The service installs SIGINT/SIGTERM handlers that stop it while the
+    // app still uses it. Give the signals back to SDL, whose quit event
+    // ends the session first and then stops the service.
+    struct sigaction interrupt{}, terminate{};
+    sigaction(SIGINT, nullptr, &interrupt);
+    sigaction(SIGTERM, nullptr, &terminate);
+    result = m_start(m_service);
+    sigaction(SIGINT, &interrupt, nullptr);
+    sigaction(SIGTERM, &terminate, nullptr);
+}
+@ The usual reason for a failed start is another CloudXR runtime already
+running on the machine, since only one service can hold the network ports.
+The embedded service writes its log to the console, which is where the
+message sends the user. On success, [[XR_RUNTIME_JSON]] is pointed at the
+SDK's manifest; the OpenXR loader reads this variable when the instance is
+created, and so the instance will be served by the CloudXR runtime library,
+which in turn connects to the service we have just started.
+
+<<Report a failed CloudXR start, or point OpenXR at the runtime>>=
+if (result != NV_CXR_SUCCESS)
+{
+    error = "The CloudXR service did not start (error " + std::to_string(int(result)) +
+            "). Is another CloudXR runtime running? The service's messages are on the console.";
+    if (m_service)
+    {
+        m_destroy(m_service);
+        m_service = nullptr;
+    }
+    stop();
+    return false;
+}
+// the OpenXR loader reads this when the instance is created
+setenv("XR_RUNTIME_JSON", manifest.c_str(), 1);
+return true;
+@ Stopping is [[stop]] followed by [[join]], which waits until the service
+has really ended, and then destroying it. [[stop]] is safe to call at any
+time, also on a half-started service.
+
+<<Stop the CloudXR service>>=
+void CloudXrService::stop()
+{
+    if (m_service)
+    {
+        m_stop(m_service);
+        m_join(m_service);
+        m_destroy(m_service);
+        m_service = nullptr;
+    }
+    if (m_library)
+    {
+        dlclose(m_library);
+        m_library = nullptr;
+    }
+    m_clientConnected = false;
+}
+@ The service queues events: a client (the headset) connected or
+disconnected, an OpenXR application connected or disconnected. Only the
+first pair interests us, for the status shown in the XR menu. One oddity of
+the API is that ``no event'' is reported as a successful call that returns an
+event of type [[NV_CXR_EVENT_NONE]], so the loop must test the type as well
+as the result.
+
+<<Poll the events of the CloudXR service>>=
+bool CloudXrService::clientConnected()
+{
+    if (!m_service)
+        return false;
+    // poll_event reports "no event" as a success with type NV_CXR_EVENT_NONE
+    nv_cxr_event_t event{};
+    while (m_pollEvent(m_service, &event) == NV_CXR_SUCCESS && event.type != NV_CXR_EVENT_NONE)
+    {
+        if (event.type == NV_CXR_EVENT_CLOUDXR_CLIENT_CONNECTED)
+            m_clientConnected = true;
+        else if (event.type == NV_CXR_EVENT_CLOUDXR_CLIENT_DISCONNECTED)
+            m_clientConnected = false;
+        event = {};
+    }
+    return m_clientConnected;
+}
+@* The XR output: interface. [[XrOutput]] has to cope with a headset that
+may appear late, disappear, and come back. Its life is therefore a small
+state machine, and the application asks for the current state every frame.
+
+<<UsdOptixViewer/src/XrOutput.h>>=
+<<Opening of the XR output header>>
+
+class XrOutput
+{
+public:
+    <<States of the XR output>>
+
+    <<Placing the XR user in the scene>>
+
+    <<Construction and session control of the XR output>>
+
+    <<Frames and eyes of the XR output>>
+
+private:
+    <<An eye of the XR output>>
+
+    <<Private steps of the XR output>>
+
+    <<OpenXR state of the XR output>>
+
+    <<Vulkan state and eye images of the XR output>>
+};
+@ The header pulls in the CUDA runtime (for the external-memory handle of
+each eye), the Vulkan and OpenXR headers, and the shared launch parameters,
+whose [[Camera]] the eye cameras are expressed in. The build defines
+[[VK_NO_PROTOTYPES]], so the Vulkan header declares types but no functions,
+and [[XR_USE_GRAPHICS_API_VULKAN]], which makes \lpfile{openxr\_platform.h}
+declare the Vulkan binding of OpenXR.
+
+<<Opening of the XR output header>>=
+// Stereo output through OpenXR, for example to a headset streamed by NVIDIA
+// CloudXR. The runtime chooses the GPU and creates the Vulkan device. Each
+// eye has a buffer in Vulkan memory that is shared with CUDA, so OptiX renders
+// straight into it; a copy on the Vulkan queue moves it into the eye's
+// swapchain image.
+#pragma once
+
+#include <array>
+#include <chrono>
+#include <string>
+#include <vector>
+
+#include <cuda_runtime.h>
+#include <vulkan/vulkan.h>
+#include <openxr/openxr.h>
+#include <openxr/openxr_platform.h>
+
+#include "LaunchParams.h"
+@ The states, in the order they are normally visited. Without an instance
+the output is [[Off]]. With one, it looks for an OpenXR \emph{system}---a
+headset---and stays [[WaitingForSystem]] until there is one. A static
+CloudXR profile has a system at once; an [[auto-*]] profile only after a
+client has connected, which may take minutes, and the desktop must remain
+usable meanwhile. Once the system is there and the Vulkan device has been
+made, the output is [[SystemReady]] and waits for the application to create
+the session; the application has a job to do first, as we shall see. The
+session then sits [[Idle]] until the runtime declares it ready, and is
+[[Running]] while frames flow.
+
+<<States of the XR output>>=
+enum class State
+{
+    Off,               // no OpenXR instance
+    WaitingForSystem,  // no headset yet (a CloudXR "auto" profile waits for a client)
+    SystemReady,       // Vulkan device created; the app must call createSession()
+    Idle,              // session created, not running
+    Running,           // frames are being submitted
+};
+@ The headset reports the eyes in its own coordinates, in meters, relative
+to where the head was when the session began. Something must say where that
+origin is in the scene. The [[Anchor]] does: an eye point, a direction to
+face, which axis is up, and a scale. The application fills it from the
+desktop view, so that the user starts where the desktop camera is.
+
+<<Placing the XR user in the scene>>=
+// Places the user in the scene: the origin of the XR space (the head's
+// position when the session started) goes to `eye`, facing the
+// horizontal part of `forward`, and one meter spans unitsPerMeter units.
+struct Anchor
+{
+    float eye[3];
+    float forward[3];
+    bool zUp;
+    float unitsPerMeter;
+};
+@ The life cycle in calls: [[init]] creates the instance, [[update]] is
+called every main-loop turn, and when the state is [[SystemReady]] the
+application makes
+CUDA current on the GPU identified by [[deviceUuid]] before calling
+[[createSession]]. The UUID is the only reliable way to name a GPU across
+APIs: CUDA and Vulkan number the two GPUs of this machine independently.
+
+<<Construction and session control of the XR output>>=
+XrOutput() = default;
+~XrOutput();
+XrOutput(const XrOutput&) = delete;
+XrOutput& operator=(const XrOutput&) = delete;
+
+// Creates the OpenXR instance with the active runtime (XR_RUNTIME_JSON).
+bool init(std::string& error);
+// Ends the session and releases everything (State::Off).
+void stop();
+// Handles runtime events and looks for the headset. On an error the XR
+// output is shut down (State::Off) and `error` is set.
+State update(std::string& error);
+State state() const { return m_state; }
+// In State::SystemReady: CUDA must be current on the GPU with this UUID
+// before createSession(), which shares memory between Vulkan and CUDA.
+const std::array<unsigned char, 16>& deviceUuid() const { return m_deviceUuid; }
+bool createSession(float resolutionScale, std::string& error);
+@ Each frame is bracketed by [[beginFrame]] and [[endFrame]]. In between,
+when [[shouldRender]] is true, the application renders every eye with
+[[eyeCamera]] into [[eyeBuffer]]. The names of the runtime, the headset and
+the GPU are kept for the XR menu.
+
+<<Frames and eyes of the XR output>>=
+// One frame: when beginFrame() returns true, render each eye into
+// eyeBuffer() if shouldRender(), then call endFrame().
+bool beginFrame(std::string& error);
+bool shouldRender() const { return m_frameState.shouldRender && m_viewsValid; }
+void endFrame(std::string& error);
+
+unsigned int eyeCount() const { return unsigned(m_eyes.size()); }
+unsigned int eyeWidth() const { return m_width; }
+unsigned int eyeHeight() const { return m_height; }
+uchar4* eyeBuffer(unsigned int eye) const { return m_eyes[eye].pixels; }
+Camera eyeCamera(unsigned int eye, const Anchor& anchor) const;
+
+const std::string& runtimeName() const { return m_runtimeName; }
+const std::string& systemName() const { return m_systemName; }
+const std::string& gpuName() const { return m_gpuName; }
+@ An eye owns a swapchain---the ring of images the runtime gives us to fill,
+usually three---and the shared buffer: a Vulkan buffer, its memory, the
+same memory as CUDA sees it, and the device pointer through which OptiX
+writes it.
+
+<<An eye of the XR output>>=
+struct Eye
+{
+    XrSwapchain swapchain = XR_NULL_HANDLE;
+    std::vector<XrSwapchainImageVulkan2KHR> images;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    cudaExternalMemory_t cudaMemory = nullptr;
+    uchar4* pixels = nullptr;  // the buffer, mapped into CUDA
+};
+@ The private steps follow the order of the life cycle; each is presented
+in its own section of the implementation.
+
+<<Private steps of the XR output>>=
+void findSystem();
+void createVulkanDevice();
+void createSharedBuffer(Eye& eye);
+void pollEvents();
+void copyToSwapchains();
+void destroySession();
+void destroyVulkan();
+@ The OpenXR side of the state: instance, system, session, the reference
+space in which views are located, the blend mode and frame state of the
+current frame, the located views, and the time of the next look for a
+system.
+
+<<OpenXR state of the XR output>>=
+State m_state = State::Off;
+XrInstance m_instance = XR_NULL_HANDLE;
+XrSystemId m_systemId = XR_NULL_SYSTEM_ID;
+XrSession m_session = XR_NULL_HANDLE;
+XrSpace m_space = XR_NULL_HANDLE;
+XrEnvironmentBlendMode m_blendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+XrFrameState m_frameState{XR_TYPE_FRAME_STATE};
+std::vector<XrView> m_views;
+bool m_viewsValid = false;
+std::chrono::steady_clock::time_point m_nextSystemPoll;
+std::string m_runtimeName, m_systemName, m_gpuName;
+@ The Vulkan side: the loaded library, the instance and device that the
+runtime created for us, one queue, one command buffer and one fence (a frame
+records one batch of copies and waits for it), and the UUID of the GPU. Last
+come the eyes and their common size.
+
+<<Vulkan state and eye images of the XR output>>=
+void* m_vulkanLibrary = nullptr;
+VkInstance m_vkInstance = VK_NULL_HANDLE;
+VkPhysicalDevice m_physicalDevice = VK_NULL_HANDLE;
+VkDevice m_device = VK_NULL_HANDLE;
+uint32_t m_queueFamily = 0;
+VkQueue m_queue = VK_NULL_HANDLE;
+VkCommandPool m_commandPool = VK_NULL_HANDLE;
+VkCommandBuffer m_commandBuffer = VK_NULL_HANDLE;
+VkFence m_fence = VK_NULL_HANDLE;
+std::array<unsigned char, 16> m_deviceUuid{};
+
+std::vector<Eye> m_eyes;
+unsigned int m_width = 0, m_height = 0;
+@* The XR output: setting up. The implementation file has a few helpers in
+an anonymous namespace, then the member functions in the order of the life
+cycle: instance and system, Vulkan, the shared buffers, the session, the
+frames, and the eye cameras.
+
+<<UsdOptixViewer/src/XrOutput.cpp>>=
+<<Headers of the XR output>>
+
+namespace {
+
+<<Vulkan functions loaded at run time for XR>>
+
+<<OpenXR functions of the Vulkan binding>>
+
+<<Error checks of the XR output>>
+
+<<Rotate a vector by a quaternion for XR>>
+
+}  // namespace
+
+<<Destroy or stop the XR output>>
+
+<<Create the OpenXR instance>>
+
+<<Update the XR output>>
+
+<<Look for the XR system>>
+
+<<Create the XR Vulkan device>>
+
+<<Destroy the XR Vulkan device>>
+
+<<Share an eye buffer between Vulkan and CUDA>>
+
+<<Create the XR session>>
+
+<<Destroy the XR session>>
+
+<<Follow the XR session state>>
+
+<<Begin an XR frame>>
+
+<<End an XR frame>>
+
+<<Copy the eye buffers into the swapchain images>>
+
+<<Compute the camera of an XR eye>>
+@
+<<Headers of the XR output>>=
+#include "XrOutput.h"
+
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <stdexcept>
+
+#include <dlfcn.h>
+@ The program does not link against Vulkan. Its driver-provided loader,
+\lpfile{libvulkan.so.1}, is opened at run time, and every function we call
+is looked up through [[vkGetInstanceProcAddr]]. This keeps the build free of
+a Vulkan SDK (only the headers are needed) and the binary free of a hard
+dependency that only the XR output uses. The list of functions is written
+once, as an ``X macro'': [[VULKAN_FUNCTIONS(X)]] applies [[X]] to every
+name, so the same list both declares the pointers and, later, loads them.
+
+<<Vulkan functions loaded at run time for XR>>=
+// Vulkan is loaded at run time from the driver, so the program needs no
+// Vulkan SDK. There is one Vulkan device per process, so the function table
+// can be global.
+#define VULKAN_FUNCTIONS(X)                                                                                            \
+    X(vkDestroyInstance)                                                                                               \
+    X(vkGetPhysicalDeviceProperties2)                                                                                  \
+    X(vkGetPhysicalDeviceQueueFamilyProperties)                                                                        \
+    X(vkGetPhysicalDeviceMemoryProperties)                                                                             \
+    X(vkDestroyDevice)                                                                                                 \
+    X(vkDeviceWaitIdle)                                                                                                \
+    X(vkGetDeviceQueue)                                                                                                \
+    X(vkCreateCommandPool)                                                                                             \
+    X(vkDestroyCommandPool)                                                                                            \
+    X(vkAllocateCommandBuffers)                                                                                        \
+    X(vkBeginCommandBuffer)                                                                                            \
+    X(vkEndCommandBuffer)                                                                                              \
+    X(vkCmdPipelineBarrier)                                                                                            \
+    X(vkCmdCopyBufferToImage)                                                                                          \
+    X(vkQueueSubmit)                                                                                                   \
+    X(vkCreateFence)                                                                                                   \
+    X(vkDestroyFence)                                                                                                  \
+    X(vkWaitForFences)                                                                                                 \
+    X(vkResetFences)                                                                                                   \
+    X(vkCreateBuffer)                                                                                                  \
+    X(vkDestroyBuffer)                                                                                                 \
+    X(vkGetBufferMemoryRequirements)                                                                                   \
+    X(vkAllocateMemory)                                                                                                \
+    X(vkFreeMemory)                                                                                                    \
+    X(vkBindBufferMemory)                                                                                              \
+    X(vkGetMemoryFdKHR)
+
+struct Vulkan
+{
+    PFN_vkGetInstanceProcAddr vkGetInstanceProcAddr = nullptr;
+#define DECLARE(name) PFN_##name name = nullptr;
+    VULKAN_FUNCTIONS(DECLARE)
+#undef DECLARE
+} vk;
+@ The OpenXR functions of the Vulkan binding are extension functions; the
+loader does not export them, and they too must be fetched, from the
+instance.
+
+<<OpenXR functions of the Vulkan binding>>=
+// The functions of the Vulkan binding are extensions, found through the instance.
+struct
+{
+    PFN_xrGetVulkanGraphicsRequirements2KHR getGraphicsRequirements = nullptr;
+    PFN_xrCreateVulkanInstanceKHR createInstance = nullptr;
+    PFN_xrGetVulkanGraphicsDevice2KHR getGraphicsDevice = nullptr;
+    PFN_xrCreateVulkanDeviceKHR createDevice = nullptr;
+} xrVulkan;
+@ Errors become exceptions, caught at the entry points, which then shut the
+output down and report the message. OpenXR can name its result codes, but
+only through an instance; the most likely error, no runtime at all, happens
+before there is one, so it gets a message of its own that also says what to
+do about it.
+
+<<Error checks of the XR output>>=
+void xrCheck(XrInstance instance, XrResult result, const char* what)
+{
+    if (XR_SUCCEEDED(result))
+        return;
+    if (result == XR_ERROR_RUNTIME_UNAVAILABLE)  // before any instance exists, so not in xrResultToString
+        throw std::runtime_error("no OpenXR runtime is available. Set XR_RUNTIME_JSON to a runtime's manifest, "
+                                 "or use --cloudxr");
+    char name[XR_MAX_RESULT_STRING_SIZE] = "";
+    if (instance == XR_NULL_HANDLE || XR_FAILED(xrResultToString(instance, result, name)))
+        snprintf(name, sizeof(name), "%d", int(result));
+    throw std::runtime_error(std::string(what) + " failed: " + name);
+}
+
+void vkCheck(VkResult result, const char* what)
+{
+    if (result != VK_SUCCESS)
+        throw std::runtime_error(std::string(what) + " failed: VkResult " + std::to_string(int(result)));
+}
+
+void cudaCheck(cudaError_t result, const char* what)
+{
+    if (result != cudaSuccess)
+        throw std::runtime_error(std::string(what) + " failed: " + cudaGetErrorString(result));
+}
+@ Head poses arrive as unit quaternions $q=(\mathbf u, w)$. Rotating a
+vector $\mathbf v$ by $q$ is $q\mathbf v q^{-1}$, which expands to the
+cheaper form
+$$\mathbf v' = \mathbf v + 2\,\mathbf u\times(\mathbf u\times\mathbf v + w\,\mathbf v).$$
+
+<<Rotate a vector by a quaternion for XR>>=
+// q * v * q^-1 for a unit quaternion
+XrVector3f rotate(const XrQuaternionf& q, XrVector3f v)
+{
+    const XrVector3f u{q.x, q.y, q.z};
+    auto cross = [](XrVector3f a, XrVector3f b) {
+        return XrVector3f{a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
+    };
+    const XrVector3f c = cross(u, v);
+    const XrVector3f t{c.x + q.w * v.x, c.y + q.w * v.y, c.z + q.w * v.z};
+    const XrVector3f d = cross(u, t);
+    return {v.x + 2.0f * d.x, v.y + 2.0f * d.y, v.z + 2.0f * d.z};
+}
+@ [[stop]] tears down in the reverse order of creation and is safe in any
+state, so it serves both as the destructor and as the common error path.
+
+<<Destroy or stop the XR output>>=
+XrOutput::~XrOutput()
+{
+    stop();
+}
+
+void XrOutput::stop()
+{
+    destroySession();
+    destroyVulkan();
+    if (m_instance != XR_NULL_HANDLE)
+        xrDestroyInstance(m_instance);
+    m_instance = XR_NULL_HANDLE;
+    m_systemId = XR_NULL_SYSTEM_ID;
+    m_state = State::Off;
+}
+@ Creating the instance takes four steps: check that the runtime can work
+with Vulkan, create the instance, record the runtime's name, and fetch the
+functions of the Vulkan binding.
+
+<<Create the OpenXR instance>>=
+// ---- instance and system ------------------------------------------------------
+bool XrOutput::init(std::string& error)
+{
+    try
+    {
+        <<Make sure the OpenXR runtime supports Vulkan>>
+
+        <<Create the OpenXR instance with the Vulkan extension>>
+
+        <<Name the OpenXR runtime>>
+
+        <<Load the OpenXR Vulkan binding functions>>
+    }
+    catch (const std::exception& e)
+    {
+        error = e.what();
+        stop();
+        return false;
+    }
+    return true;
+}
+@ Enumerating the instance extensions is the first call that needs a
+runtime, so it doubles as the test that there is one. The renderer's images
+can only reach the runtime through Vulkan, which this program speaks through
+the second version of the Vulkan binding, [[XR_KHR_vulkan_enable2]]. The
+CloudXR runtime offers exactly that (and no desktop OpenGL binding).
+
+<<Make sure the OpenXR runtime supports Vulkan>>=
+uint32_t count = 0;
+xrCheck(XR_NULL_HANDLE, xrEnumerateInstanceExtensionProperties(nullptr, 0, &count, nullptr),
+        "Looking for an OpenXR runtime");
+std::vector<XrExtensionProperties> extensions(count, {XR_TYPE_EXTENSION_PROPERTIES});
+xrEnumerateInstanceExtensionProperties(nullptr, count, &count, extensions.data());
+if (std::none_of(extensions.begin(), extensions.end(), [](const XrExtensionProperties& e) {
+        return std::strcmp(e.extensionName, XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME) == 0;
+    }))
+    throw std::runtime_error("the OpenXR runtime does not support Vulkan (XR_KHR_vulkan_enable2)");
+@ We ask for OpenXR 1.0, which every current runtime supports.
+
+<<Create the OpenXR instance with the Vulkan extension>>=
+const char* enabled[] = {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME};
+XrInstanceCreateInfo info{XR_TYPE_INSTANCE_CREATE_INFO};
+std::strncpy(info.applicationInfo.applicationName, "UsdOptixViewer", XR_MAX_APPLICATION_NAME_SIZE - 1);
+std::strncpy(info.applicationInfo.engineName, "UsdOptixViewer", XR_MAX_ENGINE_NAME_SIZE - 1);
+info.applicationInfo.applicationVersion = 1;
+info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
+info.enabledExtensionCount = 1;
+info.enabledExtensionNames = enabled;
+xrCheck(XR_NULL_HANDLE, xrCreateInstance(&info, &m_instance), "xrCreateInstance");
+@
+<<Name the OpenXR runtime>>=
+XrInstanceProperties properties{XR_TYPE_INSTANCE_PROPERTIES};
+xrCheck(m_instance, xrGetInstanceProperties(m_instance, &properties), "xrGetInstanceProperties");
+m_runtimeName = std::string(properties.runtimeName) + " " +
+                std::to_string(XR_VERSION_MAJOR(properties.runtimeVersion)) + "." +
+                std::to_string(XR_VERSION_MINOR(properties.runtimeVersion)) + "." +
+                std::to_string(XR_VERSION_PATCH(properties.runtimeVersion));
+@
+<<Load the OpenXR Vulkan binding functions>>=
+auto load = [&](auto& fn, const char* name) {
+    xrCheck(m_instance, xrGetInstanceProcAddr(m_instance, name, reinterpret_cast<PFN_xrVoidFunction*>(&fn)),
+            name);
+};
+load(xrVulkan.getGraphicsRequirements, "xrGetVulkanGraphicsRequirements2KHR");
+load(xrVulkan.createInstance, "xrCreateVulkanInstanceKHR");
+load(xrVulkan.getGraphicsDevice, "xrGetVulkanGraphicsDevice2KHR");
+load(xrVulkan.createDevice, "xrCreateVulkanDeviceKHR");
+m_state = State::WaitingForSystem;
+@ The main loop calls [[update]] every turn. Waiting for a system and
+following the session's events are the two things that can happen between
+frames.
+
+<<Update the XR output>>=
+XrOutput::State XrOutput::update(std::string& error)
+{
+    try
+    {
+        if (m_state == State::WaitingForSystem)
+            findSystem();
+        else if (m_state == State::Idle || m_state == State::Running)
+            pollEvents();
+    }
+    catch (const std::exception& e)
+    {
+        error = e.what();
+        stop();
+    }
+    return m_state;
+}
+@ Looking for a system must not block, and must not hammer the runtime
+either; twice a second is plenty. A runtime without a headset answers
+[[XR_ERROR_FORM_FACTOR_UNAVAILABLE]], which is not an error here, just ``not
+yet''. When the system appears, the Vulkan device is created at once,
+because its UUID is what the application needs next.
+
+<<Look for the XR system>>=
+// A CloudXR "auto" device profile has no system until a client connects, so
+// the system is looked for twice a second until it appears.
+void XrOutput::findSystem()
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (now < m_nextSystemPoll)
+        return;
+    m_nextSystemPoll = now + std::chrono::milliseconds(500);
+
+    XrSystemGetInfo info{XR_TYPE_SYSTEM_GET_INFO};
+    info.formFactor = XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY;
+    const XrResult result = xrGetSystem(m_instance, &info, &m_systemId);
+    if (result == XR_ERROR_FORM_FACTOR_UNAVAILABLE)
+        return;
+    xrCheck(m_instance, result, "xrGetSystem");
+    XrSystemProperties properties{XR_TYPE_SYSTEM_PROPERTIES};
+    xrCheck(m_instance, xrGetSystemProperties(m_instance, m_systemId, &properties), "xrGetSystemProperties");
+    m_systemName = properties.systemName;
+    createVulkanDevice();
+    m_state = State::SystemReady;
+}
+@* Vulkan for the runtime. With [[XR_KHR_vulkan_enable2]] the application
+does not create its Vulkan instance and device by itself. It fills in the
+usual creation structures and hands them to the runtime, which adds the
+extensions it needs for its own work (sharing images with its compositor
+process, in CloudXR's case) and creates the objects with our loader
+function. The runtime also chooses the physical device: the GPU the headset
+is driven from, which on a machine with two GPUs need not be the first one.
+
+<<Create the XR Vulkan device>>=
+// ---- Vulkan -------------------------------------------------------------------
+// The runtime creates the Vulkan instance and device itself (vulkan_enable2),
+// adding the extensions it needs to ours, and tells us which GPU to use.
+void XrOutput::createVulkanDevice()
+{
+    <<Ask the XR runtime for the Vulkan version>>
+
+    <<Load the Vulkan library for XR>>
+
+<<Have the XR runtime create the Vulkan instance>>
+
+    <<Find the GPU the XR runtime chose>>
+
+    <<Pick a graphics queue for XR>>
+
+    <<Have the XR runtime create the Vulkan device>>
+
+    <<Create the XR command buffer and fence>>
+}
+@ The runtime states the oldest Vulkan version it can work with; we ask for
+that or 1.1, whichever is newer. Version 1.1 is the first in which external
+memory and dedicated allocations are part of the core.
+
+<<Ask the XR runtime for the Vulkan version>>=
+XrGraphicsRequirementsVulkan2KHR requirements{XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN2_KHR};
+xrCheck(m_instance, xrVulkan.getGraphicsRequirements(m_instance, m_systemId, &requirements),
+        "xrGetVulkanGraphicsRequirements2KHR");
+const uint32_t apiVersion =
+    std::max(VK_API_VERSION_1_1, VK_MAKE_API_VERSION(0, XR_VERSION_MAJOR(requirements.minApiVersionSupported),
+                                                     XR_VERSION_MINOR(requirements.minApiVersionSupported), 0));
+@
+<<Load the Vulkan library for XR>>=
+m_vulkanLibrary = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+if (!m_vulkanLibrary)
+    throw std::runtime_error("libvulkan.so.1 not found");
+vk.vkGetInstanceProcAddr =
+    reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(m_vulkanLibrary, "vkGetInstanceProcAddr"));
+@ The instance needs no extensions of ours. Once it exists, all the
+functions in our list can be looked up through it, device functions
+included: the loader returns trampolines that dispatch to the right device.
+The loading macro sits in the left margin, as a preprocessor definition
+should.
+
+<<Have the XR runtime create the Vulkan instance>>=
+    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
+    app.pApplicationName = "UsdOptixViewer";
+    app.apiVersion = apiVersion;
+    VkInstanceCreateInfo instanceInfo{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    instanceInfo.pApplicationInfo = &app;
+    XrVulkanInstanceCreateInfoKHR xrInstanceInfo{XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR};
+    xrInstanceInfo.systemId = m_systemId;
+    xrInstanceInfo.pfnGetInstanceProcAddr = vk.vkGetInstanceProcAddr;
+    xrInstanceInfo.vulkanCreateInfo = &instanceInfo;
+    VkResult vkResult = VK_SUCCESS;
+    xrCheck(m_instance, xrVulkan.createInstance(m_instance, &xrInstanceInfo, &m_vkInstance, &vkResult),
+            "xrCreateVulkanInstanceKHR");
+    vkCheck(vkResult, "vkCreateInstance");
+#define LOAD(name)                                                                                                     \
+    vk.name = reinterpret_cast<PFN_##name>(vk.vkGetInstanceProcAddr(m_vkInstance, #name));                             \
+    if (!vk.name)                                                                                                      \
+        throw std::runtime_error("Vulkan function " #name " not found");
+    VULKAN_FUNCTIONS(LOAD)
+#undef LOAD
+@ The UUID of the chosen GPU comes from the device's ID properties; the
+application compares it with the UUIDs that CUDA reports.
+
+<<Find the GPU the XR runtime chose>>=
+XrVulkanGraphicsDeviceGetInfoKHR deviceGetInfo{XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR};
+deviceGetInfo.systemId = m_systemId;
+deviceGetInfo.vulkanInstance = m_vkInstance;
+xrCheck(m_instance, xrVulkan.getGraphicsDevice(m_instance, &deviceGetInfo, &m_physicalDevice),
+        "xrGetVulkanGraphicsDevice2KHR");
+VkPhysicalDeviceIDProperties ids{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &ids};
+vk.vkGetPhysicalDeviceProperties2(m_physicalDevice, &properties);
+std::copy(std::begin(ids.deviceUUID), std::end(ids.deviceUUID), m_deviceUuid.begin());
+m_gpuName = properties.properties.deviceName;
+@ Any queue family with graphics capability will do: we only record copies,
+and the binding requires the queue the runtime may synchronize with to be
+one it can also use for its own work.
+
+<<Pick a graphics queue for XR>>=
+uint32_t familyCount = 0;
+vk.vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &familyCount, nullptr);
+std::vector<VkQueueFamilyProperties> families(familyCount);
+vk.vkGetPhysicalDeviceQueueFamilyProperties(m_physicalDevice, &familyCount, families.data());
+const auto graphics = std::find_if(families.begin(), families.end(), [](const VkQueueFamilyProperties& f) {
+    return f.queueFlags & VK_QUEUE_GRAPHICS_BIT;
+});
+if (graphics == families.end())
+    throw std::runtime_error("the XR GPU has no graphics queue");
+m_queueFamily = uint32_t(graphics - families.begin());
+@ The one device extension we need is [[VK_KHR_external_memory_fd]], which
+exports device memory as a POSIX file descriptor that CUDA can import.
+
+<<Have the XR runtime create the Vulkan device>>=
+const float priority = 1.0f;
+VkDeviceQueueCreateInfo queueInfo{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+queueInfo.queueFamilyIndex = m_queueFamily;
+queueInfo.queueCount = 1;
+queueInfo.pQueuePriorities = &priority;
+const char* deviceExtensions[] = {VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME};  // memory shared with CUDA
+VkDeviceCreateInfo deviceInfo{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+deviceInfo.queueCreateInfoCount = 1;
+deviceInfo.pQueueCreateInfos = &queueInfo;
+deviceInfo.enabledExtensionCount = 1;
+deviceInfo.ppEnabledExtensionNames = deviceExtensions;
+XrVulkanDeviceCreateInfoKHR xrDeviceInfo{XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR};
+xrDeviceInfo.systemId = m_systemId;
+xrDeviceInfo.pfnGetInstanceProcAddr = vk.vkGetInstanceProcAddr;
+xrDeviceInfo.vulkanPhysicalDevice = m_physicalDevice;
+xrDeviceInfo.vulkanCreateInfo = &deviceInfo;
+xrCheck(m_instance, xrVulkan.createDevice(m_instance, &xrDeviceInfo, &m_device, &vkResult),
+        "xrCreateVulkanDeviceKHR");
+vkCheck(vkResult, "vkCreateDevice");
+vk.vkGetDeviceQueue(m_device, m_queueFamily, 0, &m_queue);
+@ A single command buffer is enough, because each frame records its copies,
+submits them, and waits on the fence before the next frame begins.
+
+<<Create the XR command buffer and fence>>=
+VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+poolInfo.queueFamilyIndex = m_queueFamily;
+vkCheck(vk.vkCreateCommandPool(m_device, &poolInfo, nullptr, &m_commandPool), "vkCreateCommandPool");
+VkCommandBufferAllocateInfo bufferInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+bufferInfo.commandPool = m_commandPool;
+bufferInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+bufferInfo.commandBufferCount = 1;
+vkCheck(vk.vkAllocateCommandBuffers(m_device, &bufferInfo, &m_commandBuffer), "vkAllocateCommandBuffers");
+VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+vkCheck(vk.vkCreateFence(m_device, &fenceInfo, nullptr, &m_fence), "vkCreateFence");
+@ Destroying the device waits for it to be idle first.
+
+<<Destroy the XR Vulkan device>>=
+void XrOutput::destroyVulkan()
+{
+    if (m_device)
+    {
+        vk.vkDeviceWaitIdle(m_device);
+        vk.vkDestroyFence(m_device, m_fence, nullptr);
+        vk.vkDestroyCommandPool(m_device, m_commandPool, nullptr);
+        vk.vkDestroyDevice(m_device, nullptr);
+    }
+    if (m_vkInstance)
+        vk.vkDestroyInstance(m_vkInstance, nullptr);
+    if (m_vulkanLibrary)
+        dlclose(m_vulkanLibrary);
+    m_device = VK_NULL_HANDLE;
+    m_fence = VK_NULL_HANDLE;
+    m_commandPool = VK_NULL_HANDLE;
+    m_commandBuffer = VK_NULL_HANDLE;
+    m_queue = VK_NULL_HANDLE;
+    m_physicalDevice = VK_NULL_HANDLE;
+    m_vkInstance = VK_NULL_HANDLE;
+    m_vulkanLibrary = nullptr;
+}
+@* Memory shared between Vulkan and CUDA. Each eye buffer is created by
+Vulkan, exported, and imported into CUDA, where it becomes an ordinary
+device pointer. It could not be the other way round: CUDA can import Vulkan
+memory, but Vulkan cannot import CUDA allocations. The buffer holds the eye
+image in the renderer's own format, four bytes per pixel, row after row.
+
+<<Share an eye buffer between Vulkan and CUDA>>=
+// A device-local Vulkan buffer exported as a file descriptor and imported
+// into CUDA: OptiX writes the eye's pixels into it, Vulkan copies them out.
+void XrOutput::createSharedBuffer(Eye& eye)
+{
+    <<Create the exportable eye buffer>>
+
+    <<Choose device-local memory for the eye buffer>>
+
+    <<Allocate and bind the exportable eye memory>>
+
+    <<Export the eye memory as a file descriptor>>
+
+    <<Import the eye memory into CUDA>>
+}
+@ The buffer must announce at creation that its memory will be exported as
+an opaque file descriptor; its only use is as the source of copies.
+
+<<Create the exportable eye buffer>>=
+const VkDeviceSize size = VkDeviceSize(m_width) * m_height * sizeof(uchar4);
+VkExternalMemoryBufferCreateInfo external{VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+VkBufferCreateInfo bufferInfo{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, &external};
+bufferInfo.size = size;
+bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+vkCheck(vk.vkCreateBuffer(m_device, &bufferInfo, nullptr, &eye.buffer), "vkCreateBuffer");
+@ The memory type must be one the buffer accepts and device-local: the
+whole point is that the pixels never leave the GPU.
+
+<<Choose device-local memory for the eye buffer>>=
+VkMemoryRequirements requirements{};
+vk.vkGetBufferMemoryRequirements(m_device, eye.buffer, &requirements);
+VkPhysicalDeviceMemoryProperties memory{};
+vk.vkGetPhysicalDeviceMemoryProperties(m_physicalDevice, &memory);
+uint32_t type = 0;
+while (type < memory.memoryTypeCount &&
+       !((requirements.memoryTypeBits & (1u << type)) &&
+         (memory.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)))
+    ++type;
+if (type == memory.memoryTypeCount)
+    throw std::runtime_error("no device-local Vulkan memory for the eye buffers");
+@ The allocation is \emph{dedicated} to the buffer, and exportable. CUDA
+must be told the former, below, since a dedicated allocation is imported
+with a different flag.
+
+<<Allocate and bind the exportable eye memory>>=
+VkMemoryDedicatedAllocateInfo dedicated{VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO};
+dedicated.buffer = eye.buffer;
+VkExportMemoryAllocateInfo exportInfo{VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO, &dedicated};
+exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+VkMemoryAllocateInfo allocInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &exportInfo};
+allocInfo.allocationSize = requirements.size;
+allocInfo.memoryTypeIndex = type;
+vkCheck(vk.vkAllocateMemory(m_device, &allocInfo, nullptr, &eye.memory), "vkAllocateMemory");
+vkCheck(vk.vkBindBufferMemory(m_device, eye.buffer, eye.memory, 0), "vkBindBufferMemory");
+@
+<<Export the eye memory as a file descriptor>>=
+VkMemoryGetFdInfoKHR fdInfo{VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+fdInfo.memory = eye.memory;
+fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+int fd = -1;
+vkCheck(vk.vkGetMemoryFdKHR(m_device, &fdInfo, &fd), "vkGetMemoryFdKHR");
+@ [[cudaImportExternalMemory]] takes ownership of the file descriptor and
+closes it when the external memory is destroyed. Mapping a buffer from the
+imported memory yields a device pointer, which is what the renderer writes
+to.
+
+<<Import the eye memory into CUDA>>=
+cudaExternalMemoryHandleDesc handle{};
+handle.type = cudaExternalMemoryHandleTypeOpaqueFd;
+handle.handle.fd = fd;  // owned by CUDA once imported
+handle.size = requirements.size;
+handle.flags = cudaExternalMemoryDedicated;
+cudaCheck(cudaImportExternalMemory(&eye.cudaMemory, &handle), "cudaImportExternalMemory");
+cudaExternalMemoryBufferDesc mapping{};
+mapping.size = size;
+void* pointer = nullptr;
+cudaCheck(cudaExternalMemoryGetMappedBuffer(&pointer, eye.cudaMemory, &mapping),
+          "cudaExternalMemoryGetMappedBuffer");
+eye.pixels = static_cast<uchar4*>(pointer);
+@* The session. A session binds the instance to our Vulkan device and is
+the object through which frames are submitted. Creating it also fixes the
+size and format of the eye images.
+
+<<Create the XR session>>=
+// ---- session ------------------------------------------------------------------
+bool XrOutput::createSession(float resolutionScale, std::string& error)
+{
+    try
+    {
+        <<Create the OpenXR session on our Vulkan device>>
+
+        <<Create the LOCAL reference space>>
+
+        <<Choose the XR environment blend mode>>
+
+        <<Size the XR eye images>>
+
+        <<Choose the XR swapchain format>>
+
+        <<Create the XR swapchains and eye buffers>>
+    }
+    catch (const std::exception& e)
+    {
+        error = e.what();
+        stop();
+        return false;
+    }
+    return true;
+}
+@
+<<Create the OpenXR session on our Vulkan device>>=
+XrGraphicsBindingVulkan2KHR binding{XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR};
+binding.instance = m_vkInstance;
+binding.physicalDevice = m_physicalDevice;
+binding.device = m_device;
+binding.queueFamilyIndex = m_queueFamily;
+binding.queueIndex = 0;
+XrSessionCreateInfo sessionInfo{XR_TYPE_SESSION_CREATE_INFO, &binding};
+sessionInfo.systemId = m_systemId;
+xrCheck(m_instance, xrCreateSession(m_instance, &sessionInfo, &m_session), "xrCreateSession");
+@ Views are located in the [[LOCAL]] reference space, whose origin is the
+head's position and heading when the session started. Every runtime
+supports it, and it is what the [[Anchor]] attaches to the scene.
+
+<<Create the LOCAL reference space>>=
+// LOCAL space: the origin is where the head was when the session started
+XrReferenceSpaceCreateInfo spaceInfo{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+spaceInfo.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_LOCAL;
+spaceInfo.poseInReferenceSpace.orientation.w = 1.0f;
+xrCheck(m_instance, xrCreateReferenceSpace(m_session, &spaceInfo, &m_space), "xrCreateReferenceSpace");
+@ A see-through headset may offer to blend our images with the real world;
+we want them opaque whenever the runtime allows.
+
+<<Choose the XR environment blend mode>>=
+uint32_t count = 0;
+xrCheck(m_instance,
+        xrEnumerateEnvironmentBlendModes(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0,
+                                         &count, nullptr),
+        "xrEnumerateEnvironmentBlendModes");
+std::vector<XrEnvironmentBlendMode> blendModes(count);
+xrEnumerateEnvironmentBlendModes(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, count,
+                                 &count, blendModes.data());
+const bool opaque = blendModes.empty() ||
+                    std::find(blendModes.begin(), blendModes.end(), XR_ENVIRONMENT_BLEND_MODE_OPAQUE) !=
+                        blendModes.end();
+m_blendMode = opaque ? XR_ENVIRONMENT_BLEND_MODE_OPAQUE : blendModes.front();
+@ The runtime recommends an image size per eye, typically somewhat larger
+than the display so that its final distortion step keeps detail. The user
+may scale it down to save rendering time; the result is kept within the
+runtime's limits. Both eyes of a stereo headset share one size.
+
+<<Size the XR eye images>>=
+xrCheck(m_instance,
+        xrEnumerateViewConfigurationViews(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,
+                                          0, &count, nullptr),
+        "xrEnumerateViewConfigurationViews");
+std::vector<XrViewConfigurationView> configViews(count, {XR_TYPE_VIEW_CONFIGURATION_VIEW});
+xrEnumerateViewConfigurationViews(m_instance, m_systemId, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, count,
+                                  &count, configViews.data());
+if (configViews.empty())
+    throw std::runtime_error("the headset has no stereo views");
+const XrViewConfigurationView& view = configViews[0];
+m_width = std::clamp(unsigned(view.recommendedImageRectWidth * resolutionScale), 16u,
+                     view.maxImageRectWidth);
+m_height = std::clamp(unsigned(view.recommendedImageRectHeight * resolutionScale), 16u,
+                      view.maxImageRectHeight);
+@ The renderer writes 8-bit RGBA that is already gamma encoded (with the
+square-root curve described with the ray generation program, close to
+sRGB). An sRGB swapchain format shows those values as intended, because the
+runtime decodes them; a linear UNORM format is the fallback.
+
+<<Choose the XR swapchain format>>=
+// The renderer writes 8-bit gamma-encoded RGBA, which an sRGB format
+// shows as intended.
+xrCheck(m_instance, xrEnumerateSwapchainFormats(m_session, 0, &count, nullptr), "xrEnumerateSwapchainFormats");
+std::vector<int64_t> formats(count);
+xrEnumerateSwapchainFormats(m_session, count, &count, formats.data());
+int64_t format = 0;
+for (int64_t wanted : {int64_t(VK_FORMAT_R8G8B8A8_SRGB), int64_t(VK_FORMAT_R8G8B8A8_UNORM)})
+    if (!format && std::find(formats.begin(), formats.end(), wanted) != formats.end())
+        format = wanted;
+if (!format)
+    throw std::runtime_error("the runtime offers no RGBA8 swapchain format");
+@ Each eye gets a swapchain whose images we only ever write by transfer, so
+[[XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT]] is the flag that matters; the colour
+attachment flag is there because the runtime expects colour images in that
+layout. The images themselves are enumerated as Vulkan images, and the
+shared buffer is made next to them.
+
+<<Create the XR swapchains and eye buffers>>=
+m_eyes.resize(configViews.size());
+for (Eye& eye : m_eyes)
+{
+    XrSwapchainCreateInfo swapchainInfo{XR_TYPE_SWAPCHAIN_CREATE_INFO};
+    swapchainInfo.usageFlags = XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+    swapchainInfo.format = format;
+    swapchainInfo.sampleCount = 1;
+    swapchainInfo.width = m_width;
+    swapchainInfo.height = m_height;
+    swapchainInfo.faceCount = 1;
+    swapchainInfo.arraySize = 1;
+    swapchainInfo.mipCount = 1;
+    xrCheck(m_instance, xrCreateSwapchain(m_session, &swapchainInfo, &eye.swapchain), "xrCreateSwapchain");
+    xrCheck(m_instance, xrEnumerateSwapchainImages(eye.swapchain, 0, &count, nullptr),
+            "xrEnumerateSwapchainImages");
+    eye.images.assign(count, {XR_TYPE_SWAPCHAIN_IMAGE_VULKAN2_KHR});
+    xrEnumerateSwapchainImages(eye.swapchain, count, &count,
+                               reinterpret_cast<XrSwapchainImageBaseHeader*>(eye.images.data()));
+    createSharedBuffer(eye);
+}
+m_views.assign(m_eyes.size(), {XR_TYPE_VIEW});
+m_state = State::Idle;
+@ Destroying the session releases the CUDA view of each buffer before the
+Vulkan memory behind it.
+
+<<Destroy the XR session>>=
+void XrOutput::destroySession()
+{
+    if (m_device)
+        vk.vkDeviceWaitIdle(m_device);
+    for (Eye& eye : m_eyes)
+    {
+        if (eye.pixels)
+            cudaFree(eye.pixels);
+        if (eye.cudaMemory)
+            cudaDestroyExternalMemory(eye.cudaMemory);
+        if (eye.buffer)
+            vk.vkDestroyBuffer(m_device, eye.buffer, nullptr);
+        if (eye.memory)
+            vk.vkFreeMemory(m_device, eye.memory, nullptr);
+        if (eye.swapchain != XR_NULL_HANDLE)
+            xrDestroySwapchain(eye.swapchain);
+    }
+    m_eyes.clear();
+    if (m_space != XR_NULL_HANDLE)
+        xrDestroySpace(m_space);
+    if (m_session != XR_NULL_HANDLE)
+        xrDestroySession(m_session);
+    m_space = XR_NULL_HANDLE;
+    m_session = XR_NULL_HANDLE;
+    m_frameState = {XR_TYPE_FRAME_STATE};
+    m_viewsValid = false;
+}
+@ The runtime drives the session through state changes delivered as
+events. [[READY]] means ``begin the session'', [[STOPPING]] means ``end
+it''. [[EXITING]] and [[LOSS_PENDING]] mean the session is over: with
+CloudXR, the client has gone. We then release the session and the Vulkan
+device (which belonged to that system) and go back to waiting for a system,
+so that a headset reconnecting resumes the stream without restarting the
+viewer. The loss of the instance itself is final.
+
+<<Follow the XR session state>>=
+// The runtime drives the session through state changes: READY means "begin",
+// STOPPING means "end". When the headset goes away (CloudXR client
+// disconnected) the session is lost and we wait for a system again.
+void XrOutput::pollEvents()
+{
+    XrEventDataBuffer event{XR_TYPE_EVENT_DATA_BUFFER};
+    while (xrPollEvent(m_instance, &event) == XR_SUCCESS)
+    {
+        if (event.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING)
+            throw std::runtime_error("the OpenXR runtime is shutting down");
+        if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED)
+        {
+            const auto& change = reinterpret_cast<const XrEventDataSessionStateChanged&>(event);
+            if (change.state == XR_SESSION_STATE_READY)
+            {
+                XrSessionBeginInfo beginInfo{XR_TYPE_SESSION_BEGIN_INFO};
+                beginInfo.primaryViewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+                xrCheck(m_instance, xrBeginSession(m_session, &beginInfo), "xrBeginSession");
+                m_state = State::Running;
+            }
+            else if (change.state == XR_SESSION_STATE_STOPPING)
+            {
+                xrCheck(m_instance, xrEndSession(m_session), "xrEndSession");
+                m_state = State::Idle;
+            }
+            else if (change.state == XR_SESSION_STATE_EXITING || change.state == XR_SESSION_STATE_LOSS_PENDING)
+            {
+                destroySession();
+                destroyVulkan();
+                m_systemId = XR_NULL_SYSTEM_ID;
+                m_state = State::WaitingForSystem;
+                return;
+            }
+        }
+        event = {XR_TYPE_EVENT_DATA_BUFFER};
+    }
+}
+@* Frames. A frame starts with [[xrWaitFrame]], which blocks until the
+runtime wants the next frame; this is what paces the application's main
+loop at the headset's rate while the session runs. [[xrBeginFrame]] then
+opens the frame. The runtime may say the frame should not be rendered (the
+headset is off, or the app not visible); the frame must still be begun and
+ended, only without images.
+
+<<Begin an XR frame>>=
+// ---- frames -------------------------------------------------------------------
+bool XrOutput::beginFrame(std::string& error)
+{
+    if (m_state != State::Running)
+        return false;
+    try
+    {
+        XrFrameWaitInfo waitInfo{XR_TYPE_FRAME_WAIT_INFO};
+        m_frameState = {XR_TYPE_FRAME_STATE};
+        xrCheck(m_instance, xrWaitFrame(m_session, &waitInfo, &m_frameState), "xrWaitFrame");  // paces the loop
+        XrFrameBeginInfo beginInfo{XR_TYPE_FRAME_BEGIN_INFO};
+        xrCheck(m_instance, xrBeginFrame(m_session, &beginInfo), "xrBeginFrame");
+
+        m_viewsValid = false;
+        <<Locate the eyes for the predicted display time>>
+    }
+    catch (const std::exception& e)
+    {
+        error = e.what();
+        stop();
+        return false;
+    }
+    return true;
+}
+@ The eyes are located for the time at which the frame will be displayed,
+not for now. The runtime predicts the head's pose for that moment, which
+hides most of the latency of rendering and streaming. Without a valid
+orientation there is nothing sensible to draw.
+
+<<Locate the eyes for the predicted display time>>=
+if (m_frameState.shouldRender)
+{
+    XrViewLocateInfo locateInfo{XR_TYPE_VIEW_LOCATE_INFO};
+    locateInfo.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    locateInfo.displayTime = m_frameState.predictedDisplayTime;
+    locateInfo.space = m_space;
+    XrViewState viewState{XR_TYPE_VIEW_STATE};
+    uint32_t count = 0;
+    xrCheck(m_instance,
+            xrLocateViews(m_session, &locateInfo, &viewState, uint32_t(m_views.size()), &count,
+                          m_views.data()),
+            "xrLocateViews");
+    m_viewsValid = count == m_views.size() && (viewState.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT);
+}
+@ Ending the frame submits one projection layer, with one view per eye: the
+pose and field of view the eye was rendered with, and the swapchain image
+holding it. A frame that was not rendered ends with no layers.
+
+<<End an XR frame>>=
+void XrOutput::endFrame(std::string& error)
+{
+    try
+    {
+        std::vector<XrCompositionLayerProjectionView> views;
+        if (shouldRender())
+        {
+            copyToSwapchains();
+            for (size_t i = 0; i < m_eyes.size(); ++i)
+            {
+                XrCompositionLayerProjectionView view{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW};
+                view.pose = m_views[i].pose;
+                view.fov = m_views[i].fov;
+                view.subImage.swapchain = m_eyes[i].swapchain;
+                view.subImage.imageRect.extent = {int32_t(m_width), int32_t(m_height)};
+                views.push_back(view);
+            }
+        }
+        XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+        layer.space = m_space;
+        layer.viewCount = uint32_t(views.size());
+        layer.views = views.data();
+        const XrCompositionLayerBaseHeader* layers[] = {reinterpret_cast<XrCompositionLayerBaseHeader*>(&layer)};
+        XrFrameEndInfo endInfo{XR_TYPE_FRAME_END_INFO};
+        endInfo.displayTime = m_frameState.predictedDisplayTime;
+        endInfo.environmentBlendMode = m_blendMode;
+        endInfo.layerCount = views.empty() ? 0 : 1;
+        endInfo.layers = layers;
+        xrCheck(m_instance, xrEndFrame(m_session, &endInfo), "xrEndFrame");
+    }
+    catch (const std::exception& e)
+    {
+        error = e.what();
+        stop();
+    }
+}
+@ Moving the eye buffers into the swapchains. Each image must first be
+acquired and waited for (the runtime may still be reading it), and released
+afterwards. OpenXR's Vulkan binding fixes the layout of colour images at
+these moments: they arrive in [[COLOR_ATTACHMENT_OPTIMAL]] and must be
+handed back in it.
+
+<<Copy the eye buffers into the swapchain images>>=
+// The eye buffers were written by CUDA (the renderer synchronizes its stream
+// before returning). Swapchain images arrive in COLOR_ATTACHMENT_OPTIMAL
+// layout and must be returned in it.
+void XrOutput::copyToSwapchains()
+{
+    <<Acquire the XR swapchain images>>
+
+    <<Record the copies into the swapchain images>>
+    <<Submit the XR copies and wait for them>>
+
+    <<Release the XR swapchain images>>
+}
+@
+<<Acquire the XR swapchain images>>=
+std::vector<uint32_t> indices(m_eyes.size());
+for (size_t i = 0; i < m_eyes.size(); ++i)
+{
+    XrSwapchainImageAcquireInfo acquireInfo{XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+    xrCheck(m_instance, xrAcquireSwapchainImage(m_eyes[i].swapchain, &acquireInfo, &indices[i]),
+            "xrAcquireSwapchainImage");
+    XrSwapchainImageWaitInfo waitInfo{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+    waitInfo.timeout = XR_INFINITE_DURATION;
+    xrCheck(m_instance, xrWaitSwapchainImage(m_eyes[i].swapchain, &waitInfo), "xrWaitSwapchainImage");
+}
+@ For every eye, a barrier moves the image into the layout for transfer
+writes, a buffer-to-image copy fills it, and a second barrier returns it to
+the colour-attachment layout. The first barrier may discard the old
+contents, since the copy overwrites every pixel. The buffer needs no barrier
+of its own: CUDA finished writing it before we got here, because the
+renderer synchronizes its stream before it returns.
+
+<<Record the copies into the swapchain images>>=
+VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+vkCheck(vk.vkBeginCommandBuffer(m_commandBuffer, &beginInfo), "vkBeginCommandBuffer");
+for (size_t i = 0; i < m_eyes.size(); ++i)
+{
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = m_eyes[i].images[indices[i]].image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;  // the whole image is overwritten
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                            0, nullptr, 0, nullptr, 1, &barrier);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.imageExtent = {m_width, m_height, 1};
+    vk.vkCmdCopyBufferToImage(m_commandBuffer, m_eyes[i].buffer, barrier.image,
+                              VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    barrier.newLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = 0;
+    vk.vkCmdPipelineBarrier(m_commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+}
+@ We wait for the copies to complete before releasing the images. That
+costs a little latency but keeps the synchronization trivial: the runtime is
+handed finished images, and the eye buffers are free to be rendered into
+again next frame.
+
+<<Submit the XR copies and wait for them>>=
+vkCheck(vk.vkEndCommandBuffer(m_commandBuffer), "vkEndCommandBuffer");
+VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+submit.commandBufferCount = 1;
+submit.pCommandBuffers = &m_commandBuffer;
+vkCheck(vk.vkQueueSubmit(m_queue, 1, &submit, m_fence), "vkQueueSubmit");
+// the eye buffers are rewritten next frame, so wait for the copy to finish
+vkCheck(vk.vkWaitForFences(m_device, 1, &m_fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+vkCheck(vk.vkResetFences(m_device, 1, &m_fence), "vkResetFences");
+@
+<<Release the XR swapchain images>>=
+for (Eye& eye : m_eyes)
+{
+    XrSwapchainImageReleaseInfo releaseInfo{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+    xrCheck(m_instance, xrReleaseSwapchainImage(eye.swapchain, &releaseInfo), "xrReleaseSwapchainImage");
+}
+@* Eye cameras. The renderer's [[Camera]] wants an eye point and three
+vectors in scene coordinates; OpenXR gives each eye a pose and four field
+of view angles in the [[LOCAL]] space. Two conversions are needed: from the
+XR space to the scene, and from the angles to the camera's vectors.
+
+<<Compute the camera of an XR eye>>=
+// ---- eye cameras ----------------------------------------------------------------
+// The XR space is Y-up and looks along -Z, in meters. Its axes are mapped to
+// the scene: +X to the anchor's right, +Y to the scene's up axis and -Z to the
+// anchor's horizontal forward direction. Eye frusta are asymmetric, so w
+// points at the centre of the image plane at distance 1 instead of straight
+// ahead (the renderer accepts this because XR views use no clipping range).
+Camera XrOutput::eyeCamera(unsigned int index, const Anchor& anchor) const
+{
+    <<Build the XR anchor frame>>
+
+    <<Turn the XR eye pose into the scene>>
+
+    <<Fill the camera of an XR eye>>
+}
+@ The XR space is right-handed with $+y$ up and the viewer looking along
+$-z$. We map it to the scene with an orthonormal frame built from the
+anchor: $\mathbf a_u$ is the scene's up axis, $\mathbf a_f$ the anchor's
+forward direction with its vertical part removed and normalized, and
+$\mathbf a_r=\mathbf a_f\times\mathbf a_u$ points right. Keeping only the
+horizontal part matters: the desktop camera usually looks down at the scene,
+but a headset user's horizon must stay level, or the world would appear
+tilted. If the anchor looks straight up or down there is no horizontal
+part, and a fixed direction is used instead. An XR vector
+$(x,y,z)$ then becomes $x\,\mathbf a_r + y\,\mathbf a_u - z\,\mathbf a_f$.
+
+<<Build the XR anchor frame>>=
+const XrView& view = m_views[index];
+const float up[3] = {0.0f, anchor.zUp ? 0.0f : 1.0f, anchor.zUp ? 1.0f : 0.0f};
+float forward[3];
+const float along = anchor.forward[0] * up[0] + anchor.forward[1] * up[1] + anchor.forward[2] * up[2];
+for (int k = 0; k < 3; ++k)
+    forward[k] = anchor.forward[k] - along * up[k];
+float length = std::sqrt(forward[0] * forward[0] + forward[1] * forward[1] + forward[2] * forward[2]);
+if (length < 1e-6f)  // looking straight up or down: face the scene's -Y (Z-up) or -Z (Y-up)
+{
+    forward[0] = 0.0f, forward[1] = anchor.zUp ? -1.0f : 0.0f, forward[2] = anchor.zUp ? 0.0f : -1.0f;
+    length = 1.0f;
+}
+for (float& f : forward)
+    f /= length;
+const float right[3] = {forward[1] * up[2] - forward[2] * up[1], forward[2] * up[0] - forward[0] * up[2],
+                        forward[0] * up[1] - forward[1] * up[0]};
+auto toScene = [&](XrVector3f v) {
+    return make_float3(right[0] * v.x + up[0] * v.y - forward[0] * v.z,
+                       right[1] * v.x + up[1] * v.y - forward[1] * v.z,
+                       right[2] * v.x + up[2] * v.y - forward[2] * v.z);
+};
+@ The eye's own axes are the XR axes rotated by its orientation, then taken
+to the scene. Its position is an offset in meters from the XR origin, which
+the anchor's scale converts to scene units.
+
+<<Turn the XR eye pose into the scene>>=
+const XrQuaternionf& q = view.pose.orientation;
+const float3 eyeRight = toScene(rotate(q, {1.0f, 0.0f, 0.0f}));
+const float3 eyeUp = toScene(rotate(q, {0.0f, 1.0f, 0.0f}));
+const float3 eyeForward = toScene(rotate(q, {0.0f, 0.0f, -1.0f}));
+const float3 offset = toScene(view.pose.position);
+const float s = anchor.unitsPerMeter;
+@ Headset views are not symmetric: each eye sees farther towards the temple
+than towards the nose. OpenXR gives the four half-angles of the view, and
+the image plane at distance~1 spans $[\tan\alpha_l,\tan\alpha_r]$
+horizontally and $[\tan\alpha_d,\tan\alpha_u]$ vertically ($\alpha_l$ and
+$\alpha_d$ are negative). The ray generation program shoots through
+$\mathbf w + x\,\mathbf u + y\,\mathbf v$ for $x,y\in[-1,1]$, so we aim
+$\mathbf w$ at the \emph{centre} of that window rather than straight ahead,
+$$\mathbf w = \mathbf f + c_x\,\mathbf r + c_y\,\mathbf u,\qquad
+  c_x = \frac{\tan\alpha_r+\tan\alpha_l}{2},\quad c_y = \frac{\tan\alpha_u+\tan\alpha_d}{2},$$
+and give $\mathbf u$ and $\mathbf v$ the half extents
+$h_x=(\tan\alpha_r-\tan\alpha_l)/2$ and $h_y=(\tan\alpha_u-\tan\alpha_d)/2$.
+This $\mathbf w$ is not a unit vector, which the renderer tolerates only
+because an eye camera has no clipping range: the depth correction of the
+clipping planes assumes a unit $\mathbf w$, and with $[0,10^{16}]$ it has
+nothing to correct.
+
+<<Fill the camera of an XR eye>>=
+const float tanLeft = std::tan(view.fov.angleLeft), tanRight = std::tan(view.fov.angleRight);
+const float tanDown = std::tan(view.fov.angleDown), tanUp = std::tan(view.fov.angleUp);
+const float cx = 0.5f * (tanRight + tanLeft), cy = 0.5f * (tanUp + tanDown);
+const float hx = 0.5f * (tanRight - tanLeft), hy = 0.5f * (tanUp - tanDown);
+Camera camera{};
+camera.eye = make_float3(anchor.eye[0] + offset.x * s, anchor.eye[1] + offset.y * s, anchor.eye[2] + offset.z * s);
+camera.u = make_float3(eyeRight.x * hx, eyeRight.y * hx, eyeRight.z * hx);
+camera.v = make_float3(eyeUp.x * hy, eyeUp.y * hy, eyeUp.z * hy);
+camera.w = make_float3(eyeForward.x + eyeRight.x * cx + eyeUp.x * cy, eyeForward.y + eyeRight.y * cx + eyeUp.y * cy,
+                       eyeForward.z + eyeRight.z * cx + eyeUp.z * cy);
+camera.orthographic = 0;
+camera.clipNear = 0.0f;
+camera.clipFar = 1e16f;
+return camera;

@@ -1,7 +1,10 @@
 #include "App.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -49,6 +52,8 @@ App::~App()
     }
     if (m_texture)
         SDL_DestroyTexture(m_texture);
+    if (m_mirrorTexture)
+        SDL_DestroyTexture(m_mirrorTexture);
     if (m_sdlRenderer)
         SDL_DestroyRenderer(m_sdlRenderer);
     if (m_window)
@@ -92,14 +97,11 @@ bool App::init(int argc, char** argv)
     ImGui_ImplSDL3_InitForSDLRenderer(m_window, m_sdlRenderer);
     ImGui_ImplSDLRenderer3_Init(m_sdlRenderer);
 
-    std::string error;
-    m_rendererOk = m_renderer.init(error);
-    if (!m_rendererOk)
-        m_error = "OptiX initialization failed: " + error;
-
     // UsdOptixViewer [file.usd] [--select /Prim/Path] [--camera /Camera/Path] [--no-mipmaps] [--no-normal-maps]
-    //                [--no-reflections]
-    std::string file, selectPath, cameraPath;
+    //                [--no-reflections] [--xr] [--cloudxr] [--cloudxr-sdk DIR] [--cloudxr-profile NAME]
+    //                [--xr-samples N] [--xr-resolution F] [--xr-mirror]
+    std::string file, selectPath, cameraPath, cloudXrSdk, cloudXrProfile;
+    bool xr = false, cloudXr = false;
     for (int i = 1; i < argc; ++i)
     {
         const std::string arg = argv[i];
@@ -107,6 +109,20 @@ bool App::init(int argc, char** argv)
             selectPath = argv[++i];
         else if (arg == "--camera" && i + 1 < argc)
             cameraPath = argv[++i];
+        else if (arg == "--xr")
+            xr = true;
+        else if (arg == "--cloudxr")
+            cloudXr = true;
+        else if (arg == "--cloudxr-sdk" && i + 1 < argc)
+            cloudXrSdk = argv[++i];
+        else if (arg == "--cloudxr-profile" && i + 1 < argc)
+            cloudXrProfile = argv[++i];
+        else if (arg == "--xr-samples" && i + 1 < argc)
+            m_xrSamples = std::clamp(std::atoi(argv[++i]), 1, 64);
+        else if (arg == "--xr-resolution" && i + 1 < argc)
+            m_xrResolution = std::clamp(float(std::atof(argv[++i])), 0.1f, 2.0f);
+        else if (arg == "--xr-mirror")
+            m_xrMirror = true;
         else if (arg == "--no-mipmaps")
             m_mipmaps = false;
         else if (arg == "--no-normal-maps")
@@ -116,6 +132,16 @@ bool App::init(int argc, char** argv)
         else
             file = arg;
     }
+
+    // The XR runtime must exist before the renderer starts, because it may
+    // choose another GPU (see updateXr).
+    if (xr || cloudXr)
+        startXr(cloudXr, cloudXrSdk, cloudXrProfile);
+    std::string error;
+    m_rendererOk = m_renderer.init(error);
+    if (!m_rendererOk)
+        m_error = "OptiX initialization failed: " + error;
+
     if (!file.empty())
         loadFile(file);
     if (!selectPath.empty() && m_scene.loaded() && SdfPath::IsValidPathString(selectPath))
@@ -187,6 +213,7 @@ void App::run()
         if (!pending.empty())
             loadFile(pending);
 
+        updateXr();  // keeps streaming while the window is minimized
         if (SDL_GetWindowFlags(m_window) & SDL_WINDOW_MINIMIZED)
         {
             SDL_Delay(10);
@@ -330,6 +357,27 @@ void App::drawMenuBar()
         for (size_t i = 0; i < cameras.size(); ++i)
             if (ImGui::MenuItem(cameras[i].path.c_str(), nullptr, m_camera == int(i)))
                 lookThrough(int(i));
+        ImGui::EndMenu();
+    }
+    if (ImGui::BeginMenu("XR"))
+    {
+        if (m_xr.state() == XrOutput::State::Off)
+            ImGui::TextDisabled("XR output is off. Start with --xr or --cloudxr.");
+        else
+        {
+            ImGui::Text("Runtime: %s", m_xr.runtimeName().c_str());
+            if (m_cloudXr.running())
+                ImGui::Text("CloudXR %s in this process, client %s", m_cloudXr.version().c_str(),
+                            m_xrClient ? "connected" : "not connected");
+            ImGui::Text("State: %s", xrStatus().c_str());
+            if (m_xr.eyeCount())
+                ImGui::Text("%s on %s, %u eyes of %u x %u", m_xr.systemName().c_str(), m_xr.gpuName().c_str(),
+                            m_xr.eyeCount(), m_xr.eyeWidth(), m_xr.eyeHeight());
+        }
+        ImGui::SeparatorText("Headset view");
+        ImGui::SliderFloat("World scale", &m_xrWorldScale, 0.01f, 100.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+        ImGui::SliderInt("Samples per frame", &m_xrSamples, 1, 8);
+        ImGui::MenuItem("Mirror left eye in viewport", nullptr, &m_xrMirror);
         ImGui::EndMenu();
     }
     if (ImGui::BeginMenu("Help"))
@@ -659,19 +707,8 @@ void App::updateCamera()
     }
     else
     {
-        const float cp = std::cos(m_pitch), sp = std::sin(m_pitch), cy = std::cos(m_yaw), sy = std::sin(m_yaw);
-        float offset[3], up[3];
-        if (m_scene.zUp())
-        {
-            offset[0] = cp * cy, offset[1] = cp * sy, offset[2] = sp;
-            up[0] = 0, up[1] = 0, up[2] = 1;
-        }
-        else
-        {
-            offset[0] = cp * sy, offset[1] = sp, offset[2] = cp * cy;
-            up[0] = 0, up[1] = 1, up[2] = 0;
-        }
-        float eye[3];
+        float offset[3], up[3], eye[3];
+        orbitOffset(offset, up);
         for (int k = 0; k < 3; ++k)
             eye[k] = m_target[k] + offset[k] * m_distance;
         m_renderer.setCamera(eye, m_target, up, m_fovY);
@@ -681,6 +718,41 @@ void App::updateCamera()
     m_renderer.setMipmaps(m_mipmaps);
     m_renderer.setNormalMaps(m_normalMaps);
     m_renderer.setReflections(m_reflections);
+}
+
+// Unit vector from the orbit target to the eye, and the world's up axis.
+void App::orbitOffset(float offset[3], float up[3]) const
+{
+    const float cp = std::cos(m_pitch), sp = std::sin(m_pitch), cy = std::cos(m_yaw), sy = std::sin(m_yaw);
+    if (m_scene.zUp())
+    {
+        offset[0] = cp * cy, offset[1] = cp * sy, offset[2] = sp;
+        up[0] = 0, up[1] = 0, up[2] = 1;
+    }
+    else
+    {
+        offset[0] = cp * sy, offset[1] = sp, offset[2] = cp * cy;
+        up[0] = 0, up[1] = 1, up[2] = 0;
+    }
+}
+
+// Eye and viewing direction of the desktop view, orbit or USD camera.
+void App::viewFrame(float eye[3], float forward[3]) const
+{
+    if (m_camera >= 0)
+    {
+        const SceneCamera& c = m_scene.cameras()[m_camera];
+        std::copy(c.eye.begin(), c.eye.end(), eye);
+        std::copy(c.forward.begin(), c.forward.end(), forward);
+        return;
+    }
+    float offset[3], up[3];
+    orbitOffset(offset, up);
+    for (int k = 0; k < 3; ++k)
+    {
+        eye[k] = m_target[k] + offset[k] * m_distance;
+        forward[k] = -offset[k];
+    }
 }
 
 // The camera's window grown along one axis to the viewport's aspect ratio, so
@@ -834,10 +906,11 @@ void App::drawViewport()
 
     const float fbScale = io.DisplayFramebufferScale.x;
     const unsigned w = unsigned(size.x * fbScale), h = unsigned(size.y * fbScale);
+    const bool mirroring = m_xrMirror && m_xr.state() == XrOutput::State::Running && !m_mirrorPixels.empty();
 
     // pick on click (left release without dragging)
     if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16.0f &&
-        m_renderer.width() == w)
+        m_renderer.width() == w && !mirroring)
     {
         const unsigned px = unsigned((io.MousePos.x - origin.x) * fbScale);
         const unsigned py = unsigned((io.MousePos.y - origin.y) * fbScale);
@@ -862,7 +935,7 @@ void App::drawViewport()
         m_renderer.resetAccumulation();
         m_needsRender = false;
     }
-    if (m_texture && m_rendererOk && m_renderer.samples() < kMaxSamples)
+    if (m_texture && m_rendererOk && m_renderer.samples() < kMaxSamples && !mirroring)
     {
         try
         {
@@ -875,7 +948,9 @@ void App::drawViewport()
             m_rendererOk = false;
         }
     }
-    if (m_texture)
+    if (mirroring)
+        drawXrMirror(origin.x, origin.y, size.x, size.y);
+    else if (m_texture)
         ImGui::GetWindowDrawList()->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(m_texture))), origin,
                                              ImVec2(origin.x + size.x, origin.y + size.y));
     if (m_scene.loaded() && m_scene.geometry().empty())
@@ -889,12 +964,13 @@ void App::drawStatusBar()
     ImGui::Begin("Status", nullptr, kPanelFlags | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
     const FlatGeometry& g = m_scene.geometry();
     ImGui::Text("%s  |  prims: %zu  meshes: %zu  triangles: %zu  textures: %zu  |  camera: %s  |  "
-                "OptiX %d.%d.%d on %s  |  samples %u/%u, %.2f ms",
+                "OptiX %d.%d.%d on %s  |  samples %u/%u, %.2f ms%s",
                 m_scene.loaded() ? m_scene.filePath().c_str() : "no file",
                 m_scene.loaded() ? m_scene.registry().storage<PrimInfo>().size() - 1 : 0, g.meshEntity.size(),
                 g.indices.size() / 3, g.textures.size(), m_camera >= 0 ? m_scene.cameras()[m_camera].path.c_str() : "orbit",
                 OPTIX_VERSION / 10000, (OPTIX_VERSION / 100) % 100, OPTIX_VERSION % 100,
-                m_renderer.deviceName().c_str(), m_renderer.samples(), kMaxSamples, m_renderer.lastRenderMs());
+                m_renderer.deviceName().c_str(), m_renderer.samples(), kMaxSamples, m_renderer.lastRenderMs(),
+                m_xr.state() == XrOutput::State::Off ? "" : ("  |  XR: " + xrStatus()).c_str());
     ImGui::End();
 }
 
@@ -928,8 +1004,161 @@ void App::drawPopups()
         ImGui::TextDisabled("Left drag: orbit   Right/middle drag: pan   Wheel: zoom");
         ImGui::TextDisabled("Click: select   F: frame selection   Esc: clear selection");
         ImGui::TextDisabled("Camera menu: look through a USD camera (moving returns to the orbit camera)");
+        ImGui::TextDisabled("XR menu: headset output through OpenXR / NVIDIA CloudXR (--xr, --cloudxr)");
         if (ImGui::Button("Close"))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+}
+
+// ---- XR output ----------------------------------------------------------------
+// --cloudxr runs the CloudXR runtime in this process; --xr alone uses the
+// active OpenXR runtime (XR_RUNTIME_JSON), for instance a CloudXR runtime
+// started by Isaac Teleop.
+void App::startXr(bool cloudXr, std::string sdkDir, const std::string& profile)
+{
+    std::string error;
+    if (cloudXr)
+    {
+        if (sdkDir.empty() && std::getenv("CLOUDXR_SDK_DIR"))
+            sdkDir = std::getenv("CLOUDXR_SDK_DIR");
+        if (sdkDir.empty())
+        {
+            m_error = "--cloudxr needs the CloudXR SDK directory: --cloudxr-sdk DIR or CLOUDXR_SDK_DIR.";
+            return;
+        }
+        if (!m_cloudXr.start(sdkDir, profile, error))
+        {
+            m_error = "CloudXR: " + error;
+            return;
+        }
+    }
+    if (!m_xr.init(error))
+    {
+        m_error = "XR output unavailable: " + error;
+        return;
+    }
+    m_xrEnabled = true;
+}
+
+// Called once per main-loop turn. When the headset appears, the renderer
+// moves to the GPU the runtime chose, so that the eye buffers can be shared.
+// While the session runs, xrWaitFrame paces the loop at the headset's rate,
+// so the desktop stops waiting for vsync.
+void App::updateXr()
+{
+    if (!m_xrEnabled)
+        return;
+    m_xrClient = m_cloudXr.clientConnected();
+    std::string error;
+    if (m_xr.update(error) == XrOutput::State::SystemReady && useRendererOn(m_xr.deviceUuid(), error))
+        m_xr.createSession(m_xrResolution, error);
+    if (m_xr.beginFrame(error))
+    {
+        const auto start = std::chrono::steady_clock::now();
+        if (m_xr.shouldRender() && m_rendererOk)
+            renderXrEyes(error);
+        m_xr.endFrame(error);
+        m_xrFrameMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+    if (!error.empty())
+    {
+        m_error = "XR output stopped: " + error;
+        m_xr.stop();
+        m_xrEnabled = false;
+    }
+    const bool paced = m_xr.state() == XrOutput::State::Running;
+    if (paced != m_xrPaced)
+    {
+        SDL_SetRenderVSync(m_sdlRenderer, paced ? 0 : 1);
+        m_xrPaced = paced;
+    }
+}
+
+// The XR origin sits at the desktop view's eye, facing its horizontal
+// direction, so the headset starts where the desktop camera is and follows it.
+void App::renderXrEyes(std::string& error)
+{
+    XrOutput::Anchor anchor{};
+    viewFrame(anchor.eye, anchor.forward);
+    anchor.zUp = m_scene.zUp();
+    const double metersPerUnit = m_scene.loaded() ? UsdGeomGetStageMetersPerUnit(m_scene.stage()) : 1.0;
+    anchor.unitsPerMeter = m_xrWorldScale / float(metersPerUnit);
+    try
+    {
+        for (unsigned int i = 0; i < m_xr.eyeCount(); ++i)
+            m_renderer.renderView(m_xr.eyeCamera(i, anchor), m_xr.eyeWidth(), m_xr.eyeHeight(), m_xr.eyeBuffer(i),
+                                  unsigned(m_xrSamples));
+        if (m_xrMirror)
+        {
+            m_mirrorPixels.resize(size_t(m_xr.eyeWidth()) * m_xr.eyeHeight());
+            if (cudaMemcpy(m_mirrorPixels.data(), m_xr.eyeBuffer(0), m_mirrorPixels.size() * sizeof(uchar4),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("copying the mirror image failed");
+        }
+    }
+    catch (const std::exception& e)
+    {
+        error = std::string("rendering failed: ") + e.what();
+    }
+}
+
+// Moves the renderer to the GPU with the given UUID and uploads the scene again.
+bool App::useRendererOn(const std::array<unsigned char, 16>& uuid, std::string& error)
+{
+    if (m_rendererOk && m_renderer.deviceUuid() == uuid)
+        return true;
+    m_renderer.release();
+    m_rendererOk = m_renderer.init(error, uuid.data());
+    if (!m_rendererOk)
+        return false;
+    if (m_scene.loaded())
+        m_renderer.setGeometry(m_scene.geometry());
+    entt::registry& reg = m_scene.registry();
+    const MeshGeometry* mesh = reg.valid(m_selected) ? reg.try_get<MeshGeometry>(m_selected) : nullptr;
+    m_renderer.setSelectedMesh(mesh ? mesh->meshId : kNoMesh);
+    m_needsRender = true;  // the viewport also resizes the new image
+    return true;
+}
+
+// The left eye's latest image, fitted inside the viewport.
+void App::drawXrMirror(float x, float y, float width, float height)
+{
+    const int w = int(m_xr.eyeWidth()), h = int(m_xr.eyeHeight());
+    if (!m_mirrorTexture || w != m_mirrorWidth || h != m_mirrorHeight)
+    {
+        if (m_mirrorTexture)
+            SDL_DestroyTexture(m_mirrorTexture);
+        m_mirrorTexture = SDL_CreateTexture(m_sdlRenderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
+        m_mirrorWidth = w;
+        m_mirrorHeight = h;
+    }
+    if (!m_mirrorTexture || m_mirrorPixels.size() != size_t(w) * h)
+        return;
+    SDL_UpdateTexture(m_mirrorTexture, nullptr, m_mirrorPixels.data(), w * 4);
+    const float scale = std::min(width / float(w), height / float(h));
+    const ImVec2 lo(x + 0.5f * (width - w * scale), y + 0.5f * (height - h * scale));
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    list->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + height), IM_COL32(0, 0, 0, 255));
+    list->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(m_mirrorTexture))), lo,
+                   ImVec2(lo.x + w * scale, lo.y + h * scale));
+}
+
+std::string App::xrStatus() const
+{
+    switch (m_xr.state())
+    {
+    case XrOutput::State::Off:
+        return "off";
+    case XrOutput::State::WaitingForSystem:
+        return m_cloudXr.running() ? "waiting for a CloudXR client" : "waiting for a headset";
+    case XrOutput::State::SystemReady:
+    case XrOutput::State::Idle:
+        return "headset idle";
+    case XrOutput::State::Running:
+        break;
+    }
+    char text[64];
+    std::snprintf(text, sizeof(text), "running, %.1f ms per frame", m_xrFrameMs);
+    return text;
 }

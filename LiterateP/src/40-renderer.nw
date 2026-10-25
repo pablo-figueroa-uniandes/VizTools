@@ -47,6 +47,7 @@ structure. The scene's [[FlatGeometry]] is only passed by reference, so a
 forward declaration is enough and the header does not drag in OpenUSD.
 
 <<Headers and declarations of the renderer interface>>=
+#include <array>
 #include <string>
 #include <vector>
 
@@ -62,16 +63,25 @@ fail (no GPU, an old driver, a PTX that does not compile) and reports the
 reason as text instead of throwing, so that the application can show it in a
 dialog and keep running without a viewport.
 
+Normally the renderer runs on the first GPU. A headset's runtime may choose
+another one, and the eye images can only be shared with it if OptiX renders
+on that same GPU; [[init]] therefore accepts the GPU's UUID, a 16-byte
+identifier that CUDA and Vulkan both report. [[release]] gives everything
+back, so that the application can call [[init]] again for another GPU.
+
 <<Renderer construction and initialization>>=
 OptixRenderer() = default;
 ~OptixRenderer();
 OptixRenderer(const OptixRenderer&) = delete;
 OptixRenderer& operator=(const OptixRenderer&) = delete;
 
-// Creates the CUDA/OptiX context and pipeline. Returns false and sets
-// `error` on failure.
-bool init(std::string& error);
+// Creates the CUDA/OptiX context and pipeline on the GPU with the given
+// UUID (the first GPU if null). Returns false and sets `error` on failure.
+bool init(std::string& error, const unsigned char* deviceUuid = nullptr);
+// Frees all GPU resources; init() may then be called again.
+void release();
 const std::string& deviceName() const { return m_deviceName; }
+const std::array<unsigned char, 16>& deviceUuid() const { return m_deviceUuid; }
 @ The scene is replaced as a whole with [[setGeometry]]. The view is described
 by the image size, the camera and the light. There are two ways to set the
 camera: [[setCamera]] takes the orbit camera's eye, target and field of view,
@@ -106,6 +116,12 @@ invalidates the picture, such as a camera move.
 The results are an array of RGBA pixels, ready to be uploaded to an SDL
 texture, and a lookup [[meshIdAt]] used for picking with the mouse.
 
+The eyes of a headset are rendered differently. [[renderView]] takes a
+complete camera and writes into a buffer that already lives on the GPU (it is
+shared with the XR runtime), and leaves the desktop image and its
+accumulation alone. A head never stays still long enough to accumulate over
+frames, so it takes a fixed number of samples per frame instead.
+
 <<Renderer frame production and results>>=
 // Adds one progressive sample per pixel and copies the average to the
 // host buffers. Call resetAccumulation() after changing anything.
@@ -118,12 +134,18 @@ unsigned int height() const { return m_params.height; }
 const std::vector<uchar4>& pixels() const { return m_pixels; }
 unsigned int meshIdAt(unsigned int x, unsigned int y) const;
 float lastRenderMs() const { return m_lastRenderMs; }
+
+// Renders one view (an XR eye) into a device buffer of width x height
+// pixels, averaging `samples` jittered samples. The desktop image and
+// its accumulation are left alone.
+void renderView(const Camera& camera, unsigned int width, unsigned int height, uchar4* target,
+                unsigned int samples);
 @ A [[DeviceBuffer]] is a block of GPU memory together with its size. OptiX
 wants device addresses as [[CUdeviceptr]], a plain integer, so that is how we
 store them. The helper is deliberately small: it can be resized, filled from
 host memory, and freed. It has no destructor, because the order in which GPU
 memory is released matters less than the fact that it is released before the
-CUDA context goes away; the renderer's destructor frees every buffer
+CUDA context goes away; the renderer's [[release]] frees every buffer
 explicitly.
 
 <<The device buffer helper>>=
@@ -148,6 +170,7 @@ from them, and the shader binding table with its three record buffers.
 
 <<CUDA and OptiX handles of the renderer>>=
 std::string m_deviceName;
+std::array<unsigned char, 16> m_deviceUuid{};
 CUcontext m_cuContext = nullptr;
 CUstream m_stream = nullptr;
 OptixDeviceContext m_context = nullptr;
@@ -163,11 +186,14 @@ triangle its mesh, material, corner texture coordinates and corner normals.
 8-bit colors shown on screen, the floating-point sums of the progressive
 samples, and the mesh ids for picking. Finally, every texture is a mipmapped
 CUDA array plus a texture object, and the objects are gathered in a device
-table that the shaders index by number.
+table that the shaders index by number. [[renderView]] has its own scratch
+buffers for the sums, the mesh ids and the parameters, so that an eye never
+disturbs the desktop image.
 
 <<Scene and output buffers of the renderer>>=
 DeviceBuffer m_vertices, m_indices, m_triMesh, m_triMaterial, m_triUVs, m_triNormals, m_materials, m_gas;
 DeviceBuffer m_colorBuffer, m_accumBuffer, m_meshIdBuffer, m_paramsBuffer;
+DeviceBuffer m_viewAccum, m_viewMeshIds, m_viewParams;  // scratch for renderView
 std::vector<cudaMipmappedArray_t> m_textureArrays;
 std::vector<cudaTextureObject_t> m_textureObjects;
 DeviceBuffer m_textureTable;
@@ -226,6 +252,8 @@ namespace {
 <<Set the light direction>>
 
 <<Render one progressive sample>>
+
+<<Render one view into a device buffer>>
 
 <<Look up the mesh under a pixel>>
 @ OptiX's host functions are not exported by any library. Instead, one header
@@ -424,17 +452,25 @@ void OptixRenderer::DeviceBuffer::free()
     ptr = 0;
     size = 0;
 }
-@* Life and death of the renderer. If [[init]] never got as far as creating
-an OptiX context, there is nothing to release. Otherwise we wait for the GPU
-to finish any work in flight and release the resources in the reverse order of
-their creation: textures and buffers first, then the pipeline, the program
-groups and the module it was linked from, then the OptiX context, and last the
-CUDA stream. The CUDA primary context itself is reference-counted by the
-runtime and is released when the process exits.
+@* Life and death of the renderer. The destructor only calls [[release]],
+which does the work. If [[init]] never got as far as creating an OptiX
+context, there is nothing to release. Otherwise we wait for the GPU to finish
+any work in flight and release the resources in the reverse order of their
+creation: textures and buffers first, then the pipeline, the program groups
+and the module it was linked from, then the OptiX context, and last the CUDA
+stream. The CUDA primary context itself is reference-counted by the runtime
+and is released when the process exits. Because [[release]] may be followed
+by another [[init]], it also resets every handle and the launch parameters,
+so that the renderer looks freshly constructed.
 
 <<Destroy the renderer>>=
 // ---- OptixRenderer --------------------------------------------------------
 OptixRenderer::~OptixRenderer()
+{
+    release();
+}
+
+void OptixRenderer::release()
 {
     if (!m_context)
         return;
@@ -442,8 +478,8 @@ OptixRenderer::~OptixRenderer()
     freeTextures();
     for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_vertices, &m_indices, &m_triMesh,
                             &m_triMaterial, &m_triUVs, &m_triNormals, &m_materials, &m_gas, &m_colorBuffer,
-                            &m_accumBuffer, &m_meshIdBuffer,
-                            &m_paramsBuffer})
+                            &m_accumBuffer, &m_meshIdBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds,
+                            &m_viewParams})
         b->free();
     optixPipelineDestroy(m_pipeline);
     optixProgramGroupDestroy(m_raygenPG);
@@ -453,12 +489,23 @@ OptixRenderer::~OptixRenderer()
     optixModuleDestroy(m_module);
     optixDeviceContextDestroy(m_context);
     cudaStreamDestroy(m_stream);
+    m_context = nullptr;
+    m_module = nullptr;
+    m_pipeline = nullptr;
+    m_raygenPG = m_hitPG = nullptr;
+    m_missPG[RAY_TYPE_RADIANCE] = m_missPG[RAY_TYPE_SHADOW] = nullptr;
+    m_sbt = {};
+    m_stream = nullptr;
+    m_cuContext = nullptr;
+    m_params = {};
+    m_pixels.clear();
+    m_meshIds.clear();
 }
 @ Initialization proceeds in three steps, any of which may throw; the
 exception's message becomes the error text.
 
 <<Initialize CUDA and OptiX>>=
-bool OptixRenderer::init(std::string& error)
+bool OptixRenderer::init(std::string& error, const unsigned char* deviceUuid)
 {
     try
     {
@@ -476,7 +523,10 @@ bool OptixRenderer::init(std::string& error)
     return true;
 }
 @ The workstation has two GPUs; one is plenty for an interactive viewer, so we
-use device~0. The CUDA runtime creates a device's \emph{primary context}
+use device~0, unless a UUID names another. CUDA and Vulkan number the GPUs
+independently, so the UUID is the only reliable way to find the GPU that the
+XR runtime picked: we compare it with the UUID of each CUDA device. The CUDA
+runtime creates a device's \emph{primary context}
 lazily, on the first call that needs one; [[cudaFree(nullptr)]] is the
 customary way to force that creation without doing anything else. OptiX,
 however, is built on the lower-level driver API and wants a [[CUcontext]], so
@@ -490,11 +540,24 @@ int deviceCount = 0;
 check(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount");
 if (deviceCount == 0)
     throw std::runtime_error("no CUDA capable device found");
-check(cudaSetDevice(0), "cudaSetDevice");
-check(cudaFree(nullptr), "cudaFree");  // creates the primary context
+int device = 0;
 cudaDeviceProp props{};
-check(cudaGetDeviceProperties(&props, 0), "cudaGetDeviceProperties");
+if (deviceUuid)
+{
+    // the XR runtime chose a GPU; CUDA numbers GPUs differently from Vulkan
+    device = -1;
+    for (int d = 0; d < deviceCount && device < 0; ++d)
+        if (cudaGetDeviceProperties(&props, d) == cudaSuccess &&
+            std::memcmp(props.uuid.bytes, deviceUuid, sizeof(props.uuid.bytes)) == 0)
+            device = d;
+    if (device < 0)
+        throw std::runtime_error("no CUDA device matches the GPU of the XR runtime");
+}
+check(cudaSetDevice(device), "cudaSetDevice");
+check(cudaFree(nullptr), "cudaFree");  // creates the primary context
+check(cudaGetDeviceProperties(&props, device), "cudaGetDeviceProperties");
 m_deviceName = props.name;
+std::memcpy(m_deviceUuid.data(), props.uuid.bytes, m_deviceUuid.size());
 check(cudaStreamCreate(&m_stream), "cudaStreamCreate");
 if (cuCtxGetCurrent(&m_cuContext) != CUDA_SUCCESS)
     throw std::runtime_error("cuCtxGetCurrent failed");
@@ -1098,6 +1161,56 @@ if (m_params.frameIndex == 0)
 check(cudaStreamSynchronize(m_stream), "render");
 ++m_params.frameIndex;
 m_lastRenderMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+@ An eye of the headset. The launch parameters are copied, so the desktop's
+camera, image and sample count stay as they are, and the copy is pointed at
+the eye's camera, its size, the target buffer, and the scratch buffers for the
+sums and the mesh ids. The ray generation program then works exactly as for
+the desktop: launch~$s$ adds sample~$s$ to the sums and writes the running
+average to the target, so after the last launch the target holds the average
+of all the samples. The first sample goes through the pixel centres and the
+others are jittered, which antialiases the edges. All launches use one device
+copy of the parameters; that is safe because the copy before each launch is
+queued on the same stream, after the previous launch.
+
+An empty scene still owes the headset an image: the background color is
+written into the target with a 32-bit memset, whose word holds the bytes
+$(40, 42, 48, 255)$ in little-endian order. The function returns only when
+the GPU has finished, because the XR runtime reads the buffer next.
+
+<<Render one view into a device buffer>>=
+void OptixRenderer::renderView(const Camera& camera, unsigned int width, unsigned int height, uchar4* target,
+                               unsigned int samples)
+{
+    const size_t pixels = size_t(width) * height;
+    if (!m_params.handle)
+    {
+        // nothing to trace: the background color (40, 42, 48) as one 32-bit word
+        if (cuMemsetD32Async(CUdeviceptr(target), 0xff302a28u, pixels, m_stream) != CUDA_SUCCESS)
+            throw std::runtime_error("cuMemsetD32Async failed");
+        check(cudaStreamSynchronize(m_stream), "renderView");
+        return;
+    }
+    m_viewAccum.resize(pixels * sizeof(float4));
+    m_viewMeshIds.resize(pixels * sizeof(unsigned int));
+    m_viewParams.resize(sizeof(LaunchParams));
+    LaunchParams params = m_params;
+    params.camera = camera;
+    params.width = width;
+    params.height = height;
+    params.colorBuffer = target;
+    params.accumBuffer = reinterpret_cast<float4*>(m_viewAccum.ptr);
+    params.meshIdBuffer = reinterpret_cast<unsigned int*>(m_viewMeshIds.ptr);
+    for (unsigned int s = 0; s < std::max(samples, 1u); ++s)
+    {
+        params.frameIndex = s;
+        check(cudaMemcpyAsync(reinterpret_cast<void*>(m_viewParams.ptr), &params, sizeof(params),
+                              cudaMemcpyHostToDevice, m_stream),
+              "upload view params");
+        check(optixLaunch(m_pipeline, m_stream, m_viewParams.ptr, sizeof(LaunchParams), &m_sbt, width, height, 1),
+              "optixLaunch");
+    }
+    check(cudaStreamSynchronize(m_stream), "renderView");
+}
 @ Picking reads the host copy of the ids; coordinates outside the image hit
 nothing.
 

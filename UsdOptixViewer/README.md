@@ -79,6 +79,14 @@ users in `/opt/viztools` (CUDA in `/usr/local/cuda-13.2`):
   (usdview's "fit" policy). Orbiting, panning or zooming switches to the
   orbit camera, which starts from the USD camera's position and direction.
   Aperture offsets are ignored with a warning.
+- XR output (branch `cloudxr`): stereo rendering to a headset through any
+  OpenXR runtime with Vulkan support, in particular NVIDIA CloudXR (Apple
+  Vision Pro, Quest through CloudXR.js). `--cloudxr --cloudxr-sdk DIR` runs the
+  CloudXR runtime inside the viewer; `--xr` uses the active runtime
+  (`XR_RUNTIME_JSON`, for example one started by Isaac Teleop). The eyes are
+  rendered by OptiX into Vulkan memory shared with CUDA. The headset starts at
+  the desktop view's eye and follows it. See the *XR* menu and
+  [../CLOUDXR.md](../CLOUDXR.md) for all options and the differences from `main`.
 
 Controls: left-drag to orbit, right/middle-drag to pan, wheel to zoom, `F` to
 frame the selection, `Esc` to clear the selection, *Camera* menu to look
@@ -100,7 +108,8 @@ setting `LD_LIBRARY_PATH`:
 ~/.local/opt/UsdOptixViewer/bin/UsdOptixViewer \
     ~/.local/opt/UsdOptixViewer/share/UsdOptixViewer/assets/sample_scene.usda \
     [--select /World/Props/BlueSphere] [--camera /World/Cameras/Front] [--no-mipmaps] [--no-normal-maps] \
-    [--no-reflections]
+    [--no-reflections] [--xr] [--cloudxr] [--cloudxr-sdk DIR] [--cloudxr-profile NAME] \
+    [--xr-samples N] [--xr-resolution F] [--xr-mirror]
 ```
 
 `--select` selects and frames a prim, `--camera` looks through a USD camera.
@@ -120,6 +129,9 @@ plastic, roughness 0.05 to 1.0 from left to right, a specular-workflow sphere,
 and a floor with a roughness checker texture whose smooth squares mirror the
 spheres.
 
+The first configure downloads the OpenXR SDK (loader built static) and the
+Vulkan headers from github.com/KhronosGroup with `FetchContent`.
+
 Dependency locations can be overridden with `CMAKE_PREFIX_PATH`,
 `-DOptiX_INSTALL_DIR=...`, `-DIMGUI_DIR=...`, `-DCUDAToolkit_ROOT=...` and
 `-DVIZ_PREFIX=...`. `VIZ_PREFIX` defaults to `/opt/viztools`, falling back to
@@ -133,6 +145,8 @@ Dependency locations can be overridden with `CMAKE_PREFIX_PATH`,
 - `src/devicePrograms.cu`: raygen / miss / closest-hit programs (compiled to
   PTX by nvcc and embedded into the binary via `cmake/EmbedFile.cmake`)
 - `src/App.*`: SDL3 + ImGui application and panels
+- `src/XrOutput.*`: OpenXR session, Vulkan device, CUDA-shared eye buffers and eye cameras
+- `src/CloudXrService.*`, `src/third_party/cxrServiceAPI.h`: in-process NVIDIA CloudXR runtime
 - `assets/sample_scene.usda`: solid color test scene
 - `assets/textured_scene.usda`, `assets/textures/uv_grid.png`: texture test scene
 - `assets/mipmap_test.usda`: texture minification and aliasing test

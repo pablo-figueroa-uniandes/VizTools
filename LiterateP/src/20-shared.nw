@@ -67,6 +67,11 @@ USD cameras also carry a clipping range. The renderer honours it for camera
 rays, as a depth measured along [[w]], so that a near plane can cut away the
 wall in front of an interior shot. The orbit camera uses $[0, 10^{16}]$.
 
+The eyes of a headset have asymmetric frusta: the image plane is not centred
+on the viewing direction. Such a camera still fits the formula if [[w]] points
+at the centre of the window rather than straight ahead; it is then no longer
+a unit vector, which matters only to the clipping range, so XR eyes use none.
+
 <<The camera frame>>=
 // Perspective: rays leave `eye` through w + u * x + v * y, for x, y in [-1, 1]
 // (u, v span the image plane at distance 1). Orthographic: rays leave
@@ -75,7 +80,7 @@ wall in front of an interior shot. The orbit camera uses $[0, 10^{16}]$.
 struct Camera
 {
     float3 eye;
-    float3 u, v, w;  // right, up and forward (w normalized)
+    float3 u, v, w;  // right, up and forward (w normalized, except for XR eyes, which have no clipping)
     unsigned int orthographic;
     float clipNear, clipFar;
 };

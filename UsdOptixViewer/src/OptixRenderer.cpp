@@ -120,14 +120,19 @@ void OptixRenderer::DeviceBuffer::free()
 // ---- OptixRenderer --------------------------------------------------------
 OptixRenderer::~OptixRenderer()
 {
+    release();
+}
+
+void OptixRenderer::release()
+{
     if (!m_context)
         return;
     cudaDeviceSynchronize();
     freeTextures();
     for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_vertices, &m_indices, &m_triMesh,
                             &m_triMaterial, &m_triUVs, &m_triNormals, &m_materials, &m_gas, &m_colorBuffer,
-                            &m_accumBuffer, &m_meshIdBuffer,
-                            &m_paramsBuffer})
+                            &m_accumBuffer, &m_meshIdBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds,
+                            &m_viewParams})
         b->free();
     optixPipelineDestroy(m_pipeline);
     optixProgramGroupDestroy(m_raygenPG);
@@ -137,9 +142,20 @@ OptixRenderer::~OptixRenderer()
     optixModuleDestroy(m_module);
     optixDeviceContextDestroy(m_context);
     cudaStreamDestroy(m_stream);
+    m_context = nullptr;
+    m_module = nullptr;
+    m_pipeline = nullptr;
+    m_raygenPG = m_hitPG = nullptr;
+    m_missPG[RAY_TYPE_RADIANCE] = m_missPG[RAY_TYPE_SHADOW] = nullptr;
+    m_sbt = {};
+    m_stream = nullptr;
+    m_cuContext = nullptr;
+    m_params = {};
+    m_pixels.clear();
+    m_meshIds.clear();
 }
 
-bool OptixRenderer::init(std::string& error)
+bool OptixRenderer::init(std::string& error, const unsigned char* deviceUuid)
 {
     try
     {
@@ -147,11 +163,24 @@ bool OptixRenderer::init(std::string& error)
         check(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount");
         if (deviceCount == 0)
             throw std::runtime_error("no CUDA capable device found");
-        check(cudaSetDevice(0), "cudaSetDevice");
-        check(cudaFree(nullptr), "cudaFree");  // creates the primary context
+        int device = 0;
         cudaDeviceProp props{};
-        check(cudaGetDeviceProperties(&props, 0), "cudaGetDeviceProperties");
+        if (deviceUuid)
+        {
+            // the XR runtime chose a GPU; CUDA numbers GPUs differently from Vulkan
+            device = -1;
+            for (int d = 0; d < deviceCount && device < 0; ++d)
+                if (cudaGetDeviceProperties(&props, d) == cudaSuccess &&
+                    std::memcmp(props.uuid.bytes, deviceUuid, sizeof(props.uuid.bytes)) == 0)
+                    device = d;
+            if (device < 0)
+                throw std::runtime_error("no CUDA device matches the GPU of the XR runtime");
+        }
+        check(cudaSetDevice(device), "cudaSetDevice");
+        check(cudaFree(nullptr), "cudaFree");  // creates the primary context
+        check(cudaGetDeviceProperties(&props, device), "cudaGetDeviceProperties");
         m_deviceName = props.name;
+        std::memcpy(m_deviceUuid.data(), props.uuid.bytes, m_deviceUuid.size());
         check(cudaStreamCreate(&m_stream), "cudaStreamCreate");
         if (cuCtxGetCurrent(&m_cuContext) != CUDA_SUCCESS)
             throw std::runtime_error("cuCtxGetCurrent failed");
@@ -489,6 +518,40 @@ void OptixRenderer::render()
     check(cudaStreamSynchronize(m_stream), "render");
     ++m_params.frameIndex;
     m_lastRenderMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+
+void OptixRenderer::renderView(const Camera& camera, unsigned int width, unsigned int height, uchar4* target,
+                               unsigned int samples)
+{
+    const size_t pixels = size_t(width) * height;
+    if (!m_params.handle)
+    {
+        // nothing to trace: the background color (40, 42, 48) as one 32-bit word
+        if (cuMemsetD32Async(CUdeviceptr(target), 0xff302a28u, pixels, m_stream) != CUDA_SUCCESS)
+            throw std::runtime_error("cuMemsetD32Async failed");
+        check(cudaStreamSynchronize(m_stream), "renderView");
+        return;
+    }
+    m_viewAccum.resize(pixels * sizeof(float4));
+    m_viewMeshIds.resize(pixels * sizeof(unsigned int));
+    m_viewParams.resize(sizeof(LaunchParams));
+    LaunchParams params = m_params;
+    params.camera = camera;
+    params.width = width;
+    params.height = height;
+    params.colorBuffer = target;
+    params.accumBuffer = reinterpret_cast<float4*>(m_viewAccum.ptr);
+    params.meshIdBuffer = reinterpret_cast<unsigned int*>(m_viewMeshIds.ptr);
+    for (unsigned int s = 0; s < std::max(samples, 1u); ++s)
+    {
+        params.frameIndex = s;
+        check(cudaMemcpyAsync(reinterpret_cast<void*>(m_viewParams.ptr), &params, sizeof(params),
+                              cudaMemcpyHostToDevice, m_stream),
+              "upload view params");
+        check(optixLaunch(m_pipeline, m_stream, m_viewParams.ptr, sizeof(LaunchParams), &m_sbt, width, height, 1),
+              "optixLaunch");
+    }
+    check(cudaStreamSynchronize(m_stream), "renderView");
 }
 
 unsigned int OptixRenderer::meshIdAt(unsigned int x, unsigned int y) const

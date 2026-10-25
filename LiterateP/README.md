@@ -7,8 +7,9 @@ prose that motivates it. Named chunks such as ⟨Find the OptiX headers 10⟩ �
 cross-referenced, and the book ends with an index of chunk names.
 
 The book covers the CMake project, the shared launch parameters, the scene, the
-OptiX renderer, the device programs, the application and the all-users install
-script. The third-party `stb_image.h` is not covered.
+OptiX renderer, the device programs, the application, the XR output (OpenXR and
+CloudXR, on the `cloudxr` branch) and the all-users install
+script. The third-party `stb_image.h` and `cxrServiceAPI.h` are not covered.
 
 ## Files
 

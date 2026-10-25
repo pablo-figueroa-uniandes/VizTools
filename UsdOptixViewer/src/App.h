@@ -2,14 +2,18 @@
 // viewport) and the OptiX renderer.
 #pragma once
 
+#include <array>
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <SDL3/SDL.h>
 
+#include "CloudXrService.h"
 #include "OptixRenderer.h"
 #include "Scene.h"
+#include "XrOutput.h"
 
 class App
 {
@@ -38,10 +42,19 @@ private:
     void frameSelection();
     void updateFilter();
     void updateCamera();
+    void orbitOffset(float offset[3], float up[3]) const;
+    void viewFrame(float eye[3], float forward[3]) const;
     void lookThrough(int camera);
     void orbitFromUsdCamera();
     void fittedWindow(const SceneCamera& camera, float& halfWidth, float& halfHeight) const;
     void openFileDialog();
+
+    void startXr(bool cloudXr, std::string sdkDir, const std::string& profile);
+    void updateXr();
+    void renderXrEyes(std::string& error);
+    bool useRendererOn(const std::array<unsigned char, 16>& uuid, std::string& error);
+    void drawXrMirror(float x, float y, float width, float height);
+    std::string xrStatus() const;
 
     SDL_Window* m_window = nullptr;
     SDL_Renderer* m_sdlRenderer = nullptr;
@@ -76,4 +89,20 @@ private:
 
     std::mutex m_pendingMutex;
     std::string m_pendingOpen;
+
+    // XR output. The CloudXR service (if it runs in this process) is declared
+    // first, so that the XR session ends before the service stops.
+    CloudXrService m_cloudXr;
+    XrOutput m_xr;
+    bool m_xrEnabled = false;
+    bool m_xrPaced = false;         // xrWaitFrame paces the loop instead of vsync
+    bool m_xrClient = false;        // a CloudXR client is connected
+    float m_xrResolution = 1.0f;    // fraction of the headset's recommended eye resolution
+    float m_xrWorldScale = 1.0f;    // > 1 makes the user larger than the scene's units say
+    int m_xrSamples = 1;            // samples per pixel and frame
+    float m_xrFrameMs = 0.0f;
+    bool m_xrMirror = false;        // show the left eye in the viewport
+    SDL_Texture* m_mirrorTexture = nullptr;
+    int m_mirrorWidth = 0, m_mirrorHeight = 0;
+    std::vector<uchar4> m_mirrorPixels;
 };

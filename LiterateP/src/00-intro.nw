@@ -5,13 +5,16 @@ geometry with a ray tracer that runs on NVIDIA's OptiX engine. The program was
 written to exercise, in one place, a set of tools installed on a workstation:
 CUDA and OptiX for ray tracing, SDL3 for the window and input, Dear ImGui for
 the user interface, EnTT for the scene graph, and OpenUSD for reading scenes.
+This edition, on the \texttt{cloudxr} branch of the repository, can also send
+the view in stereo to a headset through OpenXR, and in particular through
+NVIDIA CloudXR, which streams it over the network.
 
 This document \emph{is} the program. Following Donald Knuth's \emph{Literate
 Programming} (1984), the code is presented in the order in which it is best
 understood by a human reader, not in the order a compiler wants it. Each piece
 of code lives in a numbered \emph{section}, together with the prose that
 explains it. A tool, \texttt{lp.py}, \emph{tangles} the sections back into the
-thirteen source files of the program, and \emph{weaves} them into the book you
+seventeen source files of the program, and \emph{weaves} them into the book you
 are reading.
 
 @ The rendering is progressive. While the reader does not touch anything, the
@@ -57,12 +60,17 @@ build system to the pixels on the screen:
 \item \emph{The device programs} run on the GPU: ray generation, shading,
   shadows, reflections and alpha cutouts.
 \item \emph{The application} ties everything together with SDL3 and Dear ImGui:
-  the hierarchy, the inspector, the viewport and the camera.
+  the hierarchy, the inspector, the viewport and the camera, and drives the XR
+  output.
+\item \emph{The XR output} talks to an OpenXR runtime through Vulkan, shares
+  the eye images between Vulkan and CUDA, and can run the CloudXR runtime
+  inside the program.
 \item \emph{Installation for all users} shows the script that moved the tools
   to a system-wide location.
 \end{itemize}
 The third-party image decoder \lpfile{stb\_image.h}, about eight thousand lines
-by Sean Barrett, is used as it comes and is not part of this book.
+by Sean Barrett, is used as it comes and is not part of this book; nor is
+NVIDIA's header \lpfile{cxrServiceAPI.h}, which declares the CloudXR service.
 
 @* A word on correctness. Literate programs are easy to let drift away from the
 code that actually runs. To prevent that, the command \texttt{python3 lp.py

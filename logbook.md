@@ -30,6 +30,37 @@ This file describes the advances in visualization tools for this computer.
 - Literate book: updated in every part that changed (shared, scene, renderer, device, app). It now has 307 sections, 300 chunks and 108 pages. `lp.py check` is ok for all 13 files.
 - Not supported: aperture offsets (ignored, with a warning), depth of field and animated cameras (only the start time is used).
 
+### Results (October 25th): task 2, CloudXR
+
+**Done, on branch `cloudxr`** (not merged into `main`). `CLOUDXR.md` at the repository root explains every difference from `main`, how to run it, what was verified and what is missing.
+- What was already on this machine:
+  - The NVIDIA CloudXR Runtime, which is an OpenXR runtime based on Monado. Isaac Teleop runs it for Vision Pro (`~/.cloudxr`, `/srv/isaac-shared/cxr`).
+  - The CloudXR 6.2.1 SDK, downloaded by the LÖVR sample in `/srv/isaac-shared/cxr/cloudxr-lovr-sample`.
+  - The runtime only accepts Vulkan apps (`XR_KHR_vulkan_enable2`).
+- Design:
+  - `XrOutput` is a plain OpenXR client. The runtime creates the Vulkan device and picks the GPU.
+  - Each eye is a Vulkan buffer exported to CUDA, so OptiX renders straight into it. A queue copy then puts it into the swapchain image.
+  - The renderer moves to the runtime's GPU (matched by UUID) if needed.
+  - `CloudXrService` can run the CloudXR runtime inside the viewer, from an SDK directory, as in NVIDIA's LÖVR sample.
+  - The headset is anchored at the desktop camera's eye and follows it.
+- Usage:
+  - `--cloudxr --cloudxr-sdk DIR [--cloudxr-profile apple-vision-pro|auto-webrtc|...]` runs the runtime inside the viewer.
+  - `--xr` uses the active runtime (`XR_RUNTIME_JSON`, for example after `source ~/.cloudxr/run/cloudxr.env`).
+  - `--xr-samples`, `--xr-resolution` and `--xr-mirror` set the headset view, along with a new *XR* menu.
+- Dependencies: the OpenXR loader 1.1.58 (static) and the Vulkan headers 1.3.275 are fetched by CMake. Vulkan is dlopened. The CloudXR SDK is loaded at run time and is not in the repository. `/opt/viztools` is unchanged.
+- Verified without a headset:
+  - With the static `apple-vision-pro` profile, the session runs: 2 × 2400×1920 eyes, 63 mm apart, 2.8 ms per frame at 1 sample per pixel.
+  - The left-eye mirror shows the correct view.
+  - `--xr` works against a runtime hosted by another process, with textures, at 4.2 ms per frame and 4 samples per pixel.
+  - Shutdown is clean.
+  - Errors leave the desktop working.
+  - Desktop rendering is unchanged.
+  - The build has no warnings, from scratch.
+  - A first test showed that the CloudXR service takes over SIGTERM and SIGINT, which left the app running without its runtime. This was fixed by restoring SDL's handlers after the service starts.
+- Not verified: a real headset (image, tracking, `auto-*` client connect and disconnect) and an actual GPU switch.
+- Literate book (branch): new part `75-xr.nw` for `XrOutput` and `CloudXrService`, written by a sub-agent. Intro, build, shared, renderer and app parts are updated. It covers 17 files, with 396 sections, 388 chunks and 143 pages. `lp.py check` is ok.
+- The installed copy in `~/.local/opt/UsdOptixViewer` is still `main`'s build (USD cameras). The branch was only built in its build tree.
+
 ## October 24th
 
 1. Locally to this account, install compatible versions of the following development tools (if they are not installed)

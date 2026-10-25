@@ -17,7 +17,7 @@ enum RayType { RAY_TYPE_RADIANCE = 0, RAY_TYPE_SHADOW = 1, RAY_TYPE_COUNT };
 struct Camera
 {
     float3 eye;
-    float3 u, v, w;  // right, up and forward (w normalized)
+    float3 u, v, w;  // right, up and forward (w normalized, except for XR eyes, which have no clipping)
     unsigned int orthographic;
     float clipNear, clipFar;
 };

@@ -44,14 +44,18 @@ act on the scene, and the state they share.
 // viewport) and the OptiX renderer.
 #pragma once
 
+#include <array>
 #include <mutex>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <SDL3/SDL.h>
 
+#include "CloudXrService.h"
 #include "OptixRenderer.h"
 #include "Scene.h"
+#include "XrOutput.h"
 
 class App
 {
@@ -72,6 +76,8 @@ private:
     <<Text input and dialog state>>
 
     <<File requests from other threads>>
+
+    <<XR output state of the application>>
 };
 @ The destructor releases ImGui and SDL in the reverse order of their
 creation. The file dialog of SDL may run its callback on a thread of its own,
@@ -105,10 +111,19 @@ void frameBounds(const float lo[3], const float hi[3]);
 void frameSelection();
 void updateFilter();
 void updateCamera();
+void orbitOffset(float offset[3], float up[3]) const;
+void viewFrame(float eye[3], float forward[3]) const;
 void lookThrough(int camera);
 void orbitFromUsdCamera();
 void fittedWindow(const SceneCamera& camera, float& halfWidth, float& halfHeight) const;
 void openFileDialog();
+
+void startXr(bool cloudXr, std::string sdkDir, const std::string& profile);
+void updateXr();
+void renderXrEyes(std::string& error);
+bool useRendererOn(const std::array<unsigned char, 16>& uuid, std::string& error);
+void drawXrMirror(float x, float y, float width, float height);
+std::string xrStatus() const;
 @ SDL gives us three objects: the window, a 2D renderer attached to it, and a
 texture that holds the latest ray-traced image. The flag [[m_running]] is
 cleared when the user asks to quit.
@@ -177,6 +192,29 @@ thread.
 <<File requests from other threads>>=
 std::mutex m_pendingMutex;
 std::string m_pendingOpen;
+@ The XR output has its own state. [[m_cloudXr]] runs the CloudXR runtime when
+it lives inside this process, and [[m_xr]] is the OpenXR side; members are
+destroyed in the reverse order of their declaration, so the session ends
+before the service that serves it stops. The other fields are the user's
+settings for the headset view, the time the last headset frame took, and the
+texture and pixels of the optional mirror of the left eye in the viewport.
+
+<<XR output state of the application>>=
+// XR output. The CloudXR service (if it runs in this process) is declared
+// first, so that the XR session ends before the service stops.
+CloudXrService m_cloudXr;
+XrOutput m_xr;
+bool m_xrEnabled = false;
+bool m_xrPaced = false;         // xrWaitFrame paces the loop instead of vsync
+bool m_xrClient = false;        // a CloudXR client is connected
+float m_xrResolution = 1.0f;    // fraction of the headset's recommended eye resolution
+float m_xrWorldScale = 1.0f;    // > 1 makes the user larger than the scene's units say
+int m_xrSamples = 1;            // samples per pixel and frame
+float m_xrFrameMs = 0.0f;
+bool m_xrMirror = false;        // show the left eye in the viewport
+SDL_Texture* m_mirrorTexture = nullptr;
+int m_mirrorWidth = 0, m_mirrorHeight = 0;
+std::vector<uchar4> m_mirrorPixels;
 @* The implementation. The file \lpfile{App.cpp} contains, after its headers
 and two helper functions, the member functions in the order of the life of the
 program: creation, the main loop, and then the panels from left to right.
@@ -230,6 +268,10 @@ namespace {
 // ---- viewport -------------------------------------------------------------
 <<Send the camera and the options to the renderer>>
 
+<<Compute the orbit offset>>
+
+<<Find the eye and direction of the desktop view>>
+
 <<Fit a USD camera's window to the viewport>>
 
 <<Look through a USD camera>>
@@ -245,6 +287,8 @@ namespace {
 <<Draw the status bar>>
 
 <<Draw the popups>>
+
+<<The XR output of the application>>
 @ Besides ImGui and its two back ends, the implementation needs a few pieces
 of OpenUSD for the inspector, and \lpfile{optix.h} only for the version number
 that the status bar and the About box display. The macro
@@ -255,7 +299,10 @@ scope, as everywhere else in the program.
 #include "App.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -284,8 +331,9 @@ constexpr unsigned int kMaxSamples = 256;  // progressive samples per pixel
 constexpr ImGuiWindowFlags kPanelFlags =
     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
 @* Creation and destruction. Initialization proceeds in four steps: the
-window, the user interface library, the ray tracer, and finally whatever the
-command line asks for. A failure of SDL is fatal, but a failure of OptiX is
+window, the user interface library, the command line, and the ray tracer
+(after the XR output, if the command line asks for one), and finally the
+file, prim and camera that the command line names. A failure of SDL is fatal, but a failure of OptiX is
 not; it is reported in a popup and the viewport stays empty.
 
 <<Initialize the application>>=
@@ -295,9 +343,10 @@ bool App::init(int argc, char** argv)
 
     <<Set up Dear ImGui>>
 
-    <<Create the OptiX renderer>>
-
     <<Parse the command line>>
+
+    <<Start the XR output and the OptiX renderer>>
+
     <<Open the requested file and select the requested prim>>
     <<Look through the requested camera>>
     return true;
@@ -362,14 +411,6 @@ style.FontScaleDpi = scale;
 style.WindowRounding = 0.0f;
 ImGui_ImplSDL3_InitForSDLRenderer(m_window, m_sdlRenderer);
 ImGui_ImplSDLRenderer3_Init(m_sdlRenderer);
-@ If OptiX cannot start, the message goes into [[m_error]], which the next
-frame shows in a popup (<<Draw the popups>>).
-
-<<Create the OptiX renderer>>=
-std::string error;
-m_rendererOk = m_renderer.init(error);
-if (!m_rendererOk)
-    m_error = "OptiX initialization failed: " + error;
 @ The command line names at most one file, and may add options. Three of them
 switch off a feature of the renderer from the start, exactly as the
 corresponding items of the View menu do; they make it easy to compare images
@@ -384,10 +425,21 @@ the command line and take a screenshot. For the same reason
 \texttt{--camera} looks through a USD camera given by its path, as the Camera
 menu does.
 
+The remaining options concern the XR output, described at the end of this
+part. \texttt{--xr} sends the view to the active OpenXR runtime, and
+\texttt{--cloudxr} first starts NVIDIA's CloudXR runtime inside the program,
+from the SDK directory that \texttt{--cloudxr-sdk} names, with the device
+profile of \texttt{--cloudxr-profile}. The last three set the samples per
+pixel and frame, the eye resolution as a fraction of the headset's
+recommendation, and the mirror of the left eye; the numbers are clamped to
+sensible ranges.
+
 <<Parse the command line>>=
 // UsdOptixViewer [file.usd] [--select /Prim/Path] [--camera /Camera/Path] [--no-mipmaps] [--no-normal-maps]
-//                [--no-reflections]
-std::string file, selectPath, cameraPath;
+//                [--no-reflections] [--xr] [--cloudxr] [--cloudxr-sdk DIR] [--cloudxr-profile NAME]
+//                [--xr-samples N] [--xr-resolution F] [--xr-mirror]
+std::string file, selectPath, cameraPath, cloudXrSdk, cloudXrProfile;
+bool xr = false, cloudXr = false;
 for (int i = 1; i < argc; ++i)
 {
     const std::string arg = argv[i];
@@ -395,6 +447,20 @@ for (int i = 1; i < argc; ++i)
         selectPath = argv[++i];
     else if (arg == "--camera" && i + 1 < argc)
         cameraPath = argv[++i];
+    else if (arg == "--xr")
+        xr = true;
+    else if (arg == "--cloudxr")
+        cloudXr = true;
+    else if (arg == "--cloudxr-sdk" && i + 1 < argc)
+        cloudXrSdk = argv[++i];
+    else if (arg == "--cloudxr-profile" && i + 1 < argc)
+        cloudXrProfile = argv[++i];
+    else if (arg == "--xr-samples" && i + 1 < argc)
+        m_xrSamples = std::clamp(std::atoi(argv[++i]), 1, 64);
+    else if (arg == "--xr-resolution" && i + 1 < argc)
+        m_xrResolution = std::clamp(float(std::atof(argv[++i])), 0.1f, 2.0f);
+    else if (arg == "--xr-mirror")
+        m_xrMirror = true;
     else if (arg == "--no-mipmaps")
         m_mipmaps = false;
     else if (arg == "--no-normal-maps")
@@ -404,6 +470,21 @@ for (int i = 1; i < argc; ++i)
     else
         file = arg;
 }
+@ The XR runtime, if one is wanted, starts before the renderer: the CloudXR
+service must run before any OpenXR call, and the renderer may later have to
+move to the GPU that the runtime picks (see <<Follow the XR session>>). If
+OptiX cannot start, the message goes into [[m_error]], which the next frame
+shows in a popup (<<Draw the popups>>).
+
+<<Start the XR output and the OptiX renderer>>=
+// The XR runtime must exist before the renderer starts, because it may
+// choose another GPU (see updateXr).
+if (xr || cloudXr)
+    startXr(cloudXr, cloudXrSdk, cloudXrProfile);
+std::string error;
+m_rendererOk = m_renderer.init(error);
+if (!m_rendererOk)
+    m_error = "OptiX initialization failed: " + error;
 @ The prim to select is looked up among the scene's entities by its USD path,
 after checking that the string is a valid path at all (the constructor of
 [[SdfPath]] would complain loudly otherwise). Selecting with [[reveal]] set
@@ -454,6 +535,8 @@ App::~App()
     }
     if (m_texture)
         SDL_DestroyTexture(m_texture);
+    if (m_mirrorTexture)
+        SDL_DestroyTexture(m_mirrorTexture);
     if (m_sdlRenderer)
         SDL_DestroyRenderer(m_sdlRenderer);
     if (m_window)
@@ -530,8 +613,10 @@ void App::openFileDialog()
 requested file if there is one, and then draws one frame. The pending path is
 taken out under the lock by swapping it with an empty string, and loaded
 after the lock has been released, so that the dialog's thread never waits for
-a stage to load. While the window is minimized we draw nothing and sleep a
-little, rather than spin.
+a stage to load. Then the XR output gets its turn (<<Follow the XR session>>),
+before the minimized test, so that the headset keeps receiving images while
+the window is minimized. While the window is minimized we draw nothing and
+sleep a little, rather than spin.
 
 Drawing a frame is ImGui's usual ritual: start a new frame in both back ends
 and in ImGui, describe the whole interface (<<Lay out the panels and handle shortcuts>>),
@@ -556,6 +641,7 @@ void App::run()
         if (!pending.empty())
             loadFile(pending);
 
+        updateXr();  // keeps streaming while the window is minimized
         if (SDL_GetWindowFlags(m_window) & SDL_WINDOW_MINIMIZED)
         {
             SDL_Delay(10);
@@ -662,7 +748,7 @@ if (!ImGui::GetIO().WantTextInput)
     if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_O))
         openFileDialog();
 }
-@* Menus. The menu bar has four menus.
+@* Menus. The menu bar has five menus.
 
 <<Draw the menu bar>>=
 void App::drawMenuBar()
@@ -672,6 +758,7 @@ void App::drawMenuBar()
     <<The File menu>>
     <<The View menu>>
     <<The Camera menu>>
+    <<The XR menu>>
     <<The Help menu>>
     ImGui::EndMainMenuBar();
 }
@@ -757,6 +844,35 @@ if (ImGui::BeginMenu("Camera"))
     for (size_t i = 0; i < cameras.size(); ++i)
         if (ImGui::MenuItem(cameras[i].path.c_str(), nullptr, m_camera == int(i)))
             lookThrough(int(i));
+    ImGui::EndMenu();
+}
+@ The XR menu reports on the headset output: the OpenXR runtime, whether a
+CloudXR client is connected when the runtime runs in this process, the state
+of the session, and the headset, GPU and eye resolution once they are known.
+Its settings apply while the session runs: the world scale (how many meters
+one meter of head motion covers, relative to the stage's units), the samples
+per pixel and frame, and the mirror of the left eye in the viewport.
+
+<<The XR menu>>=
+if (ImGui::BeginMenu("XR"))
+{
+    if (m_xr.state() == XrOutput::State::Off)
+        ImGui::TextDisabled("XR output is off. Start with --xr or --cloudxr.");
+    else
+    {
+        ImGui::Text("Runtime: %s", m_xr.runtimeName().c_str());
+        if (m_cloudXr.running())
+            ImGui::Text("CloudXR %s in this process, client %s", m_cloudXr.version().c_str(),
+                        m_xrClient ? "connected" : "not connected");
+        ImGui::Text("State: %s", xrStatus().c_str());
+        if (m_xr.eyeCount())
+            ImGui::Text("%s on %s, %u eyes of %u x %u", m_xr.systemName().c_str(), m_xr.gpuName().c_str(),
+                        m_xr.eyeCount(), m_xr.eyeWidth(), m_xr.eyeHeight());
+    }
+    ImGui::SeparatorText("Headset view");
+    ImGui::SliderFloat("World scale", &m_xrWorldScale, 0.01f, 100.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+    ImGui::SliderInt("Samples per frame", &m_xrSamples, 1, 8);
+    ImGui::MenuItem("Mirror left eye in viewport", nullptr, &m_xrMirror);
     ImGui::EndMenu();
 }
 @ The About box cannot be opened from inside the menu, because ImGui's popups
@@ -1276,22 +1392,54 @@ m_renderer.setCameraView(c.eye.data(), c.forward.data(), c.up.data(), halfW, hal
                          c.clipNear, c.clipFar);
 @
 <<Send the orbit camera to the renderer>>=
-const float cp = std::cos(m_pitch), sp = std::sin(m_pitch), cy = std::cos(m_yaw), sy = std::sin(m_yaw);
-float offset[3], up[3];
-if (m_scene.zUp())
-{
-    offset[0] = cp * cy, offset[1] = cp * sy, offset[2] = sp;
-    up[0] = 0, up[1] = 0, up[2] = 1;
-}
-else
-{
-    offset[0] = cp * sy, offset[1] = sp, offset[2] = cp * cy;
-    up[0] = 0, up[1] = 1, up[2] = 0;
-}
-float eye[3];
+float offset[3], up[3], eye[3];
+orbitOffset(offset, up);
 for (int k = 0; k < 3; ++k)
     eye[k] = m_target[k] + offset[k] * m_distance;
 m_renderer.setCamera(eye, m_target, up, m_fovY);
+@ The formulas for $\mathbf o$ and the up axis live in a function of their
+own, because the XR output also needs the desktop view's eye and direction.
+
+<<Compute the orbit offset>>=
+// Unit vector from the orbit target to the eye, and the world's up axis.
+void App::orbitOffset(float offset[3], float up[3]) const
+{
+    const float cp = std::cos(m_pitch), sp = std::sin(m_pitch), cy = std::cos(m_yaw), sy = std::sin(m_yaw);
+    if (m_scene.zUp())
+    {
+        offset[0] = cp * cy, offset[1] = cp * sy, offset[2] = sp;
+        up[0] = 0, up[1] = 0, up[2] = 1;
+    }
+    else
+    {
+        offset[0] = cp * sy, offset[1] = sp, offset[2] = cp * cy;
+        up[0] = 0, up[1] = 1, up[2] = 0;
+    }
+}
+@ The XR output places the headset where the desktop view's eye is, looking
+the same way. For a USD camera these are its own eye and forward direction;
+for the orbit camera, the eye is $\mathbf t+d\,\mathbf o$ and the direction
+$-\mathbf o$.
+
+<<Find the eye and direction of the desktop view>>=
+// Eye and viewing direction of the desktop view, orbit or USD camera.
+void App::viewFrame(float eye[3], float forward[3]) const
+{
+    if (m_camera >= 0)
+    {
+        const SceneCamera& c = m_scene.cameras()[m_camera];
+        std::copy(c.eye.begin(), c.eye.end(), eye);
+        std::copy(c.forward.begin(), c.forward.end(), forward);
+        return;
+    }
+    float offset[3], up[3];
+    orbitOffset(offset, up);
+    for (int k = 0; k < 3; ++k)
+    {
+        eye[k] = m_target[k] + offset[k] * m_distance;
+        forward[k] = -offset[k];
+    }
+}
 @ A camera's film back rarely has the shape of the viewport. Like usdview's
 default ``fit'' policy, we grow the camera's window along one axis until it
 has the viewport's aspect ratio $a$: if the viewport is relatively wider than
@@ -1567,11 +1715,14 @@ if (hovered && io.MouseWheel != 0.0f)
     m_needsRender = true;
 }
 @ ImGui measures in logical units, but the image should have one ray per
-physical pixel. The framebuffer scale converts one into the other.
+physical pixel. The framebuffer scale converts one into the other. While the
+viewport mirrors the headset's left eye, the desktop image is neither rendered
+nor picked from: the mirror shows something else.
 
 <<Compute the resolution of the image>>=
 const float fbScale = io.DisplayFramebufferScale.x;
 const unsigned w = unsigned(size.x * fbScale), h = unsigned(size.y * fbScale);
+const bool mirroring = m_xrMirror && m_xr.state() == XrOutput::State::Running && !m_mirrorPixels.empty();
 @ Picking. Clicking on the image selects the prim under the mouse. The
 renderer already knows which mesh each pixel shows: on the first sample of
 every image, which goes through the center of each pixel, it records a mesh
@@ -1589,7 +1740,7 @@ has no mesh, clears it.
 <<Pick the prim under a mouse click>>=
 // pick on click (left release without dragging)
 if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16.0f &&
-    m_renderer.width() == w)
+    m_renderer.width() == w && !mirroring)
 {
     const unsigned px = unsigned((io.MousePos.x - origin.x) * fbScale);
     const unsigned py = unsigned((io.MousePos.y - origin.y) * fbScale);
@@ -1634,7 +1785,7 @@ if (m_needsRender)
     m_renderer.resetAccumulation();
     m_needsRender = false;
 }
-if (m_texture && m_rendererOk && m_renderer.samples() < kMaxSamples)
+if (m_texture && m_rendererOk && m_renderer.samples() < kMaxSamples && !mirroring)
 {
     try
     {
@@ -1651,9 +1802,12 @@ if (m_texture && m_rendererOk && m_renderer.samples() < kMaxSamples)
 back end interprets a texture identifier as a pointer to an
 [[SDL_Texture]]. If the stage has nothing the renderer can draw, a note says so
 in the corner, so that an empty viewport is not mistaken for a broken one.
+The mirror of the headset, when on, takes the image's place.
 
 <<Show the image in the viewport>>=
-if (m_texture)
+if (mirroring)
+    drawXrMirror(origin.x, origin.y, size.x, size.y);
+else if (m_texture)
     ImGui::GetWindowDrawList()->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(m_texture))), origin,
                                          ImVec2(origin.x + size.x, origin.y + size.y));
 if (m_scene.loaded() && m_scene.geometry().empty())
@@ -1663,7 +1817,8 @@ if (m_scene.loaded() && m_scene.geometry().empty())
 bottom. It counts the prims (minus one, for the pseudo-root, which is an
 entity like the others but not a prim anyone wrote), the meshes, the triangles
 and the textures, names the camera in use, the OptiX version and the GPU, and shows the progress
-of the rendering with the time of the last sample. [[OPTIX_VERSION]] encodes
+of the rendering with the time of the last sample, followed by the state of
+the XR output when there is one. [[OPTIX_VERSION]] encodes
 version 9.1.0 as 90100, so we take it apart with divisions.
 
 <<Draw the status bar>>=
@@ -1672,12 +1827,13 @@ void App::drawStatusBar()
     ImGui::Begin("Status", nullptr, kPanelFlags | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
     const FlatGeometry& g = m_scene.geometry();
     ImGui::Text("%s  |  prims: %zu  meshes: %zu  triangles: %zu  textures: %zu  |  camera: %s  |  "
-                "OptiX %d.%d.%d on %s  |  samples %u/%u, %.2f ms",
+                "OptiX %d.%d.%d on %s  |  samples %u/%u, %.2f ms%s",
                 m_scene.loaded() ? m_scene.filePath().c_str() : "no file",
                 m_scene.loaded() ? m_scene.registry().storage<PrimInfo>().size() - 1 : 0, g.meshEntity.size(),
                 g.indices.size() / 3, g.textures.size(), m_camera >= 0 ? m_scene.cameras()[m_camera].path.c_str() : "orbit",
                 OPTIX_VERSION / 10000, (OPTIX_VERSION / 100) % 100, OPTIX_VERSION % 100,
-                m_renderer.deviceName().c_str(), m_renderer.samples(), kMaxSamples, m_renderer.lastRenderMs());
+                m_renderer.deviceName().c_str(), m_renderer.samples(), kMaxSamples, m_renderer.lastRenderMs(),
+                m_xr.state() == XrOutput::State::Off ? "" : ("  |  XR: " + xrStatus()).c_str());
     ImGui::End();
 }
 @ Two modal popups complete the interface. The error popup opens whenever
@@ -1717,10 +1873,235 @@ void App::drawPopups()
         ImGui::TextDisabled("Left drag: orbit   Right/middle drag: pan   Wheel: zoom");
         ImGui::TextDisabled("Click: select   F: frame selection   Esc: clear selection");
         ImGui::TextDisabled("Camera menu: look through a USD camera (moving returns to the orbit camera)");
+        ImGui::TextDisabled("XR menu: headset output through OpenXR / NVIDIA CloudXR (--xr, --cloudxr)");
         if (ImGui::Button("Close"))
             ImGui::CloseCurrentPopup();
         ImGui::EndPopup();
     }
+}
+@* The XR output. The viewer can show its scene in a headset as well: in
+stereo, with the head's own motion, through any OpenXR runtime, and in
+particular through NVIDIA CloudXR, which streams the images over the network
+to an Apple Vision Pro, a Meta Quest or a similar device. The OpenXR side is
+the class [[XrOutput]] and the CloudXR side the class [[CloudXrService]], both
+described in the next part. Here we see how the application drives them.
+
+<<The XR output of the application>>=
+// ---- XR output ----------------------------------------------------------------
+<<Start the XR output>>
+
+<<Follow the XR session>>
+
+<<Render the eyes of the headset>>
+
+<<Move the renderer to the GPU of the headset>>
+
+<<Draw the mirror of the left eye>>
+
+<<Describe the state of the XR output>>
+@ There are two ways to reach a CloudXR headset. CloudXR may already run as a
+service of its own, started for example by NVIDIA's Isaac Teleop tools, which
+also set [[XR_RUNTIME_JSON]] so that OpenXR applications find it; then
+\texttt{--xr} is enough. Or the viewer runs the CloudXR runtime itself, from
+the libraries of a CloudXR SDK, with \texttt{--cloudxr}. The SDK's directory
+comes from \texttt{--cloudxr-sdk} or from the environment variable
+[[CLOUDXR_SDK_DIR]]. Either way the OpenXR instance is created next; a
+failure leaves the viewer working on the desktop, with the reason in the
+error popup.
+
+<<Start the XR output>>=
+// --cloudxr runs the CloudXR runtime in this process; --xr alone uses the
+// active OpenXR runtime (XR_RUNTIME_JSON), for instance a CloudXR runtime
+// started by Isaac Teleop.
+void App::startXr(bool cloudXr, std::string sdkDir, const std::string& profile)
+{
+    std::string error;
+    if (cloudXr)
+    {
+        if (sdkDir.empty() && std::getenv("CLOUDXR_SDK_DIR"))
+            sdkDir = std::getenv("CLOUDXR_SDK_DIR");
+        if (sdkDir.empty())
+        {
+            m_error = "--cloudxr needs the CloudXR SDK directory: --cloudxr-sdk DIR or CLOUDXR_SDK_DIR.";
+            return;
+        }
+        if (!m_cloudXr.start(sdkDir, profile, error))
+        {
+            m_error = "CloudXR: " + error;
+            return;
+        }
+    }
+    if (!m_xr.init(error))
+    {
+        m_error = "XR output unavailable: " + error;
+        return;
+    }
+    m_xrEnabled = true;
+}
+@ Once per turn of the main loop, the application lets the XR output handle
+the runtime's events and then, if a frame is due, renders the two eyes.
+
+A headset is not always there. With CloudXR's \emph{auto} device profiles the
+runtime reports no headset until a client connects, which may be minutes
+after the program started. When the headset appears, the output reports
+[[SystemReady]]: the runtime has chosen a GPU and made a Vulkan device on it.
+The eye images are shared between Vulkan and CUDA, which works only on one
+and the same GPU, so the renderer moves to that GPU if it is not already
+there, and then the session is created.
+
+[[beginFrame]] waits until the headset wants the next frame. That wait paces
+the whole loop at the headset's refresh rate, so while the session runs the
+desktop must not wait for its own vertical blank as well, or the two clocks
+would beat against each other; vsync is switched off and back on as the
+session starts and stops. Any error ends the XR output, not the program.
+
+<<Follow the XR session>>=
+// Called once per main-loop turn. When the headset appears, the renderer
+// moves to the GPU the runtime chose, so that the eye buffers can be shared.
+// While the session runs, xrWaitFrame paces the loop at the headset's rate,
+// so the desktop stops waiting for vsync.
+void App::updateXr()
+{
+    if (!m_xrEnabled)
+        return;
+    m_xrClient = m_cloudXr.clientConnected();
+    std::string error;
+    if (m_xr.update(error) == XrOutput::State::SystemReady && useRendererOn(m_xr.deviceUuid(), error))
+        m_xr.createSession(m_xrResolution, error);
+    if (m_xr.beginFrame(error))
+    {
+        const auto start = std::chrono::steady_clock::now();
+        if (m_xr.shouldRender() && m_rendererOk)
+            renderXrEyes(error);
+        m_xr.endFrame(error);
+        m_xrFrameMs = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() - start).count();
+    }
+    if (!error.empty())
+    {
+        m_error = "XR output stopped: " + error;
+        m_xr.stop();
+        m_xrEnabled = false;
+    }
+    const bool paced = m_xr.state() == XrOutput::State::Running;
+    if (paced != m_xrPaced)
+    {
+        SDL_SetRenderVSync(m_sdlRenderer, paced ? 0 : 1);
+        m_xrPaced = paced;
+    }
+}
+@ Where is the user in the scene? The headset reports the head's pose in its
+own space, in meters, relative to where the head was when the session
+started. We put that origin at the eye of the desktop view, facing the
+horizontal part of its direction (tilting the whole world with the desktop
+camera's pitch would be uncomfortable), so the headset starts where the
+desktop view is and follows it when the desktop user orbits or picks another
+camera. A meter of head motion spans $1/m$ scene units, where $m$ is the
+stage's \emph{metersPerUnit}, times the world scale of the XR menu.
+
+Each eye is then rendered by the OptiX renderer straight into its shared
+buffer. For the mirror, the left eye is also copied to main memory; this costs
+a transfer per frame, which is why the mirror is optional.
+
+<<Render the eyes of the headset>>=
+// The XR origin sits at the desktop view's eye, facing its horizontal
+// direction, so the headset starts where the desktop camera is and follows it.
+void App::renderXrEyes(std::string& error)
+{
+    XrOutput::Anchor anchor{};
+    viewFrame(anchor.eye, anchor.forward);
+    anchor.zUp = m_scene.zUp();
+    const double metersPerUnit = m_scene.loaded() ? UsdGeomGetStageMetersPerUnit(m_scene.stage()) : 1.0;
+    anchor.unitsPerMeter = m_xrWorldScale / float(metersPerUnit);
+    try
+    {
+        for (unsigned int i = 0; i < m_xr.eyeCount(); ++i)
+            m_renderer.renderView(m_xr.eyeCamera(i, anchor), m_xr.eyeWidth(), m_xr.eyeHeight(), m_xr.eyeBuffer(i),
+                                  unsigned(m_xrSamples));
+        if (m_xrMirror)
+        {
+            m_mirrorPixels.resize(size_t(m_xr.eyeWidth()) * m_xr.eyeHeight());
+            if (cudaMemcpy(m_mirrorPixels.data(), m_xr.eyeBuffer(0), m_mirrorPixels.size() * sizeof(uchar4),
+                           cudaMemcpyDeviceToHost) != cudaSuccess)
+                throw std::runtime_error("copying the mirror image failed");
+        }
+    }
+    catch (const std::exception& e)
+    {
+        error = std::string("rendering failed: ") + e.what();
+    }
+}
+@ Moving the renderer to another GPU means starting it again there: release
+everything, initialize on the GPU with the given UUID, and upload the scene
+and the selection anew. The desktop image follows by itself: the renderer's
+image size is now zero, so the viewport resizes it on the next frame.
+
+<<Move the renderer to the GPU of the headset>>=
+// Moves the renderer to the GPU with the given UUID and uploads the scene again.
+bool App::useRendererOn(const std::array<unsigned char, 16>& uuid, std::string& error)
+{
+    if (m_rendererOk && m_renderer.deviceUuid() == uuid)
+        return true;
+    m_renderer.release();
+    m_rendererOk = m_renderer.init(error, uuid.data());
+    if (!m_rendererOk)
+        return false;
+    if (m_scene.loaded())
+        m_renderer.setGeometry(m_scene.geometry());
+    entt::registry& reg = m_scene.registry();
+    const MeshGeometry* mesh = reg.valid(m_selected) ? reg.try_get<MeshGeometry>(m_selected) : nullptr;
+    m_renderer.setSelectedMesh(mesh ? mesh->meshId : kNoMesh);
+    m_needsRender = true;  // the viewport also resizes the new image
+    return true;
+}
+@ The mirror is an SDL texture of the eye's size, recreated when that size
+changes, and drawn as large as fits in the viewport without distortion, on
+black.
+
+<<Draw the mirror of the left eye>>=
+// The left eye's latest image, fitted inside the viewport.
+void App::drawXrMirror(float x, float y, float width, float height)
+{
+    const int w = int(m_xr.eyeWidth()), h = int(m_xr.eyeHeight());
+    if (!m_mirrorTexture || w != m_mirrorWidth || h != m_mirrorHeight)
+    {
+        if (m_mirrorTexture)
+            SDL_DestroyTexture(m_mirrorTexture);
+        m_mirrorTexture = SDL_CreateTexture(m_sdlRenderer, SDL_PIXELFORMAT_RGBA32, SDL_TEXTUREACCESS_STREAMING, w, h);
+        m_mirrorWidth = w;
+        m_mirrorHeight = h;
+    }
+    if (!m_mirrorTexture || m_mirrorPixels.size() != size_t(w) * h)
+        return;
+    SDL_UpdateTexture(m_mirrorTexture, nullptr, m_mirrorPixels.data(), w * 4);
+    const float scale = std::min(width / float(w), height / float(h));
+    const ImVec2 lo(x + 0.5f * (width - w * scale), y + 0.5f * (height - h * scale));
+    ImDrawList* list = ImGui::GetWindowDrawList();
+    list->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + height), IM_COL32(0, 0, 0, 255));
+    list->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(m_mirrorTexture))), lo,
+                   ImVec2(lo.x + w * scale, lo.y + h * scale));
+}
+@ Finally, the state of the XR output in words, for the XR menu and the status
+bar. While the session runs, it includes the time the last frame took to
+render and hand over, not counting the wait for the headset.
+
+<<Describe the state of the XR output>>=
+std::string App::xrStatus() const
+{
+    switch (m_xr.state())
+    {
+    case XrOutput::State::Off:
+        return "off";
+    case XrOutput::State::WaitingForSystem:
+        return m_cloudXr.running() ? "waiting for a CloudXR client" : "waiting for a headset";
+    case XrOutput::State::SystemReady:
+    case XrOutput::State::Idle:
+        return "headset idle";
+    case XrOutput::State::Running:
+        break;
+    }
+    char text[64];
+    std::snprintf(text, sizeof(text), "running, %.1f ms per frame", m_xrFrameMs);
+    return text;
 }
 @* Decoding images. Our build of OpenUSD leaves out its imaging libraries,
 and with them OpenUSD's image readers, so the scene decodes textures with
