@@ -229,3 +229,19 @@ Not supported yet: translucency, UsdTransform2d, UDIM, normal/roughness/metallic
 - `Docs/LiterateNotes-Answers-261026.md` answers, in numbered order, the 13 notes added to `LiterateP/UsdOptixViewer-literate.pdf` (extracted from its PDF annotations).
 - Notes 1, 2, 3, 4, 7 and 8 ask for changes (delete the install script and `~/.local/opt`, install Vulkan/OpenXR/CloudXR for all users, prebuild ImGui, move the alignment prose). The document describes each change but none has been made yet.
 - Checked while writing: `sizeof(MaterialData)` is 192 bytes with no padding, and the GPUs are `sm_89` (relevant to the `compute_75` question).
+
+### Follow-up (October 27th): CloudXR connection address in the XR menu
+
+- With `--cloudxr`, the XR menu now has a "Connect a client to" section: the IPv4 address of every network interface that is up (except loopback), with its name, plus the service's port. This is what the Vision Pro client needs.
+- The port is read from the service's `server-port` property (`nv_cxr_service_get_int64_property`) instead of being hard-coded, because it depends on the profile (48010 for `apple-vision-pro`, 49100 for WebRTC) and on `NV_CXR_SERVER_PORT`. If the read fails, the menu says the port is unknown.
+- The addresses are collected once, when the service starts (`CloudXrService::findAddresses`, using `getifaddrs`).
+- Verified: with `--cloudxr-profile apple-vision-pro`, the service reports 48010, and `ss` shows the app listening on TCP 0.0.0.0:48010. The addresses match `ip -4 addr` (enp66s0f0 157.253.192.148, wlp195s0 157.253.113.156, tailscale0 100.116.114.43). The build has no warnings, `lp.py check` is ok for all files, the PDF was rebuilt, CLOUDXR.md was updated, and the installed copy was updated. The menu itself wasn't screenshotted, because synthetic input can't open it.
+
+### Follow-up (October 27th): first run with an Apple Vision Pro
+
+- The viewer streams to the Vision Pro. The steps are in CLOUDXR.md under "Connecting an Apple Vision Pro".
+- Two things stopped the first attempts:
+  - My launch was killed by the command runner's 2-minute timeout, so the service was gone. Long runs must be started with `run_in_background`.
+  - The headset client connects over TLS to 48322 only. The working Isaac Teleop setup has stunnel there, forwarding to the runtime on 127.0.0.1:48324, and ufw allows 48322/tcp and 47998-48012/udp from 157.253.113.0/24 only. Without stunnel the headset shows `0x800B1004`. The fix: the user runs the ufw + stunnel steps as root, and the viewer starts with `NV_CXR_SERVER_PORT=48324`.
+- Result: two sessions (3 and 4 minutes) with all streams connected, ended from the headset. The user confirmed that it runs.
+- Open: the XR menu shows the runtime's port (48324), not stunnel's 48322. A `--cloudxr-port` option and a menu hint for the TLS proxy would help.

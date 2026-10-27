@@ -67,6 +67,9 @@ XR_RUNTIME_JSON=/path/to/runtime.json ./build/UsdOptixViewer scene.usd --xr
 The new *XR* menu shows:
 - the runtime, the CloudXR client state, the session state, the headset, the
   GPU and the eye size;
+- with `--cloudxr`, where a client connects: the IPv4 address of each network
+  interface and the service's port, read from its `server-port` property
+  (48010 with the `apple-vision-pro` profile, or `NV_CXR_SERVER_PORT`);
 - the *World scale*, *Samples per frame* and *Mirror left eye in viewport*
   settings.
 
@@ -77,6 +80,32 @@ On the client side, nothing changes from the existing Isaac Teleop setup:
 - Quest: CloudXR.js with the `auto-webrtc` profile.
 - Network and TLS: the same firewall and stunnel setup.
 
+### Connecting an Apple Vision Pro (tested October 27th)
+
+The headset's CloudXRViewer connects over TLS to port 48322 (it has no port
+field). stunnel terminates TLS there and forwards to the runtime on
+127.0.0.1:48324, so the viewer must run its CloudXR service on 48324. Without
+stunnel the headset reports `0x800B1004`.
+
+1. Once per boot, as root (the same steps as `/srv/isaac-shared/cxr/cxr-start.sh`,
+   without starting its own runtime):
+   ```bash
+   ufw allow from 157.253.113.0/24 to any port 48322 proto tcp
+   ufw allow from 157.253.113.0/24 to any port 47998:48012 proto udp
+   pgrep -x stunnel || stunnel /etc/stunnel/cloudxr.conf
+   ```
+2. Start the viewer with the runtime on 48324:
+   ```bash
+   NV_CXR_SERVER_PORT=48324 ./build/UsdOptixViewer assets/textured_scene.usda --cloudxr \
+       --cloudxr-sdk /srv/isaac-shared/cxr/cloudxr-lovr-sample/build/cloudxr/CloudXR-6.2.1-Linux-sdk \
+       --cloudxr-profile apple-vision-pro --xr-mirror
+   ```
+3. In the headset, on the same Wi-Fi: CloudXRViewer, Zone *Manual IP Address*,
+   `157.253.113.156` (the address of `wlp195s0`, which the TLS certificate
+   names), *Connect*.
+
+The XR menu shows the runtime's port (48324 here), not stunnel's 48322.
+
 CloudXR can only serve one OpenXR app at a time. Run either the viewer or
 Isaac Sim, not both.
 
@@ -85,7 +114,7 @@ Isaac Sim, not both.
 | File | Change |
 |---|---|
 | `UsdOptixViewer/src/XrOutput.h/.cpp` | **New.** The OpenXR client: instance, system discovery (retried for `auto` profiles), Vulkan instance and device created through the runtime (`XR_KHR_vulkan_enable2`), session state machine, swapchains, shared eye buffers (Vulkan memory exported as an opaque file descriptor and imported into CUDA), and the frame loop (wait, locate views, copy buffer to image, end frame with a projection layer). It also builds each eye's camera: maps the XR axes (Y up, -Z forward, meters) to the scene, and handles asymmetric frusta. Vulkan is loaded at run time from `libvulkan.so.1`. |
-| `UsdOptixViewer/src/CloudXrService.h/.cpp` | **New.** Loads `libcloudxr.so` from a CloudXR SDK, sets the device profile, starts the service, points `XR_RUNTIME_JSON` at the SDK's manifest, and reports client connect/disconnect events. It restores SDL's SIGINT/SIGTERM handlers after the service installs its own, so that Ctrl+C ends the session before the service stops. |
+| `UsdOptixViewer/src/CloudXrService.h/.cpp` | **New.** Loads `libcloudxr.so` from a CloudXR SDK, sets the device profile, starts the service, points `XR_RUNTIME_JSON` at the SDK's manifest, reports client connect/disconnect events, and gives the addresses and port a client connects to. It restores SDL's SIGINT/SIGTERM handlers after the service installs its own, so that Ctrl+C ends the session before the service stops. |
 | `UsdOptixViewer/src/third_party/cxrServiceAPI.h` | **New.** NVIDIA's CloudXR service API header (Apache-2.0 OR MIT), copied from the CloudXR 6.2.1 SDK. The CloudXR libraries themselves are not in the repository. |
 | `UsdOptixViewer/CMakeLists.txt` | Fetches Vulkan-Headers v1.3.275 and OpenXR-SDK release-1.1.58 with `FetchContent`. The OpenXR loader is built static. Links `OpenXR::openxr_loader` and `Vulkan::Headers`, and defines `VK_NO_PROTOTYPES` and `XR_USE_GRAPHICS_API_VULKAN`. Adds the two new source files. |
 | `UsdOptixViewer/src/OptixRenderer.h/.cpp` | `init(error, deviceUuid)` picks the CUDA device by UUID. `release()` (the old destructor body, which now also resets every handle) allows a restart on another GPU. `deviceUuid()` is new. `renderView(camera, w, h, target, samples)` renders an eye into a device buffer with its own scratch buffers, so the desktop image and its accumulation are not touched. |
@@ -131,7 +160,11 @@ The all-users toolchain in `/opt/viztools` was not changed.
   - A second app on a single-session runtime: `XR_ERROR_LIMIT_REACHED`.
 - Desktop rendering is the same as on `main`.
 
-**Not verified:** the image in a real headset (Vision Pro or Quest), head
+**Verified with a Vision Pro (October 27th):** the viewer streamed to the
+headset through stunnel, with the color, alpha/depth, input and audio streams
+connected, in two sessions of 3 and 4 minutes.
+
+**Not verified:** the image in a Quest, head
 tracking with real motion, `auto-*` profiles with a real client connecting
 and disconnecting, and the renderer switching GPUs (here the runtime always
 picked the GPU CUDA was already using).

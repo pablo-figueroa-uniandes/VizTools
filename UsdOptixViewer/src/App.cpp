@@ -367,8 +367,20 @@ void App::drawMenuBar()
         {
             ImGui::Text("Runtime: %s", m_xr.runtimeName().c_str());
             if (m_cloudXr.running())
+            {
                 ImGui::Text("CloudXR %s in this process, client %s", m_cloudXr.version().c_str(),
                             m_xrClient ? "connected" : "not connected");
+                // what to type into the CloudXR client on the Vision Pro
+                ImGui::SeparatorText("Connect a client to");
+                if (m_cloudXr.addresses().empty())
+                    ImGui::TextDisabled("No network interface with an IPv4 address");
+                for (const std::string& address : m_cloudXr.addresses())
+                    ImGui::Text("%s", address.c_str());
+                if (m_cloudXr.serverPort())
+                    ImGui::Text("Port: %lld", static_cast<long long>(m_cloudXr.serverPort()));
+                else
+                    ImGui::TextDisabled("Port: unknown, see the service's messages on the console");
+            }
             ImGui::Text("State: %s", xrStatus().c_str());
             if (m_xr.eyeCount())
                 ImGui::Text("%s on %s, %u eyes of %u x %u", m_xr.systemName().c_str(), m_xr.gpuName().c_str(),

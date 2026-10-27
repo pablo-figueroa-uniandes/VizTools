@@ -60,7 +60,9 @@ private:
 // started before the OpenXR instance is created.
 #pragma once
 
+#include <cstdint>
 #include <string>
+#include <vector>
 
 #include "third_party/cxrServiceAPI.h"
 @ The SDK is found at run time, from a directory given on the command line,
@@ -85,27 +87,40 @@ void stop();
 bool running() const { return m_service != nullptr; }
 const std::string& version() const { return m_version; }
 
+// Where a client such as the Vision Pro app connects: the IPv4 address of
+// each network interface ("eth0 192.168.1.20") and the service's port
+// (0 if the service did not say).
+const std::vector<std::string>& addresses() const { return m_addresses; }
+int64_t serverPort() const { return m_serverPort; }
+
 // Drains the service's events; true while a CloudXR client is connected.
 bool clientConnected();
 @ The service is a handle into the loaded library. The library's functions
 are reached through pointers that [[start]] resolves with [[dlsym]]; their
-types come from the SDK header.
+types come from the SDK header. The addresses and the port are found once,
+when the service has started, by the private [[findAddresses]] and by asking
+the service.
 
 <<State and entry points of the CloudXR service>>=
+void findAddresses();
+
 void* m_library = nullptr;
 nv_cxr_service* m_service = nullptr;
 std::string m_version;
 bool m_clientConnected = false;
+std::vector<std::string> m_addresses;
+int64_t m_serverPort = 0;
 
 PFN_nv_cxr_get_runtime_version m_getRuntimeVersion = nullptr;
 PFN_nv_cxr_service_create m_create = nullptr;
 PFN_nv_cxr_service_set_string_property m_setStringProperty = nullptr;
+PFN_nv_cxr_service_get_int64_property m_getInt64Property = nullptr;
 PFN_nv_cxr_service_start m_start = nullptr;
 PFN_nv_cxr_service_stop m_stop = nullptr;
 PFN_nv_cxr_service_join m_join = nullptr;
 PFN_nv_cxr_service_destroy m_destroy = nullptr;
 PFN_nv_cxr_service_poll_event m_pollEvent = nullptr;
-@ The implementation file holds the five member functions, in the order of
+@ The implementation file holds the six member functions, in the order of
 the service's life.
 
 <<UsdOptixViewer/src/CloudXrService.cpp>>=
@@ -115,11 +130,14 @@ the service's life.
 
 <<Start the CloudXR service>>
 
+<<Find the network addresses of this machine>>
+
 <<Stop the CloudXR service>>
 
 <<Poll the events of the CloudXR service>>
 @ It needs the file-system library to build paths, the signal functions for
-a reason explained below, and [[dlopen]].
+a reason explained below, [[dlopen]], and the socket headers that list the
+network interfaces.
 
 <<Headers of the CloudXR service>>=
 #include "CloudXrService.h"
@@ -130,7 +148,10 @@ a reason explained below, and [[dlopen]].
 
 #include <csignal>
 
+#include <arpa/inet.h>
 #include <dlfcn.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 @ A running service must be stopped before the library that contains it is
 unloaded, and the destructor sees to it.
 
@@ -190,6 +211,7 @@ auto resolve = [&](auto& fn, const char* name) {
 };
 if (!resolve(m_getRuntimeVersion, "nv_cxr_get_runtime_version") || !resolve(m_create, "nv_cxr_service_create") ||
     !resolve(m_setStringProperty, "nv_cxr_service_set_string_property") ||
+    !resolve(m_getInt64Property, "nv_cxr_service_get_int64_property") ||
     !resolve(m_start, "nv_cxr_service_start") || !resolve(m_stop, "nv_cxr_service_stop") ||
     !resolve(m_join, "nv_cxr_service_join") || !resolve(m_destroy, "nv_cxr_service_destroy") ||
     !resolve(m_pollEvent, "nv_cxr_service_poll_event"))
@@ -242,6 +264,13 @@ SDK's manifest; the OpenXR loader reads this variable when the instance is
 created, and so the instance will be served by the CloudXR runtime library,
 which in turn connects to the service we have just started.
 
+Last, we collect what the user must type into the client on the headset: the
+machine's address and the service's port. The port is not a constant: it
+depends on the device profile (48010 for [[apple-vision-pro]], 49100 for the
+WebRTC profiles) and can be changed with the environment variable
+[[NV_CXR_SERVER_PORT]], so we ask the service for its [[server-port]]
+property rather than guess.
+
 <<Report a failed CloudXR start, or point OpenXR at the runtime>>=
 if (result != NV_CXR_SUCCESS)
 {
@@ -257,7 +286,38 @@ if (result != NV_CXR_SUCCESS)
 }
 // the OpenXR loader reads this when the instance is created
 setenv("XR_RUNTIME_JSON", manifest.c_str(), 1);
+
+// The port depends on the device profile (48010 for apple-vision-pro)
+// and on NV_CXR_SERVER_PORT, so ask the service.
+const std::string portName = "server-port";
+if (m_getInt64Property(m_service, portName.data(), portName.size(), &m_serverPort) != NV_CXR_SUCCESS)
+    m_serverPort = 0;
+findAddresses();
 return true;
+@ The service listens on every interface, and a machine often has several
+(wired, wireless, a VPN), of which only the user knows which one the headset
+can reach. So we list the IPv4 address of every interface that is up, except
+the loopback, each with its interface's name; [[getifaddrs]] returns them as a
+linked list, which we must free.
+
+<<Find the network addresses of this machine>>=
+void CloudXrService::findAddresses()
+{
+    m_addresses.clear();
+    ifaddrs* list = nullptr;
+    if (getifaddrs(&list) != 0)
+        return;
+    for (const ifaddrs* entry = list; entry; entry = entry->ifa_next)
+    {
+        if (!entry->ifa_addr || entry->ifa_addr->sa_family != AF_INET || (entry->ifa_flags & IFF_LOOPBACK) ||
+            !(entry->ifa_flags & IFF_UP))
+            continue;
+        char text[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(entry->ifa_addr)->sin_addr, text, sizeof(text));
+        m_addresses.push_back(std::string(entry->ifa_name) + " " + text);
+    }
+    freeifaddrs(list);
+}
 @ Stopping is [[stop]] followed by [[join]], which waits until the service
 has really ended, and then destroying it. [[stop]] is safe to call at any
 time, also on a half-started service.
@@ -278,6 +338,8 @@ void CloudXrService::stop()
         m_library = nullptr;
     }
     m_clientConnected = false;
+    m_addresses.clear();
+    m_serverPort = 0;
 }
 @ The service queues events: a client (the headset) connected or
 disconnected, an OpenXR application connected or disconnected. Only the

@@ -6,7 +6,10 @@
 
 #include <csignal>
 
+#include <arpa/inet.h>
 #include <dlfcn.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 CloudXrService::~CloudXrService()
 {
@@ -37,6 +40,7 @@ bool CloudXrService::start(const std::string& sdkDir, const std::string& deviceP
     };
     if (!resolve(m_getRuntimeVersion, "nv_cxr_get_runtime_version") || !resolve(m_create, "nv_cxr_service_create") ||
         !resolve(m_setStringProperty, "nv_cxr_service_set_string_property") ||
+        !resolve(m_getInt64Property, "nv_cxr_service_get_int64_property") ||
         !resolve(m_start, "nv_cxr_service_start") || !resolve(m_stop, "nv_cxr_service_stop") ||
         !resolve(m_join, "nv_cxr_service_join") || !resolve(m_destroy, "nv_cxr_service_destroy") ||
         !resolve(m_pollEvent, "nv_cxr_service_poll_event"))
@@ -80,7 +84,32 @@ bool CloudXrService::start(const std::string& sdkDir, const std::string& deviceP
     }
     // the OpenXR loader reads this when the instance is created
     setenv("XR_RUNTIME_JSON", manifest.c_str(), 1);
+
+    // The port depends on the device profile (48010 for apple-vision-pro)
+    // and on NV_CXR_SERVER_PORT, so ask the service.
+    const std::string portName = "server-port";
+    if (m_getInt64Property(m_service, portName.data(), portName.size(), &m_serverPort) != NV_CXR_SUCCESS)
+        m_serverPort = 0;
+    findAddresses();
     return true;
+}
+
+void CloudXrService::findAddresses()
+{
+    m_addresses.clear();
+    ifaddrs* list = nullptr;
+    if (getifaddrs(&list) != 0)
+        return;
+    for (const ifaddrs* entry = list; entry; entry = entry->ifa_next)
+    {
+        if (!entry->ifa_addr || entry->ifa_addr->sa_family != AF_INET || (entry->ifa_flags & IFF_LOOPBACK) ||
+            !(entry->ifa_flags & IFF_UP))
+            continue;
+        char text[INET_ADDRSTRLEN] = {};
+        inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(entry->ifa_addr)->sin_addr, text, sizeof(text));
+        m_addresses.push_back(std::string(entry->ifa_name) + " " + text);
+    }
+    freeifaddrs(list);
 }
 
 void CloudXrService::stop()
@@ -98,6 +127,8 @@ void CloudXrService::stop()
         m_library = nullptr;
     }
     m_clientConnected = false;
+    m_addresses.clear();
+    m_serverPort = 0;
 }
 
 bool CloudXrService::clientConnected()
