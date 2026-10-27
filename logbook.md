@@ -2,6 +2,19 @@
 
 This file describes the advances in visualization tools for this computer.
 
+## October 26th
+
+I read 13 lines of the literate output, and leave notes in the document. I ask claude to answer to the following prompt:
+
+create a document in Docs with the answers to the notes in LiterateP/UsdOptixViewer-literate.pdf. Enumerate the answers
+
+After reading the document, I will:
+- remove the use of ENTT, and leave the scene graph at the USD to handle all the work
+- carefully install for everybody that is possible (CUDA and Vulkan), and remove the local versions and their mentions in the cmake
+- keep the imgui just as source code, due the explanation
+
+However, try first the XRCloud server
+
 ## October 25th
 
 1. Add a way to change the viewpoint to one of the cameras in the USD file
@@ -209,3 +222,9 @@ Not supported yet: translucency, UsdTransform2d, UDIM, normal/roughness/metallic
 
 - `Docs/UsdOptixViewer-code.pptx` walks through the code in 24 slides: architecture, scene loading, OptiX, the application, USD cameras and the XR output. It has speaker notes and screenshots of the running viewer (`Docs/images/`), including the CloudXR left-eye mirror.
 - `Docs/make_slides.js` regenerates it with pptxgenjs (`npm install pptxgenjs@3.12.0`). It lives on the `cloudxr` branch, because it covers the XR code.
+
+### Follow-up (October 26th): answers to the PDF notes
+
+- `Docs/LiterateNotes-Answers.md` answers, in numbered order, the 13 notes added to `LiterateP/UsdOptixViewer-literate.pdf` (extracted from its PDF annotations).
+- Notes 1, 2, 3, 4, 7 and 8 ask for changes (delete the install script and `~/.local/opt`, install Vulkan/OpenXR/CloudXR for all users, prebuild ImGui, move the alignment prose). The document describes each change but none has been made yet.
+- Checked while writing: `sizeof(MaterialData)` is 192 bytes with no padding, and the GPUs are `sm_89` (relevant to the `compute_75` question).
