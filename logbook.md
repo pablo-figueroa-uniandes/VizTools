@@ -12,6 +12,7 @@ After reading the document, I will:
 - remove the use of ENTT, and leave the scene graph at the USD to handle all the work
 - carefully install for everybody that is possible (CUDA and Vulkan), and remove the local versions and their mentions in the cmake
 - keep the imgui just as source code, due the explanation
+- check the new version for ptx... and maybe use it instead of ptx.
 
 However, try first the XRCloud server
 
@@ -225,6 +226,6 @@ Not supported yet: translucency, UsdTransform2d, UDIM, normal/roughness/metallic
 
 ### Follow-up (October 26th): answers to the PDF notes
 
-- `Docs/LiterateNotes-Answers.md` answers, in numbered order, the 13 notes added to `LiterateP/UsdOptixViewer-literate.pdf` (extracted from its PDF annotations).
+- `Docs/LiterateNotes-Answers-261026.md` answers, in numbered order, the 13 notes added to `LiterateP/UsdOptixViewer-literate.pdf` (extracted from its PDF annotations).
 - Notes 1, 2, 3, 4, 7 and 8 ask for changes (delete the install script and `~/.local/opt`, install Vulkan/OpenXR/CloudXR for all users, prebuild ImGui, move the alignment prose). The document describes each change but none has been made yet.
 - Checked while writing: `sizeof(MaterialData)` is 192 bytes with no padding, and the GPUs are `sm_89` (relevant to the `compute_75` question).
