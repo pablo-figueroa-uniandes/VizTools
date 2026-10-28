@@ -40,7 +40,7 @@ Do the following tasks:
    - The CloudXR SDK 6.2.1 was copied from `/srv/isaac-shared/...` to `/opt/viztools/cloudxr-6.2.1`. Its license allows use by an educational institution's authorized users.
    - `/etc/profile.d/viztools.sh` now adds both prefixes and `CLOUDXR_SDK_DIR`. The old version is in `viztools.sh.bak-20261028`.
    - `--cloudxr-sdk` defaults to `$CLOUDXR_SDK_DIR`, then to `/opt/viztools/cloudxr-6.2.1` (`CLOUDXR_SDK_DEFAULT`).
-5. **`install_all_users.sh` deleted, along with its book part.** The CMake file only uses `/opt/viztools` and fails clearly without it. CUDA comes from `$CUDA_HOME` or `/usr/local/cuda-13.2`. There is no `~/.local/opt` fallback and no `FetchContent`. The per-user copies in `~/.local/opt` were left in place; nothing uses them, and they can be deleted.
+5. **`install_all_users.sh` deleted, along with its book part.** The CMake file only uses `/opt/viztools` and fails clearly without it. CUDA comes from `$CUDA_HOME` or `/usr/local/cuda-13.2`. There is no `~/.local/opt` fallback and no `FetchContent`. The per-user copies in `~/.local/opt` (cuda-13.2, usd-26.11, sdl3, entt-4.0.0, imgui-1.93.0, optix-9.1.0 and viztools-env.sh, about 7.3 GB) were deleted afterwards, at the user's request. The installed viewer's RUNPATH points only to `/opt/viztools` and `/usr/local/cuda-13.2`, and it still resolves every library. `~/.local/opt/UsdOptixViewer` is kept.
 6. **Literate book redone.** Four sub-agents rewrote the parts in parallel; I then merged and checked them.
    - The prose describes only the current code. There is no mention of EnTT, `FlatGeometry`, PTX, branches or history.
    - Code comments and strings about history were fixed too: the About box and the `kLightIntensity` comment.

@@ -55,7 +55,5 @@ a sample app (see `logbook.md`, October 24th, tasks 1 to 3).
 
 - Mouse interaction in the viewport was not automatically tested, because
   synthetic X input doesn't reach SDL on this display. Check it by hand.
-- Unused per-user tool copies in `~/.local/opt` (CUDA, USD, SDL3, ...) can be
-  deleted. Keep `~/.local/opt/UsdOptixViewer`.
 - Possible next features: translucency, USD lights (dome/area) and indirect
   diffuse lighting, texture transforms, animation playback.

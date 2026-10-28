@@ -23,8 +23,8 @@ live in `logbook.md`. Read it before starting a new task, and add a dated
 
 - Environment: `/etc/profile.d/viztools.sh` (login shells). In a fresh non-login
   shell, run `source /etc/profile.d/viztools.sh` first.
-- Older per-user copies remain in `~/.local/opt`; nothing uses them, and the
-  CMake file only looks in `/opt/viztools`. Don't build against them.
+- `~/.local/opt` holds only the installed viewer (`UsdOptixViewer`); the
+  per-user tool copies were deleted on October 28th.
 
 ## Permissions and boundaries
 
