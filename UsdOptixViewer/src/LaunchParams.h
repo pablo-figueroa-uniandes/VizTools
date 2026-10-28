@@ -58,6 +58,18 @@ struct MaterialData
     float  ior;
 };
 
+// One mesh, in its local space. Instance i of the IAS is mesh i, so
+// optixGetInstanceId() is both the index into LaunchParams::meshes and the
+// mesh id used for picking.
+struct MeshData
+{
+    const float3*       positions;
+    const float3*       normals;      // shading normal per vertex; null: flat
+    const float2*       uvs;          // st per vertex; null: no texture coordinates
+    const uint3*        indices;      // 3 vertices per triangle
+    const unsigned int* triMaterial;  // material of each triangle
+};
+
 struct LaunchParams
 {
     // output: colorBuffer = accumBuffer / (frameIndex + 1); meshIdBuffer is written on frame 0
@@ -75,14 +87,9 @@ struct LaunchParams
     unsigned int reflections;  // 0: reflect the sky only, without tracing rays
     unsigned int selectedMesh;
 
-    // scene: one GAS with all triangles in world space
+    // scene: an IAS with one instance (and one GAS) per mesh
     OptixTraversableHandle handle;
-    const float3*       vertices;
-    const uint3*        indices;
-    const unsigned int* triMesh;      // mesh id of each triangle
-    const unsigned int* triMaterial;  // material of each triangle
-    const float2*       triUVs;       // st of the 3 corners of each triangle
-    const float3*       triNormals;   // shading normal of the 3 corners (zero: flat)
+    const MeshData*     meshes;
     const MaterialData* materials;
     const cudaTextureObject_t* textures;
 };

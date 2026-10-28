@@ -31,13 +31,13 @@ private:
     void drawUi();
     void drawMenuBar();
     void drawHierarchy();
-    void drawHierarchyNode(entt::entity e);
+    void drawHierarchyNode(const pxr::UsdPrim& prim);
     void drawInspector();
     void drawViewport();
     void drawStatusBar();
     void drawPopups();
 
-    void select(entt::entity e, bool reveal);
+    void select(const pxr::SdfPath& path, bool reveal);
     void frameBounds(const float lo[3], const float hi[3]);
     void frameSelection();
     void updateFilter();
@@ -76,12 +76,13 @@ private:
     bool m_normalMaps = true;
     bool m_reflections = true;
 
-    entt::entity m_selected = entt::null;
+    using PathSet = std::unordered_set<pxr::SdfPath, pxr::SdfPath::Hash>;
+    pxr::SdfPath m_selected;  // empty: nothing selected
     bool m_revealSelection = false;
-    std::unordered_set<entt::entity> m_reveal;  // ancestors to open in the tree
+    PathSet m_reveal;  // ancestors to open in the tree
     char m_filter[128] = "";
     std::string m_appliedFilter;
-    std::unordered_set<entt::entity> m_visibleByFilter;
+    PathSet m_visibleByFilter;
 
     char m_pathInput[1024] = "";
     std::string m_error;

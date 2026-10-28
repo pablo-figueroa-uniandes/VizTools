@@ -14,7 +14,7 @@
 
 #include "Scene.h"
 
-extern const char g_devicePrograms[];
+extern const unsigned char g_devicePrograms[];
 extern const size_t g_devicePrograms_size;
 
 namespace {
@@ -117,6 +117,13 @@ void OptixRenderer::DeviceBuffer::free()
     size = 0;
 }
 
+void OptixRenderer::MeshBuffers::free()
+{
+    for (DeviceBuffer* b : {&positions, &normals, &uvs, &indices, &triMaterial, &gas})
+        b->free();
+    handle = 0;
+}
+
 // ---- OptixRenderer --------------------------------------------------------
 OptixRenderer::~OptixRenderer()
 {
@@ -128,11 +135,9 @@ void OptixRenderer::release()
     if (!m_context)
         return;
     cudaDeviceSynchronize();
-    freeTextures();
-    for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_vertices, &m_indices, &m_triMesh,
-                            &m_triMaterial, &m_triUVs, &m_triNormals, &m_materials, &m_gas, &m_colorBuffer,
-                            &m_accumBuffer, &m_meshIdBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds,
-                            &m_viewParams})
+    freeScene();
+    for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_colorBuffer, &m_accumBuffer,
+                            &m_meshIdBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds, &m_viewParams})
         b->free();
     optixPipelineDestroy(m_pipeline);
     optixProgramGroupDestroy(m_raygenPG);
@@ -216,7 +221,7 @@ void OptixRenderer::createPipeline()
     moduleOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
 
     OptixPipelineCompileOptions pipelineOptions = {};
-    pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
+    pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
     pipelineOptions.numPayloadValues = 6;
     pipelineOptions.numAttributeValues = 2;
     pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
@@ -225,8 +230,9 @@ void OptixRenderer::createPipeline()
 
     char log[2048];
     size_t logSize = sizeof(log);
-    check(optixModuleCreate(m_context, &moduleOptions, &pipelineOptions, g_devicePrograms, g_devicePrograms_size,
-                            log, &logSize, &m_module),
+    check(optixModuleCreate(m_context, &moduleOptions, &pipelineOptions,
+                            reinterpret_cast<const char*>(g_devicePrograms), g_devicePrograms_size, log, &logSize,
+                            &m_module),
           "optixModuleCreate");
 
     OptixProgramGroupOptions pgOptions = {};
@@ -263,7 +269,8 @@ void OptixRenderer::createPipeline()
     logSize = sizeof(log);
     check(optixPipelineCreate(m_context, &pipelineOptions, &linkOptions, groups, 4, log, &logSize, &m_pipeline),
           "optixPipelineCreate");
-    check(optixPipelineSetStackSizeFromCallDepths(m_pipeline, linkOptions.maxTraceDepth, 0, 0, 0, 1),
+    // traversable graph depth 2: IAS -> GAS
+    check(optixPipelineSetStackSizeFromCallDepths(m_pipeline, linkOptions.maxTraceDepth, 0, 0, 0, 2),
           "optixPipelineSetStackSizeFromCallDepths");
 }
 
@@ -293,19 +300,13 @@ void OptixRenderer::buildSbt()
     m_sbt.hitgroupRecordCount = RAY_TYPE_COUNT;
 }
 
-void OptixRenderer::setGeometry(const FlatGeometry& g)
+void OptixRenderer::setScene(const Scene& scene)
 {
     m_params.handle = 0;
     m_params.frameIndex = 0;
-    m_gas.free();
-    m_vertices.upload(g.vertices.data(), g.vertices.size() * sizeof(float));
-    m_indices.upload(g.indices.data(), g.indices.size() * sizeof(unsigned int));
-    m_triMesh.upload(g.triMesh.data(), g.triMesh.size() * sizeof(unsigned int));
-    m_triMaterial.upload(g.triMaterial.data(), g.triMaterial.size() * sizeof(unsigned int));
-    m_triUVs.upload(g.triUVs.data(), g.triUVs.size() * sizeof(float));
-    m_triNormals.upload(g.triNormals.data(), g.triNormals.size() * sizeof(float));
+    freeScene();
     std::vector<MaterialData> materials;
-    for (const Material& m : g.materials)
+    for (const Material& m : scene.materials())
     {
         auto f4 = [](const std::array<float, 4>& v) { return make_float4(v[0], v[1], v[2], v[3]); };
         auto f3 = [](const std::array<float, 3>& v) { return make_float3(v[0], v[1], v[2]); };
@@ -334,34 +335,68 @@ void OptixRenderer::setGeometry(const FlatGeometry& g)
         materials.push_back(d);
     }
     m_materials.upload(materials.data(), materials.size() * sizeof(MaterialData));
-    uploadTextures(g);
-    m_params.vertices = reinterpret_cast<const float3*>(m_vertices.ptr);
-    m_params.indices = reinterpret_cast<const uint3*>(m_indices.ptr);
-    m_params.triMesh = reinterpret_cast<const unsigned int*>(m_triMesh.ptr);
-    m_params.triMaterial = reinterpret_cast<const unsigned int*>(m_triMaterial.ptr);
-    m_params.triUVs = reinterpret_cast<const float2*>(m_triUVs.ptr);
-    m_params.triNormals = reinterpret_cast<const float3*>(m_triNormals.ptr);
+    uploadTextures(scene);
     m_params.materials = reinterpret_cast<const MaterialData*>(m_materials.ptr);
     m_params.textures = reinterpret_cast<const cudaTextureObject_t*>(m_textureTable.ptr);
-    if (g.empty())
+
+    // one GAS per mesh, in the mesh's own space
+    std::vector<MeshData> records;
+    std::vector<OptixInstance> instances;
+    for (const RenderMesh& mesh : scene.meshes())
+    {
+        MeshBuffers& b = m_meshes.emplace_back();
+        b.positions.upload(mesh.positions.data(), mesh.positions.size() * sizeof(float));
+        b.normals.upload(mesh.normals.data(), mesh.normals.size() * sizeof(float));
+        b.uvs.upload(mesh.uvs.data(), mesh.uvs.size() * sizeof(float));
+        b.indices.upload(mesh.indices.data(), mesh.indices.size() * sizeof(unsigned int));
+        b.triMaterial.upload(mesh.triMaterial.data(), mesh.triMaterial.size() * sizeof(unsigned int));
+        records.push_back({reinterpret_cast<const float3*>(b.positions.ptr),
+                           reinterpret_cast<const float3*>(b.normals.ptr), reinterpret_cast<const float2*>(b.uvs.ptr),
+                           reinterpret_cast<const uint3*>(b.indices.ptr),
+                           reinterpret_cast<const unsigned int*>(b.triMaterial.ptr)});
+
+        // any-hit stays enabled for alpha cutouts; it returns early for opaque materials
+        const unsigned int flags[] = {OPTIX_GEOMETRY_FLAG_NONE};
+        OptixBuildInput input = {};
+        input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
+        OptixBuildInputTriangleArray& tri = input.triangleArray;
+        tri.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
+        tri.vertexStrideInBytes = sizeof(float3);
+        tri.numVertices = unsigned(mesh.vertexCount());
+        tri.vertexBuffers = &b.positions.ptr;
+        tri.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
+        tri.indexStrideInBytes = sizeof(uint3);
+        tri.numIndexTriplets = unsigned(mesh.triangleCount());
+        tri.indexBuffer = b.indices.ptr;
+        tri.flags = flags;
+        tri.numSbtRecords = 1;
+        b.handle = buildAccel(input, b.gas);
+
+        OptixInstance instance = {};
+        std::copy(mesh.toWorld.begin(), mesh.toWorld.end(), instance.transform);
+        instance.instanceId = unsigned(instances.size());  // the mesh id
+        instance.visibilityMask = 255;
+        instance.sbtOffset = 0;
+        instance.flags = OPTIX_INSTANCE_FLAG_NONE;
+        instance.traversableHandle = b.handle;
+        instances.push_back(instance);
+    }
+    m_meshRecords.upload(records.data(), records.size() * sizeof(MeshData));
+    m_params.meshes = reinterpret_cast<const MeshData*>(m_meshRecords.ptr);
+    if (instances.empty())
         return;
 
-    // any-hit stays enabled for alpha cutouts; it returns early for opaque materials
-    const unsigned int flags[] = {OPTIX_GEOMETRY_FLAG_NONE};
+    // the IAS places every mesh in the world
+    m_instances.upload(instances.data(), instances.size() * sizeof(OptixInstance));
     OptixBuildInput input = {};
-    input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
-    OptixBuildInputTriangleArray& tri = input.triangleArray;
-    tri.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
-    tri.vertexStrideInBytes = sizeof(float3);
-    tri.numVertices = unsigned(g.vertices.size() / 3);
-    tri.vertexBuffers = &m_vertices.ptr;
-    tri.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
-    tri.indexStrideInBytes = sizeof(uint3);
-    tri.numIndexTriplets = unsigned(g.indices.size() / 3);
-    tri.indexBuffer = m_indices.ptr;
-    tri.flags = flags;
-    tri.numSbtRecords = 1;
+    input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
+    input.instanceArray.instances = m_instances.ptr;
+    input.instanceArray.numInstances = unsigned(instances.size());
+    m_params.handle = buildAccel(input, m_ias);
+}
 
+OptixTraversableHandle OptixRenderer::buildAccel(const OptixBuildInput& input, DeviceBuffer& output)
+{
     OptixAccelBuildOptions accelOptions = {};
     accelOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
     accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
@@ -370,18 +405,30 @@ void OptixRenderer::setGeometry(const FlatGeometry& g)
     check(optixAccelComputeMemoryUsage(m_context, &accelOptions, &input, 1, &sizes), "optixAccelComputeMemoryUsage");
     DeviceBuffer temp;
     temp.resize(sizes.tempSizeInBytes);
-    m_gas.resize(sizes.outputSizeInBytes);
-    check(optixAccelBuild(m_context, m_stream, &accelOptions, &input, 1, temp.ptr, temp.size, m_gas.ptr, m_gas.size,
-                          &m_params.handle, nullptr, 0),
+    output.resize(sizes.outputSizeInBytes);
+    OptixTraversableHandle handle = 0;
+    check(optixAccelBuild(m_context, m_stream, &accelOptions, &input, 1, temp.ptr, temp.size, output.ptr, output.size,
+                          &handle, nullptr, 0),
           "optixAccelBuild");
     check(cudaStreamSynchronize(m_stream), "accel build");
     temp.free();
+    return handle;
 }
 
-void OptixRenderer::uploadTextures(const FlatGeometry& g)
+void OptixRenderer::freeScene()
+{
+    for (MeshBuffers& b : m_meshes)
+        b.free();
+    m_meshes.clear();
+    for (DeviceBuffer* b : {&m_meshRecords, &m_instances, &m_ias, &m_materials})
+        b->free();
+    freeTextures();
+}
+
+void OptixRenderer::uploadTextures(const Scene& scene)
 {
     freeTextures();
-    for (const Texture& t : g.textures)
+    for (const Texture& t : scene.textures())
     {
         // full mip chain, down to 1x1
         const unsigned levels = 1u + unsigned(std::floor(std::log2(double(std::max(t.width, t.height)))));

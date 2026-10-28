@@ -100,13 +100,13 @@ void processEvent(const SDL_Event& event);
 void drawUi();
 void drawMenuBar();
 void drawHierarchy();
-void drawHierarchyNode(entt::entity e);
+void drawHierarchyNode(const pxr::UsdPrim& prim);
 void drawInspector();
 void drawViewport();
 void drawStatusBar();
 void drawPopups();
 
-void select(entt::entity e, bool reveal);
+void select(const pxr::SdfPath& path, bool reveal);
 void frameBounds(const float lo[3], const float hi[3]);
 void frameSelection();
 void updateFilter();
@@ -163,20 +163,25 @@ bool m_shadows = true;
 bool m_mipmaps = true;
 bool m_normalMaps = true;
 bool m_reflections = true;
-@ The selection is an EnTT entity, one of those created by the scene for each
-prim. When a prim is selected by clicking on the image, the tree must open
-all its ancestors so that it becomes visible; [[m_reveal]] holds them until the
+@ The selection is the USD path of a prim, and the empty path means that
+nothing is selected. A path is the natural name for a prim: it is what the
+stage hands out, what the command line and the inspector show, and it stays
+meaningful whatever the scene and the renderer derive from the stage. When a
+prim is selected by clicking on the image, the tree must open all its
+ancestors so that it becomes visible; [[m_reveal]] holds their paths until the
 tree has been drawn once. The filter of the tree keeps the text being typed,
 the text for which the filter was last computed, and the resulting set of
-entities to show.
+paths to show. Both sets are hash sets of paths, with the hash function that
+[[SdfPath]] provides.
 
 <<Selection and hierarchy filter state>>=
-entt::entity m_selected = entt::null;
+using PathSet = std::unordered_set<pxr::SdfPath, pxr::SdfPath::Hash>;
+pxr::SdfPath m_selected;  // empty: nothing selected
 bool m_revealSelection = false;
-std::unordered_set<entt::entity> m_reveal;  // ancestors to open in the tree
+PathSet m_reveal;  // ancestors to open in the tree
 char m_filter[128] = "";
 std::string m_appliedFilter;
-std::unordered_set<entt::entity> m_visibleByFilter;
+PathSet m_visibleByFilter;
 @ ImGui's text fields edit fixed character buffers in place, hence the
 [[char]] arrays. [[m_error]] holds a message to be shown in a modal popup; an
 empty string means there is none.
@@ -260,7 +265,7 @@ namespace {
 
 <<Draw one node of the hierarchy>>
 
-<<Select an entity>>
+<<Select a prim>>
 
 // ---- inspector ------------------------------------------------------------
 <<Draw the inspector>>
@@ -290,7 +295,8 @@ namespace {
 
 <<The XR output of the application>>
 @ Besides ImGui and its two back ends, the implementation needs a few pieces
-of OpenUSD for the inspector, and \lpfile{optix.h} only for the version number
+of OpenUSD for the inspector and the hierarchy (prim ranges walk the whole
+stage for the filter), and \lpfile{optix.h} only for the version number
 that the status bar and the About box display. The macro
 [[PXR_NAMESPACE_USING_DIRECTIVE]] brings OpenUSD's versioned namespace into
 scope, as everywhere else in the program.
@@ -310,6 +316,7 @@ scope, as everywhere else in the program.
 #include <pxr/base/tf/stringUtils.h>
 #include <pxr/usd/usd/attribute.h>
 #include <pxr/usd/usd/modelAPI.h>
+#include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usd/relationship.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <optix.h>
@@ -417,11 +424,10 @@ corresponding items of the View menu do; they make it easy to compare images
 with and without mipmaps, normal maps or traced reflections.
 
 The fourth, \texttt{--select}, selects a prim by its path and frames the
-camera on it. It exists mostly for testing: while this program was developed,
-synthetic mouse clicks sent to its window by \texttt{xdotool} never reached
-SDL on the development machine's display, so the only way to check the
-selection, the tree and the inspector from a script was to select a prim from
-the command line and take a screenshot. For the same reason
+camera on it. It exists mostly for testing: synthetic mouse clicks sent to
+the window by \texttt{xdotool} do not reach SDL on the development machine's
+display, so the way to check the selection, the tree and the inspector from a
+script is to select a prim from the command line and take a screenshot. For the same reason
 \texttt{--camera} looks through a USD camera given by its path, as the Camera
 menu does.
 
@@ -485,7 +491,7 @@ std::string error;
 m_rendererOk = m_renderer.init(error);
 if (!m_rendererOk)
     m_error = "OptiX initialization failed: " + error;
-@ The prim to select is looked up among the scene's entities by its USD path,
+@ The prim to select must exist on the stage, which we ask the stage itself,
 after checking that the string is a valid path at all (the constructor of
 [[SdfPath]] would complain loudly otherwise). Selecting with [[reveal]] set
 opens its ancestors in the tree, and [[frameSelection]] points the camera at
@@ -497,12 +503,11 @@ if (!file.empty())
 if (!selectPath.empty() && m_scene.loaded() && SdfPath::IsValidPathString(selectPath))
 {
     const SdfPath path(selectPath);
-    for (auto [e, info] : m_scene.registry().view<PrimInfo>().each())
-        if (info.path == path)
-        {
-            select(e, true);
-            frameSelection();
-        }
+    if (m_scene.stage()->GetPrimAtPath(path))
+    {
+        select(path, true);
+        frameSelection();
+    }
 }
 @ The camera comes last, because selecting a prim frames it with the orbit
 camera. A path that names no camera of the stage is reported in the error
@@ -560,19 +565,19 @@ void App::requestOpen(const std::string& path)
     m_pendingOpen = path;
 }
 @ Loading forgets everything that belonged to the previous stage: the camera
-we were looking through, the selection, the entities to reveal and the filter
+we were looking through, the selection, the prims to reveal and the filter
 of the tree. If the scene
 cannot open the file, its message is shown in the error popup. Otherwise the
 path is copied into the text field of the File menu (so that it can be edited
-and reloaded), the window title names the file, the flattened geometry is sent
-to the renderer, and the camera frames the whole stage.
+and reloaded), the window title names the file, the scene's meshes, materials
+and textures are sent to the renderer, and the camera frames the whole stage.
 
 <<Load a USD file into the scene and the renderer>>=
 void App::loadFile(const std::string& path)
 {
     std::string error;
     m_camera = -1;  // camera indices refer to the previous stage
-    m_selected = entt::null;
+    m_selected = SdfPath();
     m_reveal.clear();
     m_appliedFilter.clear();
     m_filter[0] = '\0';
@@ -585,11 +590,10 @@ void App::loadFile(const std::string& path)
     SDL_SetWindowTitle(m_window, ("USD OptiX Viewer - " + path).c_str());
     if (m_rendererOk)
     {
-        m_renderer.setGeometry(m_scene.geometry());
+        m_renderer.setScene(m_scene);
         m_renderer.setSelectedMesh(kNoMesh);
     }
-    const FlatGeometry& g = m_scene.geometry();
-    frameBounds(g.boundsMin, g.boundsMax);
+    frameBounds(m_scene.boundsMin(), m_scene.boundsMax());
 }
 @ The dialog is SDL's portable one; it uses the desktop's native dialog where
 there is one. Its callback receives a list of chosen files, an empty list if
@@ -744,7 +748,7 @@ if (!ImGui::GetIO().WantTextInput)
     if (ImGui::IsKeyPressed(ImGuiKey_F))
         frameSelection();
     if (ImGui::IsKeyPressed(ImGuiKey_Escape))
-        select(entt::null, false);
+        select(SdfPath(), false);
     if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_O))
         openFileDialog();
 }
@@ -803,11 +807,8 @@ while we look through one.
 if (ImGui::BeginMenu("View"))
 {
     if (ImGui::MenuItem("Frame all"))
-    {
-        const FlatGeometry& g = m_scene.geometry();
-        frameBounds(g.boundsMin, g.boundsMax);
-    }
-    if (ImGui::MenuItem("Frame selection", "F", false, m_selected != entt::null))
+        frameBounds(m_scene.boundsMin(), m_scene.boundsMax());
+    if (ImGui::MenuItem("Frame selection", "F", false, !m_selected.IsEmpty()))
         frameSelection();
     if (ImGui::MenuItem("Shadows", nullptr, &m_shadows))
         m_needsRender = true;
@@ -899,12 +900,19 @@ if (ImGui::BeginMenu("Help"))
         m_showAbout = true;
     ImGui::EndMenu();
 }
-@* The hierarchy. The left panel shows the prims of the stage as a tree. The
-scene has already mirrored the stage into the EnTT registry: every prim is an
-entity with a [[PrimInfo]] component (path, name, type) and a [[Hierarchy]]
-component (parent and children). The tree is drawn by a recursive function,
-starting from the children of the pseudo-root, the invisible prim at the top
-of every USD stage.
+@* The hierarchy. The left panel shows the prims of the stage as a tree. A
+USD stage already is a scene graph: every prim knows its name, its type, its
+parent and its children, so the tree is read straight from the stage, with no
+copy of the hierarchy to build and keep in step. The tree is drawn by a
+recursive function, starting from the children of the pseudo-root, the
+invisible prim at the top of every USD stage.
+
+Children are listed with the predicate [[UsdTraverseInstanceProxies]]. The
+prims below an instance live in a shared prototype and are not children of
+the instance in the ordinary sense; the predicate presents them as
+\emph{instance proxies}, prims with paths of their own under the instance.
+That is how the scene sees them too, since it draws the meshes of instances,
+so a mesh picked in the image can always be found in the tree.
 
 Above the tree, a text field filters the prims by name. The filter is
 recomputed only when its text changes (<<Recompute the hierarchy filter>>), not
@@ -926,7 +934,7 @@ void App::drawHierarchy()
     updateFilter();
     ImGui::Separator();
     ImGui::BeginChild("tree");
-    for (entt::entity child : m_scene.registry().get<Hierarchy>(m_scene.root()).children)
+    for (const UsdPrim& child : m_scene.stage()->GetPseudoRoot().GetFilteredChildren(UsdTraverseInstanceProxies()))
         drawHierarchyNode(child);
     m_revealSelection = false;
     ImGui::EndChild();
@@ -934,11 +942,16 @@ void App::drawHierarchy()
 }
 @ A filtered tree must show not only the prims whose names match, but also
 every ancestor of each match; otherwise the matches would have no branch to
-hang from. So for each matching entity we walk up the parents, inserting each
-one in the set. The walk stops at the root, or as soon as an insertion fails:
-an entity already in the set has had its own ancestors inserted before, by the
-same walk, so there is no point in climbing further. The total work is
-therefore proportional to the number of prims, however many of them match.
+hang from. Unlike the drawing of the tree, the filter must look at every
+prim, open or not, so it walks the whole stage with a [[UsdPrimRange]], again
+including instance proxies. For each matching prim we walk up its path,
+inserting each prefix in the set; a path's parent is just the path with its
+last element removed, so no lookup on the stage is needed. The walk stops at
+the absolute root path, which stands for the pseudo-root and is never drawn,
+or as soon as an insertion fails: a path already in the set has had its own
+ancestors inserted before, by the same walk, so there is no point in climbing
+further. The total work is therefore proportional to the number of prims,
+however many of them match.
 
 <<Recompute the hierarchy filter>>=
 void App::updateFilter()
@@ -949,13 +962,12 @@ void App::updateFilter()
     m_visibleByFilter.clear();
     if (m_appliedFilter.empty())
         return;
-    entt::registry& reg = m_scene.registry();
-    for (auto [e, info] : reg.view<PrimInfo>().each())
+    for (const UsdPrim& prim : UsdPrimRange::Stage(m_scene.stage(), UsdTraverseInstanceProxies()))
     {
-        if (!containsCaseInsensitive(info.name, m_appliedFilter))
+        if (!containsCaseInsensitive(prim.GetName().GetString(), m_appliedFilter))
             continue;
-        for (entt::entity a = e; a != entt::null && m_visibleByFilter.insert(a).second;)
-            a = reg.get<Hierarchy>(a).parent;
+        for (SdfPath a = prim.GetPath(); a != SdfPath::AbsoluteRootPath() && m_visibleByFilter.insert(a).second;)
+            a = a.GetParentPath();
     }
 }
 @ Names are compared without regard to case, which is what one expects of a
@@ -971,28 +983,37 @@ bool containsCaseInsensitive(const std::string& text, const std::string& pattern
                return std::tolower(static_cast<unsigned char>(a)) == std::tolower(static_cast<unsigned char>(b));
            }) != text.end();
 }
-@ Drawing a node. A node is skipped if a filter is active and the node is not
-in its set. Otherwise we compute the flags of ImGui's tree node: it opens
-only with its arrow or a double click (so that a single click on the label
-selects), it spans the width of the panel, it is a leaf if it has no children,
-and it is highlighted if it is the selection.
+@ Drawing a node. A node is skipped if a filter is active and its path is not
+in the filter's set. Otherwise we ask the stage for the prim's children; the
+answer is a lazy range, so finding out whether there are any costs one step.
+Then we compute the flags of ImGui's tree node: it opens only with its arrow
+or a double click (so that a single click on the label selects), it spans the
+width of the panel, it is a leaf if it has no children, and it is highlighted
+if it is the selection.
+
+The recursion descends only into open nodes. A large stage may have hundreds
+of thousands of prims, but a person looks at a few dozen rows of the tree at
+a time; a closed node costs the same whatever lies beneath it, so drawing the
+tree takes time in proportion to what is shown, not to the size of the stage.
 
 <<Draw one node of the hierarchy>>=
-void App::drawHierarchyNode(entt::entity e)
+// The tree is drawn straight from the stage: USD already holds the hierarchy,
+// names and types. Only open nodes visit their children.
+void App::drawHierarchyNode(const UsdPrim& prim)
 {
-    if (!m_appliedFilter.empty() && !m_visibleByFilter.contains(e))
+    const SdfPath& path = prim.GetPath();
+    if (!m_appliedFilter.empty() && !m_visibleByFilter.contains(path))
         return;
-    entt::registry& reg = m_scene.registry();
-    const PrimInfo& info = reg.get<PrimInfo>(e);
-    const Hierarchy& h = reg.get<Hierarchy>(e);
+    const UsdPrimSiblingRange children = prim.GetFilteredChildren(UsdTraverseInstanceProxies());
+    const bool leaf = children.empty();
 
     <<Choose the flags of the tree node>>
 
     <<Draw the tree node and react to clicks>>
 
-    if (open && !h.children.empty())
+    if (open && !leaf)
     {
-        for (entt::entity child : h.children)
+        for (const UsdPrim& child : children)
             drawHierarchyNode(child);
         ImGui::TreePop();
     }
@@ -1010,19 +1031,19 @@ opened when it first appears, so that all matches can be seen; the condition
 <<Choose the flags of the tree node>>=
 ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
                            ImGuiTreeNodeFlags_SpanAvailWidth;
-if (h.children.empty())
+if (leaf)
     flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-if (e == m_selected)
+if (path == m_selected)
     flags |= ImGuiTreeNodeFlags_Selected;
-if (m_revealSelection && m_reveal.contains(e))
+if (m_revealSelection && m_reveal.contains(path))
     ImGui::SetNextItemOpen(true);
 if (!m_appliedFilter.empty())
     ImGui::SetNextItemOpen(true, ImGuiCond_Appearing);
-@ Prims that produced triangles for the renderer are drawn in light blue, so
-that the geometry stands out among transforms, scopes and materials. ImGui
-identifies tree nodes by an ID; prim names are not unique (many prims are
-called ``Mesh''), but the entity is, so we pass its integer value as a pointer
-ID and the name only as the label.
+@ Prims that produced triangles for the renderer, those for which the scene
+has a mesh, are drawn in light blue, so that the geometry stands out among
+transforms, scopes and materials. ImGui identifies tree nodes by an ID; prim
+names are not unique (many prims are called ``Mesh''), but paths are, so we
+pass the path's text as the ID and the name only as the label.
 
 A click on the label selects the prim, while a click on the arrow merely
 opens or closes the node; the function [[IsItemToggledOpen]] tells the two
@@ -1031,42 +1052,43 @@ scrolls the panel to the selected node. The type of the prim follows its name,
 in grey.
 
 <<Draw the tree node and react to clicks>>=
-const bool hasMesh = reg.all_of<MeshGeometry>(e);
+const bool hasMesh = m_scene.meshIndex(path) >= 0;
 if (hasMesh)
     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
-const bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(entt::to_integral(e))), flags,
-                                    "%s", info.name.c_str());
+const bool open = ImGui::TreeNodeEx(path.GetText(), flags, "%s", prim.GetName().GetText());
 if (hasMesh)
     ImGui::PopStyleColor();
 if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-    select(e, false);
-if (m_revealSelection && e == m_selected)
+    select(path, false);
+if (m_revealSelection && path == m_selected)
     ImGui::SetScrollHereY();
-if (!info.typeName.empty())
+if (!prim.GetTypeName().IsEmpty())
 {
     ImGui::SameLine();
-    ImGui::TextDisabled("%s", info.typeName.c_str());
+    ImGui::TextDisabled("%s", prim.GetTypeName().GetText());
 }
-@ Selecting an entity informs the renderer, which tints the selected mesh,
-and restarts the rendering. A selection made in the tree needs no revealing;
-one made by clicking on the image does, so in that case we collect the
-ancestors of the entity and raise [[m_revealSelection]]. The flag is lowered
-again at the end of the next drawing of the tree (<<Draw the hierarchy panel>>),
-so the forced opening and scrolling happen exactly once, and the user
-is free to fold the branches again.
+@ Selecting a prim informs the renderer, which tints the selected mesh if the
+prim has one, and restarts the rendering. The renderer knows meshes by their
+mesh id, which is the mesh's index in the scene, and [[meshIndex]] finds it
+for a path. A selection made in the tree needs no revealing; one made by
+clicking on the image does, so in that case we collect the paths of the
+prim's ancestors, up to but excluding the absolute root, and raise
+[[m_revealSelection]]. The flag is lowered again at the end of the next
+drawing of the tree (<<Draw the hierarchy panel>>), so the forced opening and
+scrolling happen exactly once, and the user is free to fold the branches
+again.
 
-<<Select an entity>>=
-void App::select(entt::entity e, bool reveal)
+<<Select a prim>>=
+void App::select(const SdfPath& path, bool reveal)
 {
-    m_selected = e;
-    entt::registry& reg = m_scene.registry();
-    const MeshGeometry* mesh = reg.valid(e) ? reg.try_get<MeshGeometry>(e) : nullptr;
-    m_renderer.setSelectedMesh(mesh ? mesh->meshId : kNoMesh);
+    m_selected = path;
+    const int mesh = m_scene.meshIndex(path);
+    m_renderer.setSelectedMesh(mesh >= 0 ? unsigned(mesh) : kNoMesh);
     m_needsRender = true;
     m_reveal.clear();
-    if (reveal && reg.valid(e))
+    if (reveal && !path.IsEmpty())
     {
-        for (entt::entity a = reg.get<Hierarchy>(e).parent; a != entt::null; a = reg.get<Hierarchy>(a).parent)
+        for (SdfPath a = path.GetParentPath(); a != SdfPath::AbsoluteRootPath() && !a.IsEmpty(); a = a.GetParentPath())
             m_reveal.insert(a);
         m_revealSelection = true;
     }
@@ -1075,13 +1097,14 @@ void App::select(entt::entity e, bool reveal)
 is selected, it describes the stage. For a prim it has three or four
 sections: the prim's identity, what the viewer made of it---a camera, or the
 geometry and material that the renderer draws---if anything, and a table of
-all its properties.
+all its properties. The prim comes from the stage by its path; an empty path
+asks for no prim at all.
 
 <<Draw the inspector>>=
 void App::drawInspector()
 {
     ImGui::Begin("Inspector", nullptr, kPanelFlags);
-    const UsdPrim prim = m_scene.prim(m_selected);
+    const UsdPrim prim = m_selected.IsEmpty() ? UsdPrim() : m_scene.stage()->GetPrimAtPath(m_selected);
     if (!prim)
     {
         <<Describe the stage when nothing is selected>>
@@ -1117,9 +1140,8 @@ if (m_scene.loaded())
         ImGui::Text("Time codes: %g - %g", stage->GetStartTimeCode(), stage->GetEndTimeCode());
     if (SdfPrimSpecHandle def = stage->GetRootLayer()->GetPrimAtPath(stage->GetDefaultPrim().GetPath()))
         ImGui::Text("Default prim: %s", def->GetName().c_str());
-    const FlatGeometry& g = m_scene.geometry();
-    ImGui::Text("Materials: %zu   Textures: %zu   Cameras: %zu", g.materials.size(), g.textures.size(),
-                m_scene.cameras().size());
+    ImGui::Text("Materials: %zu   Textures: %zu   Cameras: %zu", m_scene.materials().size(),
+                m_scene.textures().size(), m_scene.cameras().size());
     if (!m_scene.warnings().empty())
     {
         ImGui::SeparatorText("Warnings");
@@ -1171,37 +1193,49 @@ if (ImGui::BeginTable("prim", 2, ImGuiTableFlags_SizingStretchProp))
 vertical field of view or the size of an orthographic view, and the clipping
 range. The raw lens attributes are in the property table below. The button
 looks through the camera; it is disabled, and says so, when we already do.
+Whether the prim is a camera the scene understood is answered by
+[[cameraIndex]], which gives its index among the scene's cameras, or $-1$.
 
 <<Describe the camera and offer to look through it>>=
-if (const CameraView* view = m_scene.registry().try_get<CameraView>(m_selected))
+if (const int camera = m_scene.cameraIndex(m_selected); camera >= 0)
 {
-    const SceneCamera& c = m_scene.cameras()[view->index];
+    const SceneCamera& c = m_scene.cameras()[camera];
     ImGui::SeparatorText("Camera");
     if (c.orthographic)
         ImGui::Text("Orthographic, %g x %g units", 2.0f * c.halfWidth, 2.0f * c.halfHeight);
     else
         ImGui::Text("Perspective, vertical field of view %.1f deg", c.fovYDeg);
     ImGui::Text("Clipping range: %g - %g", c.clipNear, c.clipFar);
-    const bool active = m_camera == int(view->index);
+    const bool active = m_camera == camera;
     ImGui::BeginDisabled(active);
     if (ImGui::Button(active ? "Looking through this camera" : "Look through"))
-        lookThrough(int(view->index));
+        lookThrough(camera);
     ImGui::EndDisabled();
 }
-@ The second section exists only for prims that the scene turned into
-triangles, that is, entities with a [[MeshGeometry]] component. It shows what
-the \emph{renderer} sees, after the scene has resolved the bound material,
-which is often more useful than the raw attributes when an image looks wrong:
-the number of triangles, the material's path, and each of its inputs in turn.
-A button frames the prim.
+@ The next section exists only for prims that the scene turned into
+triangles, that is, prims for which [[meshIndex]] finds a [[RenderMesh]]. It
+shows what the \emph{renderer} sees, after the scene has resolved the bound
+material, which is often more useful than the raw attributes when an image
+looks wrong: the size of the mesh, the material's path, and each of its
+inputs in turn. A button frames the prim.
+
+The size is given in triangles and vertices, and with the number of triangle
+corners the vertices came from. The scene starts with one vertex per corner,
+since a corner may have a normal and texture coordinates of its own, and then
+welds corners that agree in everything; the two numbers show how much
+sharing the mesh allowed. A smooth, seamless mesh comes down to about one
+vertex per two triangles, while a mesh with flat shading or many texture seams
+keeps closer to three.
 
 <<Describe the rendered geometry and its material>>=
-if (const MeshGeometry* mesh = m_scene.registry().try_get<MeshGeometry>(m_selected))
+if (const int meshIndex = m_scene.meshIndex(m_selected); meshIndex >= 0)
 {
+    const RenderMesh* mesh = &m_scene.meshes()[meshIndex];
     ImGui::SeparatorText("Rendered geometry");
-    ImGui::Text("Triangles: %u", mesh->triangleCount);
-    const FlatGeometry& g = m_scene.geometry();
-    const Material& material = g.materials[mesh->material];
+    ImGui::Text("Triangles: %zu   Vertices: %zu (from %zu corners)", mesh->triangleCount(), mesh->vertexCount(),
+                mesh->corners);
+    const std::vector<Texture>& textures = m_scene.textures();
+    const Material& material = m_scene.materials()[mesh->material];
     ImGui::TextWrapped("Material: %s", material.name.c_str());
     <<Describe the diffuse color or texture>>
     <<Describe the normal map>>
@@ -1221,10 +1255,10 @@ with its inputs and picker disabled.
 <<Describe the diffuse color or texture>>=
 if (material.texture >= 0)
 {
-    const Texture& t = g.textures[material.texture];
+    const Texture& t = textures[material.texture];
     ImGui::TextWrapped("Diffuse texture: %s", t.path.c_str());
     ImGui::Text("  %d x %d, %s, uv set '%s'%s", t.width, t.height, t.srgb ? "sRGB" : "raw",
-                material.uvSet.c_str(), mesh->hasUVs ? "" : " (missing!)");
+                material.uvSet.c_str(), mesh->uvs.empty() ? " (missing!)" : "");
 }
 else
 {
@@ -1238,7 +1272,7 @@ flips the green channel (as many DirectX-style maps do) does it through them.
 <<Describe the normal map>>=
 if (material.normalTexture >= 0)
 {
-    const Texture& t = g.textures[material.normalTexture];
+    const Texture& t = textures[material.normalTexture];
     ImGui::TextWrapped("Normal map: %s", t.path.c_str());
     ImGui::Text("  %d x %d, %s, scale (%g, %g, %g), bias (%g, %g, %g)", t.width, t.height,
                 t.srgb ? "sRGB" : "raw", material.normalScale[0], material.normalScale[1],
@@ -1255,7 +1289,7 @@ show one or the other, followed by the index of refraction.
 auto scalarText = [&](const char* label, const ScalarInput& in) {
     if (in.texture >= 0)
         ImGui::TextWrapped("%s: texture channel %c of %s (x%g %+g)", label, "rgba"[in.channel],
-                           g.textures[in.texture].path.c_str(), in.scale, in.bias);
+                           textures[in.texture].path.c_str(), in.scale, in.bias);
     else
         ImGui::Text("%s: %g", label, in.value);
 };
@@ -1263,7 +1297,7 @@ scalarText("Roughness", material.roughness);
 if (material.specularWorkflow)
 {
     if (material.specularTexture >= 0)
-        ImGui::TextWrapped("Specular color: %s", g.textures[material.specularTexture].path.c_str());
+        ImGui::TextWrapped("Specular color: %s", textures[material.specularTexture].path.c_str());
     else
     {
         float color[3] = {material.specularColor[0], material.specularColor[1], material.specularColor[2]};
@@ -1499,7 +1533,7 @@ The field of view is that of the fitted window, $2\arctan h$.
 Two things cannot be carried over. The orbit camera has no roll, so a tilted
 camera straightens up. And it is always a pinhole: an orthographic view becomes
 a perspective one whose distance makes the visible height at the target the
-same, $d=h/	an(\phi/2)$.
+same, $d=h/\tan(\phi/2)$.
 
 <<Hand the view of a USD camera to the orbit camera>>=
 // Hands the view over to the orbit camera, which starts where the USD camera
@@ -1516,13 +1550,14 @@ void App::orbitFromUsdCamera()
     m_camera = -1;
     m_needsRender = true;
 
-    const FlatGeometry& g = m_scene.geometry();
+    const float* lo = m_scene.boundsMin();
+    const float* hi = m_scene.boundsMax();
     const float* f = c.forward.data();
     float depth = 0.0f, radius = 0.0f;
     for (int k = 0; k < 3; ++k)
     {
-        depth += (0.5f * (g.boundsMin[k] + g.boundsMax[k]) - c.eye[k]) * f[k];
-        radius += (g.boundsMax[k] - g.boundsMin[k]) * (g.boundsMax[k] - g.boundsMin[k]);
+        depth += (0.5f * (lo[k] + hi[k]) - c.eye[k]) * f[k];
+        radius += (hi[k] - lo[k]) * (hi[k] - lo[k]);
     }
     if (depth < 1e-3f)
         depth = std::max(0.5f * std::sqrt(radius), 1.0f);
@@ -1570,32 +1605,20 @@ void App::frameBounds(const float lo[3], const float hi[3])
     m_distance = 1.15f * radius / std::sin(0.5f * m_fovY * float(M_PI) / 180.0f);
     m_needsRender = true;
 }
-@ The bounds of a selected mesh are not stored anywhere, but they are cheap to
-compute: the scene recorded the range of triangles each mesh contributed to
-the flattened geometry, so we visit their vertices, already in world space.
-Without a selected mesh we frame the whole stage, whose bounds the scene
-computed while flattening it.
+@ The scene computes a world-space bounding box for every mesh, and one for
+the whole stage, when it reads the geometry. Framing the selection therefore
+needs only the selected prim's mesh, if it has one; without a selected mesh
+(nothing selected, or a prim such as a transform or a material) we frame the
+whole stage.
 
 <<Frame the selection>>=
 void App::frameSelection()
 {
-    const FlatGeometry& g = m_scene.geometry();
-    const MeshGeometry* mesh =
-        m_scene.registry().valid(m_selected) ? m_scene.registry().try_get<MeshGeometry>(m_selected) : nullptr;
-    if (!mesh)
-    {
-        frameBounds(g.boundsMin, g.boundsMax);
-        return;
-    }
-    float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
-    for (unsigned t = mesh->firstTriangle; t < mesh->firstTriangle + mesh->triangleCount; ++t)
-        for (int c = 0; c < 3; ++c)
-        {
-            const float* v = &g.vertices[3 * size_t(g.indices[3 * size_t(t) + c])];
-            for (int k = 0; k < 3; ++k)
-                lo[k] = std::min(lo[k], v[k]), hi[k] = std::max(hi[k], v[k]);
-        }
-    frameBounds(lo, hi);
+    const int mesh = m_scene.meshIndex(m_selected);
+    if (mesh < 0)
+        frameBounds(m_scene.boundsMin(), m_scene.boundsMax());
+    else
+        frameBounds(m_scene.meshes()[mesh].boundsMin, m_scene.meshes()[mesh].boundsMax);
 }
 @* The viewport. The middle panel shows the ray-traced image and turns mouse
 actions into camera motion and selection. It is also where rendering happens:
@@ -1747,8 +1770,10 @@ records the largest squared distance the mouse moved while the button was
 down, and we accept less than 16, that is, less than 4 units. Anything longer
 was an orbit, not a click. We also require that the renderer's buffer has the
 viewport's current width, so that pixel coordinates mean the same thing in
-both. The selection is revealed in the tree; a click on the background, which
-has no mesh, clears it.
+both. A mesh id is the mesh's index in the scene, and each mesh records the
+path of the prim it came from, so the id leads straight to the prim to
+select. The selection is revealed in the tree; a click on the background,
+whose id is no mesh's index, clears it.
 
 <<Pick the prim under a mouse click>>=
 // pick on click (left release without dragging)
@@ -1758,8 +1783,7 @@ if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxD
     const unsigned px = unsigned((io.MousePos.x - origin.x) * fbScale);
     const unsigned py = unsigned((io.MousePos.y - origin.y) * fbScale);
     const unsigned meshId = m_renderer.meshIdAt(px, py);
-    const FlatGeometry& g = m_scene.geometry();
-    select(meshId < g.meshEntity.size() ? g.meshEntity[meshId] : entt::null, true);
+    select(meshId < m_scene.meshes().size() ? m_scene.meshes()[meshId].path : SdfPath(), true);
 }
 @ When the viewport changes size, the renderer reallocates its buffers and we
 replace the SDL texture by one of the new size. The texture is a
@@ -1823,13 +1847,14 @@ if (mirroring)
 else if (m_texture)
     ImGui::GetWindowDrawList()->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(m_texture))), origin,
                                          ImVec2(origin.x + size.x, origin.y + size.y));
-if (m_scene.loaded() && m_scene.geometry().empty())
+if (m_scene.loaded() && m_scene.meshes().empty())
     ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x + 12, origin.y + 12), IM_COL32(220, 220, 220, 255),
                                         "This stage has no renderable geometry (Mesh, Cube, Sphere).");
 @* The status bar and the popups. The status bar is a one-line window at the
-bottom. It counts the prims (minus one, for the pseudo-root, which is an
-entity like the others but not a prim anyone wrote), the meshes, the triangles
-and the textures, names the camera in use, the OptiX version and the GPU, and shows the progress
+bottom. It counts the prims (instance proxies included, the pseudo-root not),
+the meshes, the triangles and the textures, as the scene counted them when it
+loaded the stage; it names the camera in use, the OptiX version and the GPU,
+and shows the progress
 of the rendering with the time of the last sample, followed by the state of
 the XR output when there is one. [[OPTIX_VERSION]] encodes
 version 9.1.0 as 90100, so we take it apart with divisions.
@@ -1838,12 +1863,11 @@ version 9.1.0 as 90100, so we take it apart with divisions.
 void App::drawStatusBar()
 {
     ImGui::Begin("Status", nullptr, kPanelFlags | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
-    const FlatGeometry& g = m_scene.geometry();
     ImGui::Text("%s  |  prims: %zu  meshes: %zu  triangles: %zu  textures: %zu  |  camera: %s  |  "
                 "OptiX %d.%d.%d on %s  |  samples %u/%u, %.2f ms%s",
                 m_scene.loaded() ? m_scene.filePath().c_str() : "no file",
-                m_scene.loaded() ? m_scene.registry().storage<PrimInfo>().size() - 1 : 0, g.meshEntity.size(),
-                g.indices.size() / 3, g.textures.size(), m_camera >= 0 ? m_scene.cameras()[m_camera].path.c_str() : "orbit",
+                m_scene.primCount(), m_scene.meshes().size(), m_scene.triangleCount(), m_scene.textures().size(),
+                m_camera >= 0 ? m_scene.cameras()[m_camera].path.c_str() : "orbit",
                 OPTIX_VERSION / 10000, (OPTIX_VERSION / 100) % 100, OPTIX_VERSION % 100,
                 m_renderer.deviceName().c_str(), m_renderer.samples(), kMaxSamples, m_renderer.lastRenderMs(),
                 m_xr.state() == XrOutput::State::Off ? "" : ("  |  XR: " + xrStatus()).c_str());
@@ -1880,7 +1904,7 @@ void App::drawPopups()
     {
         ImGui::Text("USD OptiX Viewer");
         ImGui::Separator();
-        ImGui::Text("OpenUSD scene loading, EnTT scene graph, OptiX %d ray tracing,", OPTIX_VERSION / 10000);
+        ImGui::Text("OpenUSD scene graph, meshoptimizer meshes, OptiX %d ray tracing,", OPTIX_VERSION / 10000);
         ImGui::Text("SDL3 windowing and Dear ImGui %s user interface.", IMGUI_VERSION);
         ImGui::Spacing();
         ImGui::TextDisabled("Left drag: orbit   Right/middle drag: pan   Wheel: zoom");
@@ -1917,10 +1941,17 @@ service of its own, started for example by NVIDIA's Isaac Teleop tools, which
 also set [[XR_RUNTIME_JSON]] so that OpenXR applications find it; then
 \texttt{--xr} is enough. Or the viewer runs the CloudXR runtime itself, from
 the libraries of a CloudXR SDK, with \texttt{--cloudxr}. The SDK's directory
-comes from \texttt{--cloudxr-sdk} or from the environment variable
-[[CLOUDXR_SDK_DIR]]. Either way the OpenXR instance is created next; a
-failure leaves the viewer working on the desktop, with the reason in the
-error popup.
+comes from \texttt{--cloudxr-sdk}, failing that from the environment variable
+[[CLOUDXR_SDK_DIR]], and failing that from [[CLOUDXR_SDK_DEFAULT]], a string
+literal that the build defines (<<Choose the default CloudXR SDK>>). By
+default it names the SDK installed for all users with the other tools,
+\lpfile{/opt/viztools/cloudxr-6.2.1}, so that on this machine
+\texttt{--cloudxr} alone is enough. The most specific
+setting wins: a command line can point at another SDK for one run, and the
+environment for a whole shell session. Only a build configured without a
+default can end up with no directory at all. Either way the OpenXR instance
+is created next; a failure leaves the viewer working on the desktop, with the
+reason in the error popup.
 
 <<Start the XR output>>=
 // --cloudxr runs the CloudXR runtime in this process; --xr alone uses the
@@ -1931,8 +1962,11 @@ void App::startXr(bool cloudXr, std::string sdkDir, const std::string& profile)
     std::string error;
     if (cloudXr)
     {
+        // the option, then the environment, then the SDK installed with the tools
         if (sdkDir.empty() && std::getenv("CLOUDXR_SDK_DIR"))
             sdkDir = std::getenv("CLOUDXR_SDK_DIR");
+        if (sdkDir.empty())
+            sdkDir = CLOUDXR_SDK_DEFAULT;
         if (sdkDir.empty())
         {
             m_error = "--cloudxr needs the CloudXR SDK directory: --cloudxr-sdk DIR or CLOUDXR_SDK_DIR.";
@@ -2059,10 +2093,9 @@ bool App::useRendererOn(const std::array<unsigned char, 16>& uuid, std::string& 
     if (!m_rendererOk)
         return false;
     if (m_scene.loaded())
-        m_renderer.setGeometry(m_scene.geometry());
-    entt::registry& reg = m_scene.registry();
-    const MeshGeometry* mesh = reg.valid(m_selected) ? reg.try_get<MeshGeometry>(m_selected) : nullptr;
-    m_renderer.setSelectedMesh(mesh ? mesh->meshId : kNoMesh);
+        m_renderer.setScene(m_scene);
+    const int mesh = m_scene.meshIndex(m_selected);
+    m_renderer.setSelectedMesh(mesh >= 0 ? unsigned(mesh) : kNoMesh);
     m_needsRender = true;  // the viewport also resizes the new image
     return true;
 }

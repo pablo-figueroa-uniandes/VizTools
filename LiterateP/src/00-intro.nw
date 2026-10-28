@@ -1,20 +1,20 @@
 @** Introduction. UsdOptixViewer is a small, complete viewer for scenes
 described in Pixar's Universal Scene Description (USD). It opens a stage, shows
 its prims as a tree, lets the reader inspect every attribute, and draws the
-geometry with a ray tracer that runs on NVIDIA's OptiX engine. The program was
-written to exercise, in one place, a set of tools installed on a workstation:
-CUDA and OptiX for ray tracing, SDL3 for the window and input, Dear ImGui for
-the user interface, EnTT for the scene graph, and OpenUSD for reading scenes.
-This edition, on the \texttt{cloudxr} branch of the repository, can also send
+geometry with a ray tracer that runs on NVIDIA's OptiX engine. It can also send
 the view in stereo to a headset through OpenXR, and in particular through
-NVIDIA CloudXR, which streams it over the network.
+NVIDIA CloudXR, which streams it over the network. The program was written to
+exercise, in one place, a set of tools installed on a workstation: CUDA and
+OptiX for ray tracing, SDL3 for the window and input, Dear ImGui for the user
+interface, OpenUSD for reading scenes, meshoptimizer for preparing meshes, and
+OpenXR for the headset.
 
 This document \emph{is} the program. Following Donald Knuth's \emph{Literate
 Programming} (1984), the code is presented in the order in which it is best
 understood by a human reader, not in the order a compiler wants it. Each piece
 of code lives in a numbered \emph{section}, together with the prose that
 explains it. A tool, \texttt{lp.py}, \emph{tangles} the sections back into the
-seventeen source files of the program, and \emph{weaves} them into the book you
+sixteen source files of the program, and \emph{weaves} them into the book you
 are reading.
 
 @ The rendering is progressive. While the reader does not touch anything, the
@@ -48,15 +48,17 @@ their mathematical symbols: $\ne$ for \texttt{!=}, $\le$ and $\ge$ for
 build system to the pixels on the screen:
 \begin{itemize}
 \item \emph{The build system} compiles the C++ code, turns the OptiX programs
-  into PTX and embeds them in the executable.
+  into OptiX-IR and embeds them in the executable.
 \item \emph{Shared parameters} define the one structure that the CPU fills in
   and the GPU reads, \lpfile{LaunchParams.h}.
-\item \emph{The scene} reads a USD stage, mirrors its prims into an EnTT
-  registry, resolves materials and textures, and flattens all geometry into
-  arrays of world-space triangles.
-\item \emph{The renderer} creates the OptiX pipeline, builds the acceleration
-  structure, uploads the textures with their mipmaps, and launches the ray
-  tracing.
+\item \emph{The scene} reads a USD stage, which serves directly as the scene
+  graph, resolves materials and textures, and turns every renderable prim into
+  one indexed triangle mesh in the prim's local space, welded with
+  meshoptimizer.
+\item \emph{The renderer} creates the OptiX pipeline, builds one geometry
+  acceleration structure per mesh and an instance acceleration structure that
+  places them in the world, uploads the textures with their mipmaps, and
+  launches the ray tracing.
 \item \emph{The device programs} run on the GPU: ray generation, shading,
   shadows, reflections and alpha cutouts.
 \item \emph{The application} ties everything together with SDL3 and Dear ImGui:
@@ -65,8 +67,6 @@ build system to the pixels on the screen:
 \item \emph{The XR output} talks to an OpenXR runtime through Vulkan, shares
   the eye images between Vulkan and CUDA, and can run the CloudXR runtime
   inside the program.
-\item \emph{Installation for all users} shows the script that moved the tools
-  to a system-wide location.
 \end{itemize}
 The third-party image decoder \lpfile{stb\_image.h}, about eight thousand lines
 by Sean Barrett, is used as it comes and is not part of this book; nor is

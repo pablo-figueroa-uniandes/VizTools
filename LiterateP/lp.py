@@ -53,7 +53,6 @@ COVERED = [
     "UsdOptixViewer/src/App.cpp",
     "UsdOptixViewer/src/main.cpp",
     "UsdOptixViewer/src/StbImage.cpp",
-    "install_all_users.sh",
 ]
 
 SECTION_RE = re.compile(r"^@(\*{0,2})(?:\s|$)(.*)$")

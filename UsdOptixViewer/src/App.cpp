@@ -12,6 +12,7 @@
 #include <pxr/base/tf/stringUtils.h>
 #include <pxr/usd/usd/attribute.h>
 #include <pxr/usd/usd/modelAPI.h>
+#include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usd/relationship.h>
 #include <pxr/usd/usdGeom/metrics.h>
 #include <optix.h>
@@ -147,12 +148,11 @@ bool App::init(int argc, char** argv)
     if (!selectPath.empty() && m_scene.loaded() && SdfPath::IsValidPathString(selectPath))
     {
         const SdfPath path(selectPath);
-        for (auto [e, info] : m_scene.registry().view<PrimInfo>().each())
-            if (info.path == path)
-            {
-                select(e, true);
-                frameSelection();
-            }
+        if (m_scene.stage()->GetPrimAtPath(path))
+        {
+            select(path, true);
+            frameSelection();
+        }
     }
     if (!cameraPath.empty())
     {
@@ -177,7 +177,7 @@ void App::loadFile(const std::string& path)
 {
     std::string error;
     m_camera = -1;  // camera indices refer to the previous stage
-    m_selected = entt::null;
+    m_selected = SdfPath();
     m_reveal.clear();
     m_appliedFilter.clear();
     m_filter[0] = '\0';
@@ -190,11 +190,10 @@ void App::loadFile(const std::string& path)
     SDL_SetWindowTitle(m_window, ("USD OptiX Viewer - " + path).c_str());
     if (m_rendererOk)
     {
-        m_renderer.setGeometry(m_scene.geometry());
+        m_renderer.setScene(m_scene);
         m_renderer.setSelectedMesh(kNoMesh);
     }
-    const FlatGeometry& g = m_scene.geometry();
-    frameBounds(g.boundsMin, g.boundsMax);
+    frameBounds(m_scene.boundsMin(), m_scene.boundsMax());
 }
 
 void App::run()
@@ -289,7 +288,7 @@ void App::drawUi()
         if (ImGui::IsKeyPressed(ImGuiKey_F))
             frameSelection();
         if (ImGui::IsKeyPressed(ImGuiKey_Escape))
-            select(entt::null, false);
+            select(SdfPath(), false);
         if (ImGui::IsKeyDown(ImGuiMod_Ctrl) && ImGui::IsKeyPressed(ImGuiKey_O))
             openFileDialog();
     }
@@ -323,11 +322,8 @@ void App::drawMenuBar()
     if (ImGui::BeginMenu("View"))
     {
         if (ImGui::MenuItem("Frame all"))
-        {
-            const FlatGeometry& g = m_scene.geometry();
-            frameBounds(g.boundsMin, g.boundsMax);
-        }
-        if (ImGui::MenuItem("Frame selection", "F", false, m_selected != entt::null))
+            frameBounds(m_scene.boundsMin(), m_scene.boundsMax());
+        if (ImGui::MenuItem("Frame selection", "F", false, !m_selected.IsEmpty()))
             frameSelection();
         if (ImGui::MenuItem("Shadows", nullptr, &m_shadows))
             m_needsRender = true;
@@ -423,13 +419,12 @@ void App::updateFilter()
     m_visibleByFilter.clear();
     if (m_appliedFilter.empty())
         return;
-    entt::registry& reg = m_scene.registry();
-    for (auto [e, info] : reg.view<PrimInfo>().each())
+    for (const UsdPrim& prim : UsdPrimRange::Stage(m_scene.stage(), UsdTraverseInstanceProxies()))
     {
-        if (!containsCaseInsensitive(info.name, m_appliedFilter))
+        if (!containsCaseInsensitive(prim.GetName().GetString(), m_appliedFilter))
             continue;
-        for (entt::entity a = e; a != entt::null && m_visibleByFilter.insert(a).second;)
-            a = reg.get<Hierarchy>(a).parent;
+        for (SdfPath a = prim.GetPath(); a != SdfPath::AbsoluteRootPath() && m_visibleByFilter.insert(a).second;)
+            a = a.GetParentPath();
     }
 }
 
@@ -448,68 +443,68 @@ void App::drawHierarchy()
     updateFilter();
     ImGui::Separator();
     ImGui::BeginChild("tree");
-    for (entt::entity child : m_scene.registry().get<Hierarchy>(m_scene.root()).children)
+    for (const UsdPrim& child : m_scene.stage()->GetPseudoRoot().GetFilteredChildren(UsdTraverseInstanceProxies()))
         drawHierarchyNode(child);
     m_revealSelection = false;
     ImGui::EndChild();
     ImGui::End();
 }
 
-void App::drawHierarchyNode(entt::entity e)
+// The tree is drawn straight from the stage: USD already holds the hierarchy,
+// names and types. Only open nodes visit their children.
+void App::drawHierarchyNode(const UsdPrim& prim)
 {
-    if (!m_appliedFilter.empty() && !m_visibleByFilter.contains(e))
+    const SdfPath& path = prim.GetPath();
+    if (!m_appliedFilter.empty() && !m_visibleByFilter.contains(path))
         return;
-    entt::registry& reg = m_scene.registry();
-    const PrimInfo& info = reg.get<PrimInfo>(e);
-    const Hierarchy& h = reg.get<Hierarchy>(e);
+    const UsdPrimSiblingRange children = prim.GetFilteredChildren(UsdTraverseInstanceProxies());
+    const bool leaf = children.empty();
 
     ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow | ImGuiTreeNodeFlags_OpenOnDoubleClick |
                                ImGuiTreeNodeFlags_SpanAvailWidth;
-    if (h.children.empty())
+    if (leaf)
         flags |= ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
-    if (e == m_selected)
+    if (path == m_selected)
         flags |= ImGuiTreeNodeFlags_Selected;
-    if (m_revealSelection && m_reveal.contains(e))
+    if (m_revealSelection && m_reveal.contains(path))
         ImGui::SetNextItemOpen(true);
     if (!m_appliedFilter.empty())
         ImGui::SetNextItemOpen(true, ImGuiCond_Appearing);
 
-    const bool hasMesh = reg.all_of<MeshGeometry>(e);
+    const bool hasMesh = m_scene.meshIndex(path) >= 0;
     if (hasMesh)
         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.85f, 1.0f, 1.0f));
-    const bool open = ImGui::TreeNodeEx(reinterpret_cast<void*>(static_cast<uintptr_t>(entt::to_integral(e))), flags,
-                                        "%s", info.name.c_str());
+    const bool open = ImGui::TreeNodeEx(path.GetText(), flags, "%s", prim.GetName().GetText());
     if (hasMesh)
         ImGui::PopStyleColor();
     if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
-        select(e, false);
-    if (m_revealSelection && e == m_selected)
+        select(path, false);
+    if (m_revealSelection && path == m_selected)
         ImGui::SetScrollHereY();
-    if (!info.typeName.empty())
+    if (!prim.GetTypeName().IsEmpty())
     {
         ImGui::SameLine();
-        ImGui::TextDisabled("%s", info.typeName.c_str());
+        ImGui::TextDisabled("%s", prim.GetTypeName().GetText());
     }
 
-    if (open && !h.children.empty())
+    if (open && !leaf)
     {
-        for (entt::entity child : h.children)
+        for (const UsdPrim& child : children)
             drawHierarchyNode(child);
         ImGui::TreePop();
     }
 }
 
-void App::select(entt::entity e, bool reveal)
+void App::select(const SdfPath& path, bool reveal)
 {
-    m_selected = e;
-    entt::registry& reg = m_scene.registry();
-    const MeshGeometry* mesh = reg.valid(e) ? reg.try_get<MeshGeometry>(e) : nullptr;
-    m_renderer.setSelectedMesh(mesh ? mesh->meshId : kNoMesh);
+    m_selected = path;
+    const int mesh = m_scene.meshIndex(path);
+    m_renderer.setSelectedMesh(mesh >= 0 ? unsigned(mesh) : kNoMesh);
     m_needsRender = true;
     m_reveal.clear();
-    if (reveal && reg.valid(e))
+    if (reveal && !path.IsEmpty())
     {
-        for (entt::entity a = reg.get<Hierarchy>(e).parent; a != entt::null; a = reg.get<Hierarchy>(a).parent)
+        for (SdfPath a = path.GetParentPath(); a != SdfPath::AbsoluteRootPath() && !a.IsEmpty(); a = a.GetParentPath())
             m_reveal.insert(a);
         m_revealSelection = true;
     }
@@ -519,7 +514,7 @@ void App::select(entt::entity e, bool reveal)
 void App::drawInspector()
 {
     ImGui::Begin("Inspector", nullptr, kPanelFlags);
-    const UsdPrim prim = m_scene.prim(m_selected);
+    const UsdPrim prim = m_selected.IsEmpty() ? UsdPrim() : m_scene.stage()->GetPrimAtPath(m_selected);
     if (!prim)
     {
         if (m_scene.loaded())
@@ -533,9 +528,8 @@ void App::drawInspector()
                 ImGui::Text("Time codes: %g - %g", stage->GetStartTimeCode(), stage->GetEndTimeCode());
             if (SdfPrimSpecHandle def = stage->GetRootLayer()->GetPrimAtPath(stage->GetDefaultPrim().GetPath()))
                 ImGui::Text("Default prim: %s", def->GetName().c_str());
-            const FlatGeometry& g = m_scene.geometry();
-            ImGui::Text("Materials: %zu   Textures: %zu   Cameras: %zu", g.materials.size(), g.textures.size(),
-                        m_scene.cameras().size());
+            ImGui::Text("Materials: %zu   Textures: %zu   Cameras: %zu", m_scene.materials().size(),
+                        m_scene.textures().size(), m_scene.cameras().size());
             if (!m_scene.warnings().empty())
             {
                 ImGui::SeparatorText("Warnings");
@@ -581,35 +575,37 @@ void App::drawInspector()
         ImGui::EndTable();
     }
 
-    if (const CameraView* view = m_scene.registry().try_get<CameraView>(m_selected))
+    if (const int camera = m_scene.cameraIndex(m_selected); camera >= 0)
     {
-        const SceneCamera& c = m_scene.cameras()[view->index];
+        const SceneCamera& c = m_scene.cameras()[camera];
         ImGui::SeparatorText("Camera");
         if (c.orthographic)
             ImGui::Text("Orthographic, %g x %g units", 2.0f * c.halfWidth, 2.0f * c.halfHeight);
         else
             ImGui::Text("Perspective, vertical field of view %.1f deg", c.fovYDeg);
         ImGui::Text("Clipping range: %g - %g", c.clipNear, c.clipFar);
-        const bool active = m_camera == int(view->index);
+        const bool active = m_camera == camera;
         ImGui::BeginDisabled(active);
         if (ImGui::Button(active ? "Looking through this camera" : "Look through"))
-            lookThrough(int(view->index));
+            lookThrough(camera);
         ImGui::EndDisabled();
     }
 
-    if (const MeshGeometry* mesh = m_scene.registry().try_get<MeshGeometry>(m_selected))
+    if (const int meshIndex = m_scene.meshIndex(m_selected); meshIndex >= 0)
     {
+        const RenderMesh* mesh = &m_scene.meshes()[meshIndex];
         ImGui::SeparatorText("Rendered geometry");
-        ImGui::Text("Triangles: %u", mesh->triangleCount);
-        const FlatGeometry& g = m_scene.geometry();
-        const Material& material = g.materials[mesh->material];
+        ImGui::Text("Triangles: %zu   Vertices: %zu (from %zu corners)", mesh->triangleCount(), mesh->vertexCount(),
+                    mesh->corners);
+        const std::vector<Texture>& textures = m_scene.textures();
+        const Material& material = m_scene.materials()[mesh->material];
         ImGui::TextWrapped("Material: %s", material.name.c_str());
         if (material.texture >= 0)
         {
-            const Texture& t = g.textures[material.texture];
+            const Texture& t = textures[material.texture];
             ImGui::TextWrapped("Diffuse texture: %s", t.path.c_str());
             ImGui::Text("  %d x %d, %s, uv set '%s'%s", t.width, t.height, t.srgb ? "sRGB" : "raw",
-                        material.uvSet.c_str(), mesh->hasUVs ? "" : " (missing!)");
+                        material.uvSet.c_str(), mesh->uvs.empty() ? " (missing!)" : "");
         }
         else
         {
@@ -618,7 +614,7 @@ void App::drawInspector()
         }
         if (material.normalTexture >= 0)
         {
-            const Texture& t = g.textures[material.normalTexture];
+            const Texture& t = textures[material.normalTexture];
             ImGui::TextWrapped("Normal map: %s", t.path.c_str());
             ImGui::Text("  %d x %d, %s, scale (%g, %g, %g), bias (%g, %g, %g)", t.width, t.height,
                         t.srgb ? "sRGB" : "raw", material.normalScale[0], material.normalScale[1],
@@ -628,7 +624,7 @@ void App::drawInspector()
         auto scalarText = [&](const char* label, const ScalarInput& in) {
             if (in.texture >= 0)
                 ImGui::TextWrapped("%s: texture channel %c of %s (x%g %+g)", label, "rgba"[in.channel],
-                                   g.textures[in.texture].path.c_str(), in.scale, in.bias);
+                                   textures[in.texture].path.c_str(), in.scale, in.bias);
             else
                 ImGui::Text("%s: %g", label, in.value);
         };
@@ -636,7 +632,7 @@ void App::drawInspector()
         if (material.specularWorkflow)
         {
             if (material.specularTexture >= 0)
-                ImGui::TextWrapped("Specular color: %s", g.textures[material.specularTexture].path.c_str());
+                ImGui::TextWrapped("Specular color: %s", textures[material.specularTexture].path.c_str());
             else
             {
                 float color[3] = {material.specularColor[0], material.specularColor[1], material.specularColor[2]};
@@ -800,13 +796,14 @@ void App::orbitFromUsdCamera()
     m_camera = -1;
     m_needsRender = true;
 
-    const FlatGeometry& g = m_scene.geometry();
+    const float* lo = m_scene.boundsMin();
+    const float* hi = m_scene.boundsMax();
     const float* f = c.forward.data();
     float depth = 0.0f, radius = 0.0f;
     for (int k = 0; k < 3; ++k)
     {
-        depth += (0.5f * (g.boundsMin[k] + g.boundsMax[k]) - c.eye[k]) * f[k];
-        radius += (g.boundsMax[k] - g.boundsMin[k]) * (g.boundsMax[k] - g.boundsMin[k]);
+        depth += (0.5f * (lo[k] + hi[k]) - c.eye[k]) * f[k];
+        radius += (hi[k] - lo[k]) * (hi[k] - lo[k]);
     }
     if (depth < 1e-3f)
         depth = std::max(0.5f * std::sqrt(radius), 1.0f);
@@ -843,23 +840,11 @@ void App::frameBounds(const float lo[3], const float hi[3])
 
 void App::frameSelection()
 {
-    const FlatGeometry& g = m_scene.geometry();
-    const MeshGeometry* mesh =
-        m_scene.registry().valid(m_selected) ? m_scene.registry().try_get<MeshGeometry>(m_selected) : nullptr;
-    if (!mesh)
-    {
-        frameBounds(g.boundsMin, g.boundsMax);
-        return;
-    }
-    float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
-    for (unsigned t = mesh->firstTriangle; t < mesh->firstTriangle + mesh->triangleCount; ++t)
-        for (int c = 0; c < 3; ++c)
-        {
-            const float* v = &g.vertices[3 * size_t(g.indices[3 * size_t(t) + c])];
-            for (int k = 0; k < 3; ++k)
-                lo[k] = std::min(lo[k], v[k]), hi[k] = std::max(hi[k], v[k]);
-        }
-    frameBounds(lo, hi);
+    const int mesh = m_scene.meshIndex(m_selected);
+    if (mesh < 0)
+        frameBounds(m_scene.boundsMin(), m_scene.boundsMax());
+    else
+        frameBounds(m_scene.meshes()[mesh].boundsMin, m_scene.meshes()[mesh].boundsMax);
 }
 
 void App::drawViewport()
@@ -927,8 +912,7 @@ void App::drawViewport()
         const unsigned px = unsigned((io.MousePos.x - origin.x) * fbScale);
         const unsigned py = unsigned((io.MousePos.y - origin.y) * fbScale);
         const unsigned meshId = m_renderer.meshIdAt(px, py);
-        const FlatGeometry& g = m_scene.geometry();
-        select(meshId < g.meshEntity.size() ? g.meshEntity[meshId] : entt::null, true);
+        select(meshId < m_scene.meshes().size() ? m_scene.meshes()[meshId].path : SdfPath(), true);
     }
 
     if (w != m_renderer.width() || h != m_renderer.height())
@@ -965,7 +949,7 @@ void App::drawViewport()
     else if (m_texture)
         ImGui::GetWindowDrawList()->AddImage(ImTextureRef(ImTextureID(reinterpret_cast<intptr_t>(m_texture))), origin,
                                              ImVec2(origin.x + size.x, origin.y + size.y));
-    if (m_scene.loaded() && m_scene.geometry().empty())
+    if (m_scene.loaded() && m_scene.meshes().empty())
         ImGui::GetWindowDrawList()->AddText(ImVec2(origin.x + 12, origin.y + 12), IM_COL32(220, 220, 220, 255),
                                             "This stage has no renderable geometry (Mesh, Cube, Sphere).");
     ImGui::End();
@@ -974,12 +958,11 @@ void App::drawViewport()
 void App::drawStatusBar()
 {
     ImGui::Begin("Status", nullptr, kPanelFlags | ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoScrollbar);
-    const FlatGeometry& g = m_scene.geometry();
     ImGui::Text("%s  |  prims: %zu  meshes: %zu  triangles: %zu  textures: %zu  |  camera: %s  |  "
                 "OptiX %d.%d.%d on %s  |  samples %u/%u, %.2f ms%s",
                 m_scene.loaded() ? m_scene.filePath().c_str() : "no file",
-                m_scene.loaded() ? m_scene.registry().storage<PrimInfo>().size() - 1 : 0, g.meshEntity.size(),
-                g.indices.size() / 3, g.textures.size(), m_camera >= 0 ? m_scene.cameras()[m_camera].path.c_str() : "orbit",
+                m_scene.primCount(), m_scene.meshes().size(), m_scene.triangleCount(), m_scene.textures().size(),
+                m_camera >= 0 ? m_scene.cameras()[m_camera].path.c_str() : "orbit",
                 OPTIX_VERSION / 10000, (OPTIX_VERSION / 100) % 100, OPTIX_VERSION % 100,
                 m_renderer.deviceName().c_str(), m_renderer.samples(), kMaxSamples, m_renderer.lastRenderMs(),
                 m_xr.state() == XrOutput::State::Off ? "" : ("  |  XR: " + xrStatus()).c_str());
@@ -1010,7 +993,7 @@ void App::drawPopups()
     {
         ImGui::Text("USD OptiX Viewer");
         ImGui::Separator();
-        ImGui::Text("OpenUSD scene loading, EnTT scene graph, OptiX %d ray tracing,", OPTIX_VERSION / 10000);
+        ImGui::Text("OpenUSD scene graph, meshoptimizer meshes, OptiX %d ray tracing,", OPTIX_VERSION / 10000);
         ImGui::Text("SDL3 windowing and Dear ImGui %s user interface.", IMGUI_VERSION);
         ImGui::Spacing();
         ImGui::TextDisabled("Left drag: orbit   Right/middle drag: pan   Wheel: zoom");
@@ -1032,8 +1015,11 @@ void App::startXr(bool cloudXr, std::string sdkDir, const std::string& profile)
     std::string error;
     if (cloudXr)
     {
+        // the option, then the environment, then the SDK installed with the tools
         if (sdkDir.empty() && std::getenv("CLOUDXR_SDK_DIR"))
             sdkDir = std::getenv("CLOUDXR_SDK_DIR");
+        if (sdkDir.empty())
+            sdkDir = CLOUDXR_SDK_DEFAULT;
         if (sdkDir.empty())
         {
             m_error = "--cloudxr needs the CloudXR SDK directory: --cloudxr-sdk DIR or CLOUDXR_SDK_DIR.";
@@ -1125,10 +1111,9 @@ bool App::useRendererOn(const std::array<unsigned char, 16>& uuid, std::string& 
     if (!m_rendererOk)
         return false;
     if (m_scene.loaded())
-        m_renderer.setGeometry(m_scene.geometry());
-    entt::registry& reg = m_scene.registry();
-    const MeshGeometry* mesh = reg.valid(m_selected) ? reg.try_get<MeshGeometry>(m_selected) : nullptr;
-    m_renderer.setSelectedMesh(mesh ? mesh->meshId : kNoMesh);
+        m_renderer.setScene(m_scene);
+    const int mesh = m_scene.meshIndex(m_selected);
+    m_renderer.setSelectedMesh(mesh >= 0 ? unsigned(mesh) : kNoMesh);
     m_needsRender = true;  // the viewport also resizes the new image
     return true;
 }

@@ -1,8 +1,9 @@
 # VizTools
 
 Setup notes for a GPU visualization toolchain on Linux, and **UsdOptixViewer**,
-a sample application that uses all of it: an OpenUSD viewer with an EnTT scene
-graph, a Dear ImGui interface and an OptiX ray-traced viewport.
+a sample application that uses all of it: an OpenUSD viewer that uses the USD
+stage as its scene graph, with meshes prepared by meshoptimizer, a Dear ImGui
+interface and an OptiX ray-traced viewport.
 
 ## UsdOptixViewer
 
@@ -27,7 +28,7 @@ graph, a Dear ImGui interface and an OptiX ray-traced viewport.
   viewport and revealed in the tree), and frame selection.
 - **Cameras**: look through any USD camera (perspective or orthographic, with
   its clipping range) from the Camera menu or `--camera`.
-- **XR / CloudXR** (branch `cloudxr`): stereo output to a headset through
+- **XR / CloudXR**: stereo output to a headset through
   OpenXR, streamed with NVIDIA CloudXR. See [CLOUDXR.md](CLOUDXR.md).
 
 See [UsdOptixViewer/README.md](UsdOptixViewer/README.md) for the full feature
@@ -40,25 +41,30 @@ Tested on Ubuntu 24.04 with two NVIDIA RTX 6000 Ada GPUs (driver 595), X11.
 | Dependency | Tested version | Notes |
 |------------|----------------|-------|
 | NVIDIA driver | 595 | OptiX 9.1 needs R590 or newer |
-| CUDA toolkit | 13.2 | nvcc compiles the OptiX programs to PTX |
+| CUDA toolkit | 13.2 | nvcc compiles the OptiX programs to OptiX-IR |
 | OptiX SDK headers | 9.1.0 | from the SDK or [NVIDIA/optix-dev](https://github.com/NVIDIA/optix-dev) |
 | CMake | 3.28 | 3.24 or newer |
 | C++ compiler | g++ 11.5 | C++20 |
 | SDL3 | 3.4.18 | |
-| EnTT | 4.0.0 | |
+| meshoptimizer | 1.3 | welds and reorders the meshes |
+| OpenXR loader | 1.1.58 | static; XR output |
+| Vulkan headers | 1.3.275 | XR output; the loader is opened at run time |
+| NVIDIA CloudXR SDK | 6.2.1 | optional, at run time (`--cloudxr`) |
 | Dear ImGui | 1.93.0 | sources plus the SDL3 and SDL_Renderer backends |
 | OpenUSD | 26.11.1 | core libraries only; Python and imaging are not needed |
 
 ## Building
 
 The CMake project looks for the dependencies in `/opt/viztools` (the
-all-users layout described in [logbook.md](logbook.md)). It falls back to
-`~/.local/opt`. Other locations can be given explicitly:
+all-users layout described in [logbook.md](logbook.md)), CUDA in
+`/usr/local/cuda-13.2` and the Vulkan headers in the system. Other locations
+can be given explicitly:
 
 ```bash
 cd UsdOptixViewer
 cmake -S . -B build \
-    -DCMAKE_PREFIX_PATH="/path/to/sdl3;/path/to/entt;/path/to/usd" \
+    -DVIZ_PREFIX=/path/to/tools \
+    -DCMAKE_PREFIX_PATH="/path/to/sdl3;/path/to/usd;/path/to/meshoptimizer;/path/to/openxr" \
     -DOptiX_INSTALL_DIR=/path/to/optix \
     -DIMGUI_DIR=/path/to/imgui \
     -DCUDAToolkit_ROOT=/path/to/cuda \
@@ -74,10 +80,9 @@ cmake --install build
 | Path | Contents |
 |------|----------|
 | [UsdOptixViewer/](UsdOptixViewer/) | Viewer sources, CMake project and test scenes |
-| [LiterateP/](LiterateP/) | The whole program as a Knuth-style literate program: [PDF](LiterateP/UsdOptixViewer-literate.pdf) (143 pages), noweb sources, and the tool that tangles, checks and weaves them |
+| [LiterateP/](LiterateP/) | The whole program as a Knuth-style literate program: [PDF](LiterateP/UsdOptixViewer-literate.pdf) (149 pages), noweb sources, and the tool that tangles, checks and weaves them |
 | [logbook.md](logbook.md) | Task log: tool installation and every feature added, with how it was verified |
 | [summary.md](summary.md) | One-page summary of the work |
-| [install_all_users.sh](install_all_users.sh) | Script that moved the per-user tool installs to `/opt/viztools` and `/usr/local/cuda-13.2` |
 | [CLAUDE.md](CLAUDE.md) | Working notes for Claude Code sessions in this repository |
 
 ## License

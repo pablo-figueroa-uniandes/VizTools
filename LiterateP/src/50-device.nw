@@ -9,8 +9,15 @@ model follows UsdPreviewSurface: Lambertian diffuse reflection plus GGX
 specular reflection, lit by one directional light with hard shadows and by
 one glossy reflection bounce, under a simple gradient sky.
 
-The file is compiled to PTX by \texttt{nvcc} and embedded in the executable,
-as described in the build-system part.
+The file is compiled to OptiX-IR by \texttt{nvcc} and embedded in the
+executable, as described in the build-system part; OptiX compiles it for the
+actual GPU when the renderer creates its module.
+
+The scene the programs see has two levels. Every mesh keeps its triangles in
+its own local space, under a geometry acceleration structure, and an
+instance acceleration structure places the meshes in the world. Rays are
+traced in world space, so whenever a program needs the geometry of the hit
+it reads it in the mesh's space and transforms it to the world.
 
 <<UsdOptixViewer/src/devicePrograms.cu>>=
 <<Opening of the device programs file>>
@@ -20,6 +27,8 @@ as described in the build-system part.
 <<Random numbers on the device>>
 
 <<Payload helpers and the sky>>
+
+<<The triangle under the hit>>
 
 <<Texture sampling with ray differentials>>
 
@@ -44,11 +53,11 @@ launch. The [[extern "C"]] keeps the name from being mangled. As noted in the
 build system, \texttt{nvcc} remarks that this \textbf{extern} declaration is
 treated as a definition, which is precisely what we want.
 
-The light intensity looks arbitrary, and in a sense it is. The very first
-version of the viewer shaded a lit surface with $0.7\,\rho\,(n\cdot l)$, where
-$\rho$ is the diffuse color. A Lambertian surface reflects
-$\rho/\pi\cdot E\,(n\cdot l)$ under irradiance $E$, so choosing $E=0.7\pi$
-keeps that familiar brightness while the shading became physically based.
+The light intensity looks arbitrary, and in a sense it is. We want a lit
+diffuse surface of color $\rho$ to show the simple brightness
+$0.7\,\rho\,(n\cdot l)$, bright but well short of white. A Lambertian
+surface reflects $\rho/\pi\cdot E\,(n\cdot l)$ under irradiance $E$, so the
+irradiance is $E=0.7\pi$, and the shading stays physically based.
 
 <<Opening of the device programs file>>=
 // OptiX programs: progressive pinhole or orthographic camera, UsdPreviewSurface-style shading
@@ -61,7 +70,7 @@ keeps that familiar brightness while the shading became physically based.
 extern "C" __constant__ LaunchParams params;
 
 constexpr float kPi = 3.14159265358979f;
-constexpr float kLightIntensity = 0.7f * kPi;  // keeps the diffuse look of the earlier versions
+constexpr float kLightIntensity = 0.7f * kPi;  // a surface facing the light reflects 0.7 x its albedo
 @ CUDA's vector types come without arithmetic. The CUDA samples ship a header
 of operators, but it is not part of the toolkit, so we write the few we need.
 Every function is [[__forceinline__]]: they are tiny, and calls in OptiX
@@ -171,6 +180,69 @@ static __forceinline__ __device__ float3 sky(float3 dir)
 {
     return mix(make_float3(0.10f, 0.10f, 0.12f), make_float3(0.32f, 0.38f, 0.48f), 0.5f * (dir.y + 1.0f));
 }
+@* The hit triangle. Texture sampling, normal mapping and shading all need the
+triangle that was hit: its mesh, the indices of its three vertices, and the
+positions of its corners in world space. [[hitTriangle]] gathers them once,
+in a small record that the other functions receive by reference.
+
+<<The triangle under the hit>>=
+// ---- the hit triangle -----------------------------------------------------------
+// The triangle under the current hit: its mesh (the instance), its vertex
+// indices and its corners moved from the mesh's space to world space.
+<<The hit triangle record>>
+
+<<Gather the hit triangle in world space>>
+
+<<Read the texture coordinates of the corners>>
+@ [[prim]] is the index of the triangle within its mesh, [[tri]] its three
+vertex indices, and [[a]], [[b]], [[c]] its corners in world space.
+
+<<The hit triangle record>>=
+struct HitTriangle
+{
+    const MeshData* mesh;
+    unsigned int prim;
+    uint3 tri;
+    float3 a, b, c;
+};
+@ The renderer gives every instance the index of its mesh as instance id, so
+[[optixGetInstanceId]] leads straight to the mesh's [[MeshData]], and
+[[optixGetPrimitiveIndex]], the triangle's index within the build input of its
+GAS, to the triangle's entry in the mesh's index array.
+
+The positions are stored in the mesh's local space, but everything the
+programs compare them with (the ray, the camera, the light) is in world
+space. [[optixTransformPointFromObjectToWorldSpace]] applies the transform of
+the instance that was hit, the same one the traversal used, so the corners
+land exactly where the ray met the triangle. Transforming three points per
+hit is cheaper than it sounds, and it lets every mesh stay in device memory
+as the scene describes it.
+
+<<Gather the hit triangle in world space>>=
+static __forceinline__ __device__ HitTriangle hitTriangle()
+{
+    HitTriangle h;
+    h.mesh = &params.meshes[optixGetInstanceId()];
+    h.prim = optixGetPrimitiveIndex();
+    h.tri = h.mesh->indices[h.prim];
+    h.a = optixTransformPointFromObjectToWorldSpace(h.mesh->positions[h.tri.x]);
+    h.b = optixTransformPointFromObjectToWorldSpace(h.mesh->positions[h.tri.y]);
+    h.c = optixTransformPointFromObjectToWorldSpace(h.mesh->positions[h.tri.z]);
+    return h;
+}
+@ Texture coordinates need no transform: they live on the surface, not in
+space. A mesh without them has a null pointer in its record, and its corners
+all get $(0,0)$; such a mesh has no business sampling textures, and the zeros
+merely keep the arithmetic below well defined.
+
+<<Read the texture coordinates of the corners>>=
+static __forceinline__ __device__ void cornerUVs(const HitTriangle& h, float2 uv[3])
+{
+    const float2* uvs = h.mesh->uvs;
+    uv[0] = uvs ? uvs[h.tri.x] : make_float2(0.0f, 0.0f);
+    uv[1] = uvs ? uvs[h.tri.y] : make_float2(0.0f, 0.0f);
+    uv[2] = uvs ? uvs[h.tri.z] : make_float2(0.0f, 0.0f);
+}
 @* Texture sampling with ray differentials. A texture seen from afar covers
 many texels within one pixel; sampling it at a single point then gives the
 shimmering moir\'e patterns of aliasing. GPUs avoid this with \emph{mipmaps},
@@ -189,7 +261,7 @@ space those points are from the hit.
 // ray differentials: the rays through the neighbouring pixels are intersected
 // with the triangle's plane, and the offsets are converted to st gradients.
 // Shadow and reflection rays sample the finest level.
-static __forceinline__ __device__ float4 sampleTexture(int texture, unsigned int prim)
+static __forceinline__ __device__ float4 sampleTexture(int texture, const HitTriangle& h)
 {
     <<Interpolate the texture coordinates at the hit>>
 
@@ -203,7 +275,7 @@ static __forceinline__ __device__ float4 sampleTexture(int texture, unsigned int
 @ OptiX reports a triangle hit with barycentric coordinates $(\beta,\gamma)$:
 the hit point is $(1-\beta-\gamma)\,a+\beta\,b+\gamma\,c$, and any quantity
 stored at the corners is interpolated with the same weights. The texture
-coordinates $(s,t)$ are read from the per-corner array of the triangle.
+coordinates $(s,t)$ are interpolated from those of the three corners.
 
 The last line of <<Texture sampling with ray differentials>> deserves a word.
 USD places the origin of texture space at the bottom-left corner of the image,
@@ -219,7 +291,8 @@ because shadow rays have no fifth payload register.
 
 <<Interpolate the texture coordinates at the hit>>=
 const float2 bary = optixGetTriangleBarycentrics();
-const float2* uv = params.triUVs + 3 * prim;
+float2 uv[3];
+cornerUVs(h, uv);
 const float w0 = 1.0f - bary.x - bary.y;
 const float s = w0 * uv[0].x + bary.x * uv[1].x + bary.y * uv[2].x;
 const float t = w0 * uv[0].y + bary.x * uv[1].y + bary.y * uv[2].y;
@@ -235,15 +308,16 @@ of them into an offset in texture space.
 <<Turn a neighbouring ray into an st offset>>
 dx = gradient(oX, dirX);
 dy = gradient(oY, dirY);
-@ We need the triangle's corner $a$, its edges $e_1=b-a$ and $e_2=c-a$, the
-normal $n=e_1\times e_2$ of its plane (its length is irrelevant here), the
-ray origin $o$ and the hit point $p=o+t_{\max}\,d$, where $t_{\max}$ is the
-distance along the ray at which the closest hit was found.
+@ We need the triangle's edges $e_1=b-a$ and $e_2=c-a$, the normal
+$n=e_1\times e_2$ of its plane (its length is irrelevant here), the ray
+origin $o$ and the hit point $p=o+t_{\max}\,d$, where $t_{\max}$ is the
+distance along the ray at which the closest hit was found. All of them are in
+world space, the space of the camera from which the neighbouring rays are
+built: the corners come from [[hitTriangle]], and the ray is asked for its
+world-space origin and direction.
 
 <<Gather the triangle and the hit point>>=
-const uint3 tri = params.indices[prim];
-const float3 a = params.vertices[tri.x];
-const float3 e1 = params.vertices[tri.y] - a, e2 = params.vertices[tri.z] - a;
+const float3 e1 = h.b - h.a, e2 = h.c - h.a;
 const float3 n = cross(e1, e2);
 const float3 o = optixGetWorldRayOrigin();
 const float3 p = o + optixGetWorldRayDirection() * optixGetRayTmax();
@@ -320,11 +394,11 @@ static __forceinline__ __device__ float channel(float4 v, int c)
     return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w;
 }
 
-static __forceinline__ __device__ float evalScalar(const ScalarParam& p, unsigned int prim)
+static __forceinline__ __device__ float evalScalar(const ScalarParam& p, const HitTriangle& h)
 {
     if (p.texture < 0)
         return p.value;
-    return channel(sampleTexture(p.texture, prim), p.channel) * p.scale + p.bias;
+    return channel(sampleTexture(p.texture, h), p.channel) * p.scale + p.bias;
 }
 @* Normal mapping. A normal map stores, in each texel, a direction expressed
 in a frame attached to the surface: the first axis follows increasing $s$ (the
@@ -336,7 +410,7 @@ use it we must know that frame in world space.
 // Shading normal from a tangent-space normal map. The tangent frame comes from
 // the triangle's positions and st (tangent along +s, bitangent along +t, the
 // image's "up"), orthonormalized around the base normal `n`.
-static __forceinline__ __device__ float3 normalMapped(const MaterialData& mat, unsigned int prim, float3 n)
+static __forceinline__ __device__ float3 normalMapped(const MaterialData& mat, const HitTriangle& h, float3 n)
 {
     <<Build the tangent frame from positions and texture coordinates>>
 
@@ -357,13 +431,13 @@ flat one): the tangent loses its component along $n$ and is normalized, and
 the bitangent becomes $n\times t$. That cross product fixes the handedness,
 so we compare it with the true $B$ and flip it when the texture is mirrored on
 this triangle; without that test the bumps of a mirrored texture would appear
-lit from the wrong side.
+lit from the wrong side. The edges are those of the world-space corners, so
+the frame comes out in world space, like the normal~$n$ it is built around.
 
 <<Build the tangent frame from positions and texture coordinates>>=
-const uint3 tri = params.indices[prim];
-const float3 a = params.vertices[tri.x];
-const float3 e1 = params.vertices[tri.y] - a, e2 = params.vertices[tri.z] - a;
-const float2* uv = params.triUVs + 3 * prim;
+const float3 e1 = h.b - h.a, e2 = h.c - h.a;
+float2 uv[3];
+cornerUVs(h, uv);
 const float du1 = uv[1].x - uv[0].x, dv1 = uv[1].y - uv[0].y;
 const float du2 = uv[2].x - uv[0].x, dv2 = uv[2].y - uv[0].y;
 const float det = du1 * dv2 - du2 * dv1;
@@ -381,7 +455,7 @@ vector is expressed in the frame $(t,b,n)$ and normalized: filtering averages
 neighbouring normals, which shortens them.
 
 <<Decode the normal map and leave tangent space>>=
-const float4 texel = sampleTexture(mat.normalTexture, prim);
+const float4 texel = sampleTexture(mat.normalTexture, h);
 const float3 local = make_float3(texel.x * mat.normalScale.x + mat.normalBias.x,
                                  texel.y * mat.normalScale.y + mat.normalBias.y,
                                  texel.z * mat.normalScale.z + mat.normalBias.z);
@@ -509,8 +583,8 @@ whose noise falls as $1/\sqrt N$.
 
 The conversion to 8 bits is a deliberate approximation. Displays expect sRGB,
 whose transfer curve is close to a power of $1/2.2$; we use $1/2$, a square
-root, which is cheaper and was the look of the viewer from its very first
-version. Values above~1 are clamped by [[__saturatef]]. Finally, the mesh id is
+root, which is cheaper and slightly brightens the midtones, a look that suits
+an interactive viewer. Values above~1 are clamped by [[__saturatef]]. Finally, the mesh id is
 stored on frame~0 only, the frame the host reads back for picking.
 
 <<Accumulate the sample and write the pixel>>=
@@ -557,18 +631,21 @@ Because the same hit-group record serves both ray types, the test applies to
 shadow rays too: the shadow of a fern is the shape of its leaves, not of its
 quads. For materials without a cutout the program returns at once; the cost
 of calling it at all is the price of not splitting the geometry into opaque
-and cutout parts.
+and cutout parts. The material is looked up from the instance's mesh and the
+triangle's index before anything else, so that an opaque hit returns without
+transforming any corners; only a cutout needs the whole hit triangle, for
+its texture coordinates and its mipmap footprint.
 
 <<The any-hit program for alpha cutouts>>=
 // Alpha cutouts (UsdPreviewSurface opacity + opacityThreshold), for camera,
 // reflection and shadow rays.
 extern "C" __global__ void __anyhit__cutout()
 {
-    const unsigned int prim = optixGetPrimitiveIndex();
-    const MaterialData& mat = params.materials[params.triMaterial[prim]];
+    const MeshData& mesh = params.meshes[optixGetInstanceId()];
+    const MaterialData& mat = params.materials[mesh.triMaterial[optixGetPrimitiveIndex()]];
     if (mat.opacityTexture < 0)
         return;
-    const float4 texel = sampleTexture(mat.opacityTexture, prim);
+    const float4 texel = sampleTexture(mat.opacityTexture, hitTriangle());
     if (channel(texel, mat.opacityChannel) < mat.opacityThreshold)
         optixIgnoreIntersection();
 }
@@ -595,20 +672,19 @@ extern "C" __global__ void __closesthit__radiance()
 
     <<Return the color and the seed to the caller>>
 }
-@ The primitive index identifies the triangle in all the per-triangle arrays.
-The payload tells us how deep in the recursion we are and gives us the seed.
+@ The payload tells us how deep in the recursion we are and gives us the seed.
+[[hitTriangle]] supplies the mesh, the triangle and its world-space corners;
+the triangle's material comes from the mesh's per-triangle array. The
+instance id is also the mesh id, which the ray generation program stores for
+picking and which we compare with the selection.
 
 <<Fetch the hit triangle and its material>>=
-const unsigned int prim = optixGetPrimitiveIndex();
 const unsigned int depth = optixGetPayload_4();
 unsigned int seed = optixGetPayload_5();
-const uint3 tri = params.indices[prim];
-const float3 a = params.vertices[tri.x];
-const float3 b = params.vertices[tri.y];
-const float3 c = params.vertices[tri.z];
+const HitTriangle hit = hitTriangle();
 const float3 rayDir = optixGetWorldRayDirection();
-const unsigned int meshId = params.triMesh[prim];
-const MaterialData& mat = params.materials[params.triMaterial[prim]];
+const unsigned int meshId = optixGetInstanceId();
+const MaterialData& mat = params.materials[hit.mesh->triMaterial[hit.prim]];
 @ Normals. We keep two of them. The \emph{geometric} normal [[n]] is the true
 normal of the flat triangle; it decides which side of the surface we are on,
 where secondary rays start, and whether they would leave the surface. The
@@ -618,27 +694,46 @@ flat triangles looks curved and bumpy.
 
 <<Compute the geometric and shading normals>>=
 // geometric normal: outward for counter-clockwise triangles (see Scene.cpp)
-float3 n = normalize(cross(b - a, c - a));
+float3 n = normalize(cross(hit.b - hit.a, hit.c - hit.a));
 <<Interpolate the shading normal from the corner normals>>
 <<Perturb the shading normal with the normal map>>
 <<Turn both normals towards the viewer>>
 @ The scene code orders the corners of every triangle counter-clockwise as
-seen from outside, so $(b-a)\times(c-a)$ points outward. When the triangle has
-shading normals, they are interpolated with the barycentric coordinates and
-normalized. Should they disagree with the winding, as happens with meshes
+seen from outside, so $(b-a)\times(c-a)$ points outward. Since the corners
+are already in world space, so is this normal.
+
+When the mesh has shading normals, the three of the triangle's vertices are
+interpolated with the barycentric coordinates, in the mesh's own space, and
+the result is moved to world space. A normal cannot be moved like a point or
+a direction, though. If the instance transform has linear part $M$, a
+tangent $t$ of the surface becomes $Mt$, and the transformed normal $n'$ must
+stay perpendicular to it: $n'\cdot Mt=0$ whenever $n\cdot t=0$. That holds
+for $n'=(M^{-1})^{\mathsf T}n$, since then
+$n'\cdot Mt=n^{\mathsf T}M^{-1}Mt=n\cdot t$. For rotations and uniform scales
+the inverse transpose is proportional to $M$ itself, but a scene full of
+squashed spheres and stretched boxes would be shaded wrongly with $M$.
+[[optixTransformNormalFromObjectToWorldSpace]] applies the inverse transpose,
+taking the inverse that OptiX keeps for every instance, and the result is
+normalized, since neither interpolation nor transformation keeps unit length.
+
+A zero interpolated normal carries no direction, and the flat normal is kept.
+Should the shading normals disagree with the winding, as happens with meshes
 whose authored normals were made for the opposite orientation, the authored
 normals win and the geometric normal is turned around.
 
 <<Interpolate the shading normal from the corner normals>>=
 // interpolated shading normal (smooth/authored normals); they win if the winding disagrees
 float3 ns = n;
-const float3* cn = params.triNormals + 3 * prim;
-if (dot(cn[0], cn[0]) > 0.0f)
+if (const float3* cn = hit.mesh->normals)
 {
     const float2 bary = optixGetTriangleBarycentrics();
-    ns = normalize(cn[0] * (1.0f - bary.x - bary.y) + cn[1] * bary.x + cn[2] * bary.y);
-    if (dot(ns, n) < 0.0f)
-        n = n * -1.0f;
+    const float3 local = cn[hit.tri.x] * (1.0f - bary.x - bary.y) + cn[hit.tri.y] * bary.x + cn[hit.tri.z] * bary.y;
+    if (dot(local, local) > 0.0f)
+    {
+        ns = normalize(optixTransformNormalFromObjectToWorldSpace(local));
+        if (dot(ns, n) < 0.0f)
+            n = n * -1.0f;
+    }
 }
 @ The normal map, when present and enabled, bends the shading normal; the
 tangent frame is built around the smooth normal, not the flat one, so that
@@ -646,7 +741,7 @@ the bumps follow the curvature of the surface.
 
 <<Perturb the shading normal with the normal map>>=
 if (params.normalMaps && mat.normalTexture >= 0)
-    ns = normalMapped(mat, prim, ns);
+    ns = normalMapped(mat, hit, ns);
 @ All surfaces are two-sided: a ray that hits the back of a triangle sees it
 lit as if it were the front. So when the geometric normal points away from
 the viewer, both normals are flipped.
@@ -686,7 +781,7 @@ reflections of metals from the albedo, a selected metal turns orange too.
 float3 albedo = mat.color;
 if (mat.texture >= 0)
 {
-    const float4 texel = sampleTexture(mat.texture, prim);
+    const float4 texel = sampleTexture(mat.texture, hit);
     albedo = make_float3(texel.x * mat.texScale.x + mat.texBias.x, texel.y * mat.texScale.y + mat.texBias.y,
                          texel.z * mat.texScale.z + mat.texBias.z);
 }
@@ -703,14 +798,14 @@ and~1 blends the two. Roughness and metallic are clamped to $[0,1]$, since a
 texture's scale and bias could carry them outside.
 
 <<Derive the roughness and the reflectance at normal incidence>>=
-const float roughness = __saturatef(evalScalar(mat.roughness, prim));
+const float roughness = __saturatef(evalScalar(mat.roughness, hit));
 float3 f0, diffuse;
 if (mat.specularWorkflow)
 {
     f0 = mat.specColor;
     if (mat.specTexture >= 0)
     {
-        const float4 texel = sampleTexture(mat.specTexture, prim);
+        const float4 texel = sampleTexture(mat.specTexture, hit);
         f0 = make_float3(texel.x * mat.specScale.x + mat.specBias.x, texel.y * mat.specScale.y + mat.specBias.y,
                          texel.z * mat.specScale.z + mat.specBias.z);
     }
@@ -718,7 +813,7 @@ if (mat.specularWorkflow)
 }
 else
 {
-    const float metallic = __saturatef(evalScalar(mat.metallic, prim));
+    const float metallic = __saturatef(evalScalar(mat.metallic, hit));
     const float r0 = (mat.ior - 1.0f) / (mat.ior + 1.0f);
     f0 = mix(make_float3(r0 * r0, r0 * r0, r0 * r0), albedo, metallic);
     diffuse = albedo * (1.0f - metallic);
@@ -734,8 +829,7 @@ const float3 kd = make_float3(1.0f - fv.x, 1.0f - fv.y, 1.0f - fv.z);
 @ The viewer does not compute indirect diffuse lighting, light that bounces
 off one surface onto another. Without it, the faces turned away from the light
 would be black. A constant ambient term of 0.15 and a ``headlight'' term that
-grows with $n\cdot v$ keep them readable and give a sense of shape, as in
-the earliest versions of the viewer.
+grows with $n\cdot v$ keep them readable and give a sense of shape.
 
 <<Add the ambient fill>>=
 // ambient + headlight fill on the diffuse part (no indirect diffuse)
@@ -809,11 +903,11 @@ each pixel traces \emph{one} reflection ray in a random direction, chosen in
 proportion to the glossy lobe, and the progressive averaging of the ray
 generation program does the integration over the frames.
 
-The choice of the random direction matters a great deal. Our first attempt
-drew microfacet normals from $D$ alone; the result was correct on average,
-but rough metals glittered with noise even after 256 samples, because the
-weight of each sample, $F\,G\,(v\cdot h)/\bigl((n\cdot h)(n\cdot v)\bigr)$,
-becomes very large at grazing angles. We now sample the distribution of
+The choice of the random direction matters a great deal. Drawing microfacet
+normals from $D$ alone would be correct on average, but rough metals would
+glitter with noise even after 256 samples, because the weight of each
+sample, $F\,G\,(v\cdot h)/\bigl((n\cdot h)(n\cdot v)\bigr)$, becomes very
+large at grazing angles. We therefore sample the distribution of
 \emph{visible} normals, the facets that the viewer can actually see, following
 Eric Heitz's ``Sampling the GGX Distribution of Visible Normals'' (2018).
 
@@ -900,9 +994,9 @@ hit, three levels in all, which is the maximum trace depth the host declares
 for the pipeline. The reflection ray carries the seed, and receives it back
 advanced.
 
-One more problem remained after visible-normal sampling: rare, very bright
-pixels, the ``fireflies''. They appeared when a rough reflection happened to
-land on the highlight of the light on another, smooth surface. That highlight
+Visible-normal sampling leaves one problem: rare, very bright pixels, the
+``fireflies''. They appear when a rough reflection happens to land on the
+highlight of the light on another, smooth surface. That highlight
 is thousands of times brighter than its surroundings, so one such sample in
 256 still shows as a white dot. Any value above~2 is displayed as white
 anyway, so we clamp the brightest component of the reflected light to~2,

@@ -1,8 +1,8 @@
 @** The renderer. The renderer is the part of the program that talks to the
 GPU. It owns the CUDA stream, the OptiX device context and pipeline, the
-acceleration structure built over the scene's triangles, the textures, and the
+meshes and the acceleration structures built over them, the textures, and the
 buffers into which the device programs write their pixels. The rest of the
-program sees a small interface: hand it a [[FlatGeometry]], a camera and a few
+program sees a small interface: hand it a [[Scene]], a camera and a few
 switches, call [[render]], and read back an RGBA image together with the
 identity of the mesh under every pixel.
 
@@ -16,7 +16,7 @@ more than write one field.
 be copied: it owns GPU resources that must be released exactly once.
 
 <<UsdOptixViewer/src/OptixRenderer.h>>=
-// Ray traces a FlatGeometry with OptiX into a host-side RGBA image.
+// Ray traces a Scene with OptiX into a host-side RGBA image.
 #pragma once
 
 <<Headers and declarations of the renderer interface>>
@@ -33,6 +33,8 @@ public:
 private:
     <<The device buffer helper>>
 
+    <<The device buffers of one mesh>>
+
     <<Private steps of the renderer>>
 
     <<CUDA and OptiX handles of the renderer>>
@@ -43,8 +45,8 @@ private:
 };
 @ The header needs the CUDA types ([[CUdeviceptr]], [[CUstream]],
 [[cudaMipmappedArray_t]]), the OptiX handle types, and the shared parameter
-structure. The scene's [[FlatGeometry]] is only passed by reference, so a
-forward declaration is enough and the header does not drag in OpenUSD.
+structure. The [[Scene]] is only passed by reference, so a forward
+declaration is enough and the header does not drag in OpenUSD.
 
 <<Headers and declarations of the renderer interface>>=
 #include <array>
@@ -57,9 +59,9 @@ forward declaration is enough and the header does not drag in OpenUSD.
 
 #include "LaunchParams.h"
 
-struct FlatGeometry;
+class Scene;
 @ Construction does nothing; the real work happens in [[init]], which may
-fail (no GPU, an old driver, a PTX that does not compile) and reports the
+fail (no GPU, an old driver, device programs that do not compile for this GPU) and reports the
 reason as text instead of throwing, so that the application can show it in a
 dialog and keep running without a viewport.
 
@@ -82,7 +84,8 @@ bool init(std::string& error, const unsigned char* deviceUuid = nullptr);
 void release();
 const std::string& deviceName() const { return m_deviceName; }
 const std::array<unsigned char, 16>& deviceUuid() const { return m_deviceUuid; }
-@ The scene is replaced as a whole with [[setGeometry]]. The view is described
+@ The scene is replaced as a whole with [[setScene]], which uploads its meshes,
+materials and textures and builds the acceleration structures over them. The view is described
 by the image size, the camera and the light. There are two ways to set the
 camera: [[setCamera]] takes the orbit camera's eye, target and field of view,
 while [[setCameraView]] takes the more general description of a USD camera,
@@ -92,7 +95,8 @@ programs: shadows, mipmapped texture filtering, normal maps, traced
 reflections, and the mesh to highlight as selected.
 
 <<Renderer scene and view settings>>=
-void setGeometry(const FlatGeometry& geometry);
+// Uploads the meshes, materials and textures and builds the acceleration structures.
+void setScene(const Scene& scene);
 void resize(unsigned int width, unsigned int height);
 void setCamera(const float eye[3], const float target[3], const float up[3], float fovYDeg);
 // halfWidth/halfHeight: the image plane at distance 1 (perspective) or half
@@ -157,15 +161,37 @@ struct DeviceBuffer
     void upload(const void* data, size_t bytes);
     void free();
 };
-@
+@ Every mesh of the scene keeps its own vertex data on the GPU: positions,
+shading normals and texture coordinates per vertex, three indices per
+triangle, and the material of each triangle. Next to them lives the mesh's
+geometry acceleration structure ([[gas]]) and the traversable handle by which
+OptiX refers to it. Optional data that the mesh lacks, such as normals for a
+flat-shaded mesh, is simply an empty buffer with a null pointer, and the
+device programs test for that null.
+
+<<The device buffers of one mesh>>=
+// A mesh's vertex data and its GAS
+struct MeshBuffers
+{
+    DeviceBuffer positions, normals, uvs, indices, triMaterial, gas;
+    OptixTraversableHandle handle = 0;
+    void free();
+};
+@ The private steps are the parts of initialization and scene loading that
+deserve their own functions. [[buildAccel]] builds an acceleration structure
+from one build input, and serves both the per-mesh structures and the one
+over the instances; [[freeScene]] releases everything [[setScene]] created.
+
 <<Private steps of the renderer>>=
 void createPipeline();
 void buildSbt();
-void uploadTextures(const FlatGeometry& geometry);
+OptixTraversableHandle buildAccel(const OptixBuildInput& input, DeviceBuffer& output);
+void uploadTextures(const Scene& scene);
 void freeTextures();
+void freeScene();
 @ The handles fall into three groups. First come CUDA and OptiX objects that
 live as long as the renderer: the CUDA context and stream, the OptiX context,
-the module compiled from the PTX, the program groups and the pipeline linked
+the module compiled from the OptiX-IR, the program groups and the pipeline linked
 from them, and the shader binding table with its three record buffers.
 
 <<CUDA and OptiX handles of the renderer>>=
@@ -179,10 +205,13 @@ OptixPipeline m_pipeline = nullptr;
 OptixProgramGroup m_raygenPG = nullptr, m_missPG[RAY_TYPE_COUNT] = {}, m_hitPG = nullptr;
 OptixShaderBindingTable m_sbt = {};
 DeviceBuffer m_raygenRecord, m_missRecords, m_hitRecords;
-@ Then come the per-scene and per-image buffers. The scene arrays mirror those
-of [[FlatGeometry]]: vertex positions, triangle indices, and for every
-triangle its mesh, material, corner texture coordinates and corner normals.
-[[m_gas]] holds the acceleration structure. The image needs three buffers: the
+@ Then come the per-scene and per-image buffers. [[m_meshes]] holds the
+buffers of every mesh, in the order of the scene's meshes, so that its index
+is the mesh id. The device programs reach those buffers through
+[[m_meshRecords]], an array of [[MeshData]] records with one device pointer
+per array. [[m_instances]] holds the instances that place the meshes in the
+world, [[m_ias]] the acceleration structure built over them, and
+[[m_materials]] the materials of the whole scene. The image needs three buffers: the
 8-bit colors shown on screen, the floating-point sums of the progressive
 samples, and the mesh ids for picking. Finally, every texture is a mipmapped
 CUDA array plus a texture object, and the objects are gathered in a device
@@ -191,7 +220,8 @@ buffers for the sums, the mesh ids and the parameters, so that an eye never
 disturbs the desktop image.
 
 <<Scene and output buffers of the renderer>>=
-DeviceBuffer m_vertices, m_indices, m_triMesh, m_triMaterial, m_triUVs, m_triNormals, m_materials, m_gas;
+std::vector<MeshBuffers> m_meshes;
+DeviceBuffer m_meshRecords, m_instances, m_ias, m_materials;
 DeviceBuffer m_colorBuffer, m_accumBuffer, m_meshIdBuffer, m_paramsBuffer;
 DeviceBuffer m_viewAccum, m_viewMeshIds, m_viewParams;  // scratch for renderView
 std::vector<cudaMipmappedArray_t> m_textureArrays;
@@ -209,7 +239,7 @@ in the anonymous namespace are private to it.
 <<UsdOptixViewer/src/OptixRenderer.cpp>>=
 <<Headers of the renderer implementation>>
 
-<<Declare the embedded PTX>>
+<<Declare the embedded OptiX-IR>>
 
 namespace {
 
@@ -229,6 +259,8 @@ namespace {
 
 <<Free a device buffer>>
 
+<<Free the buffers of a mesh>>
+
 <<Destroy the renderer>>
 
 <<Initialize CUDA and OptiX>>
@@ -237,7 +269,11 @@ namespace {
 
 <<Build the shader binding table>>
 
-<<Set the scene geometry>>
+<<Set the scene>>
+
+<<Build an acceleration structure>>
+
+<<Free the scene>>
 
 <<Upload the textures>>
 
@@ -280,12 +316,16 @@ translation unit of the program, and this is it.
 #include <optix_stubs.h>
 
 #include "Scene.h"
-@ The device programs reach us as PTX text, compiled into the executable by
-the build system (see <<Compile the device programs to PTX and embed them>>).
-The array is terminated by a zero byte, and the size excludes it.
+@ The device programs reach us as OptiX-IR, the intermediate form that
+\texttt{nvcc} produces for OptiX and that the build system compiles into the
+executable (see <<Compile the device programs to OptiX-IR and embed them>>).
+OptiX-IR is binary, so the size is what delimits it; the array also ends
+with a zero byte, which the size excludes. Its bytes are \textbf{unsigned}
+\textbf{char}, because a plain \textbf{char} is signed here and cannot hold
+values above 127; [[optixModuleCreate]] takes them through a [[const char*]].
 
-<<Declare the embedded PTX>>=
-extern const char g_devicePrograms[];
+<<Declare the embedded OptiX-IR>>=
+extern const unsigned char g_devicePrograms[];
 extern const size_t g_devicePrograms_size;
 @ Errors. Every CUDA and OptiX call returns a status code. Rather than test
 each one by hand, we pass it to an overloaded [[check]] that throws an
@@ -452,11 +492,21 @@ void OptixRenderer::DeviceBuffer::free()
     ptr = 0;
     size = 0;
 }
+@ A mesh frees its buffers one by one, its acceleration structure among them,
+and forgets the handle that pointed into that structure.
+
+<<Free the buffers of a mesh>>=
+void OptixRenderer::MeshBuffers::free()
+{
+    for (DeviceBuffer* b : {&positions, &normals, &uvs, &indices, &triMaterial, &gas})
+        b->free();
+    handle = 0;
+}
 @* Life and death of the renderer. The destructor only calls [[release]],
 which does the work. If [[init]] never got as far as creating an OptiX
 context, there is nothing to release. Otherwise we wait for the GPU to finish
 any work in flight and release the resources in the reverse order of their
-creation: textures and buffers first, then the pipeline, the program groups
+creation: the scene and the buffers first, then the pipeline, the program groups
 and the module it was linked from, then the OptiX context, and last the CUDA
 stream. The CUDA primary context itself is reference-counted by the runtime
 and is released when the process exits. Because [[release]] may be followed
@@ -475,11 +525,9 @@ void OptixRenderer::release()
     if (!m_context)
         return;
     cudaDeviceSynchronize();
-    freeTextures();
-    for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_vertices, &m_indices, &m_triMesh,
-                            &m_triMaterial, &m_triUVs, &m_triNormals, &m_materials, &m_gas, &m_colorBuffer,
-                            &m_accumBuffer, &m_meshIdBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds,
-                            &m_viewParams})
+    freeScene();
+    for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_colorBuffer, &m_accumBuffer,
+                            &m_meshIdBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds, &m_viewParams})
         b->free();
     optixPipelineDestroy(m_pipeline);
     optixProgramGroupDestroy(m_raygenPG);
@@ -590,8 +638,8 @@ setLightDir(light);
 m_paramsBuffer.resize(sizeof(LaunchParams));
 @* The pipeline. An OptiX \emph{pipeline} is the complete program run by a
 launch. It is assembled from \emph{program groups}, which in turn refer to
-entry functions inside \emph{modules}, the compiled form of PTX. Our single
-module holds all the device programs.
+entry functions inside \emph{modules}, which OptiX compiles from OptiX-IR.
+Our single module holds all the device programs.
 
 <<Create the OptiX pipeline>>=
 void OptixRenderer::createPipeline()
@@ -600,7 +648,7 @@ void OptixRenderer::createPipeline()
 
     <<Pipeline compile options>>
 
-    <<Compile the embedded PTX into a module>>
+    <<Compile the embedded OptiX-IR into a module>>
 
     <<Create the ray generation program group>>
 
@@ -622,9 +670,10 @@ moduleOptions.debugLevel = OPTIX_COMPILE_DEBUG_LEVEL_MINIMAL;
 @ The pipeline compile options must be identical for every module of a
 pipeline, because they shape the calling convention between programs.
 \begin{itemize}
-\item The whole scene is one geometry acceleration structure (GAS), with no
-  instancing, so we promise OptiX a traversable graph of a single GAS, its
-  fastest case.
+\item The scene is a two-level structure: an instance acceleration structure
+  (IAS) whose instances each point to the geometry acceleration structure
+  (GAS) of one mesh. We promise OptiX exactly that, single-level instancing,
+  so that it can drop support for deeper graphs and for motion.
 \item The \emph{payload} is the set of 32-bit registers a ray carries between
   the program that traces it and the programs it triggers. Radiance rays use
   six: the three color components as float bits, the id of the mesh that was
@@ -639,23 +688,25 @@ pipeline, because they shape the calling convention between programs.
 
 <<Pipeline compile options>>=
 OptixPipelineCompileOptions pipelineOptions = {};
-pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_GAS;
+pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
 pipelineOptions.numPayloadValues = 6;
 pipelineOptions.numAttributeValues = 2;
 pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
 pipelineOptions.pipelineLaunchParamsVariableName = "params";
 pipelineOptions.usesPrimitiveTypeFlags = OPTIX_PRIMITIVE_TYPE_FLAGS_TRIANGLE;
-@ The PTX is compiled to machine code for the installed GPU here, at run time.
+@ The OptiX-IR is compiled to machine code for the installed GPU here, at run
+time; that is what lets one executable run on any GPU that OptiX supports.
 OptiX writes warnings and errors to a log buffer; [[logSize]] goes in as the
 capacity and comes back as the length used, so it is reset before every call.
 We do not print the log: on failure the error code already says what went
-wrong, and the PTX was compiled and checked at build time.
+wrong, and the device programs were compiled and checked at build time.
 
-<<Compile the embedded PTX into a module>>=
+<<Compile the embedded OptiX-IR into a module>>=
 char log[2048];
 size_t logSize = sizeof(log);
-check(optixModuleCreate(m_context, &moduleOptions, &pipelineOptions, g_devicePrograms, g_devicePrograms_size,
-                        log, &logSize, &m_module),
+check(optixModuleCreate(m_context, &moduleOptions, &pipelineOptions,
+                        reinterpret_cast<const char*>(g_devicePrograms), g_devicePrograms_size, log, &logSize,
+                        &m_module),
       "optixModuleCreate");
 @ Program groups name their entry functions by string. OptiX requires the
 names to start with a prefix that tells the kind of program:
@@ -712,7 +763,7 @@ reflect again, and shadow rays do not shade.
 Recursion lives on a stack whose size OptiX must know. In general one adds up
 the stack needs of all programs; OptiX~9 can do this for us from the call
 depths: three levels of tracing, no continuation or direct callables, and a
-traversable graph one level deep.
+traversable graph two levels deep, the IAS above the GASes.
 
 <<Link the pipeline and set its stack size>>=
 OptixProgramGroup groups[] = {m_raygenPG, m_missPG[0], m_missPG[1], m_hitPG};
@@ -721,16 +772,22 @@ linkOptions.maxTraceDepth = 3;  // camera -> reflection -> shadow
 logSize = sizeof(log);
 check(optixPipelineCreate(m_context, &pipelineOptions, &linkOptions, groups, 4, log, &logSize, &m_pipeline),
       "optixPipelineCreate");
-check(optixPipelineSetStackSizeFromCallDepths(m_pipeline, linkOptions.maxTraceDepth, 0, 0, 0, 1),
+// traversable graph depth 2: IAS -> GAS
+check(optixPipelineSetStackSizeFromCallDepths(m_pipeline, linkOptions.maxTraceDepth, 0, 0, 0, 2),
       "optixPipelineSetStackSizeFromCallDepths");
-@* The shader binding table. When a ray of type $r$ hits geometry, OptiX picks
-the hit record at index $\hbox{offset}+\hbox{stride}\times\hbox{geometry index}$, where
-offset and stride are arguments of [[optixTrace]]; misses use the miss record
-named by another argument. The device programs pass the ray type as the miss
-index, an offset of~0 and a stride of [[RAY_TYPE_COUNT]]. With a single
-geometry (index~0), every ray therefore lands on hit record~0, and the second
-record exists only so that the table has one record per ray type, the layout
-that a stride of [[RAY_TYPE_COUNT]] presumes.
+@* The shader binding table. When a ray hits geometry, OptiX picks the hit
+record at index
+$$\hbox{instance offset}+\hbox{stride}\times\hbox{geometry index}+\hbox{ray offset},$$
+where the instance offset is the [[sbtOffset]] of the instance that was hit,
+the geometry index numbers the build inputs of its GAS, and stride and ray
+offset are arguments of [[optixTrace]]; misses use the miss record named by
+another argument. The device programs pass the ray type as the miss index, a
+ray offset of~0 and a stride of [[RAY_TYPE_COUNT]]. Every instance has an
+offset of~0 and every GAS a single build input (index~0), so every ray lands
+on hit record~0: all meshes share one hit group, and the programs tell the
+meshes apart by the instance id. The second record
+exists only so that the table has one record per ray type, the layout that a
+stride of [[RAY_TYPE_COUNT]] presumes.
 
 <<Build the shader binding table>>=
 void OptixRenderer::buildSbt()
@@ -772,46 +829,51 @@ m_sbt.missRecordCount = RAY_TYPE_COUNT;
 m_sbt.hitgroupRecordBase = m_hitRecords.ptr;
 m_sbt.hitgroupRecordStrideInBytes = sizeof(SbtRecord<Empty>);
 m_sbt.hitgroupRecordCount = RAY_TYPE_COUNT;
-@* Loading a scene. [[setGeometry]] replaces everything that depends on the
-scene: the arrays, the materials, the textures and the acceleration
-structure. The old acceleration structure is invalid as soon as the arrays
-change, so its handle is cleared first, and the accumulated image restarts.
+@* Loading a scene. [[setScene]] replaces everything that depends on the
+scene: the materials, the textures, the meshes and the acceleration
+structures. The materials and textures come first, because all meshes share
+them; then every mesh is uploaded and gets its own acceleration structure;
+last, one structure over all the meshes places them in the world.
 
-<<Set the scene geometry>>=
-void OptixRenderer::setGeometry(const FlatGeometry& g)
+Why one structure per mesh, rather than one over all the triangles of the
+scene in world space? A USD stage describes each mesh in its own local space
+and positions it with a transform, and keeping that split costs nothing on
+the GPU. The ray-tracing hardware applies the transform as it descends from
+the top structure into a mesh, so a mesh's vertices are uploaded exactly as
+the scene holds them; only the small top structure would have to be rebuilt
+to move an object. The instance also gives every hit a number for free, the
+\emph{instance id}, which the device programs use both to find the mesh's
+data and as the mesh id for picking.
+
+<<Set the scene>>=
+void OptixRenderer::setScene(const Scene& scene)
 {
-    <<Upload the flattened scene arrays>>
+    <<Free the old scene and restart the accumulation>>
     <<Pack the materials for the device>>
-    <<Upload the textures and publish the device pointers>>
+    <<Upload the textures and publish the material tables>>
 
-    <<Describe the triangles to OptiX>>
+    <<Upload every mesh and build its acceleration structure>>
+    <<Publish the mesh records>>
 
-    <<Choose the acceleration structure build options>>
-
-    <<Build the geometry acceleration structure>>
+    <<Build the instance acceleration structure>>
 }
-@ The arrays of [[FlatGeometry]] are copied as they are. Their element types
-on the device ([[float3]], [[uint3]], [[float2]]) have the same layout as the
-consecutive [[float]]s and [[unsigned int]]s of the host vectors.
+@ The handle in the launch parameters points into the acceleration structures
+that [[freeScene]] is about to release, so it is cleared first. Should
+anything below throw, [[render]] then sees no scene rather than a dangling
+handle. The accumulated image belongs to the old scene and restarts.
 
-<<Upload the flattened scene arrays>>=
+<<Free the old scene and restart the accumulation>>=
 m_params.handle = 0;
 m_params.frameIndex = 0;
-m_gas.free();
-m_vertices.upload(g.vertices.data(), g.vertices.size() * sizeof(float));
-m_indices.upload(g.indices.data(), g.indices.size() * sizeof(unsigned int));
-m_triMesh.upload(g.triMesh.data(), g.triMesh.size() * sizeof(unsigned int));
-m_triMaterial.upload(g.triMaterial.data(), g.triMaterial.size() * sizeof(unsigned int));
-m_triUVs.upload(g.triUVs.data(), g.triUVs.size() * sizeof(float));
-m_triNormals.upload(g.triNormals.data(), g.triNormals.size() * sizeof(float));
-@ Materials are another matter. The scene describes them with C++ types that
+freeScene();
+@ Materials. The scene describes them with C++ types that
 are convenient on the host ([[std::array]], [[bool]], [[ScalarInput]]); the
 device wants the flat, CUDA-aligned [[MaterialData]] of
 \lpfile{LaunchParams.h}. We convert field by field.
 
 <<Pack the materials for the device>>=
 std::vector<MaterialData> materials;
-for (const Material& m : g.materials)
+for (const Material& m : scene.materials())
 {
     <<Conversions from host material fields>>
     <<Fill in one device material>>
@@ -832,7 +894,7 @@ auto scalar = [](const ScalarInput& in) {
 and bias, those of the normal map and the specular color, the constant
 colors, texture indices ($-1$ meaning none), roughness and metallic, the
 alpha-cutout channel and threshold, the workflow flag and the index of
-refraction. Texture indices refer to the table built below.
+refraction. Texture indices refer to the table built by [[uploadTextures]].
 
 <<Fill in one device material>>=
 MaterialData d = {};
@@ -855,36 +917,64 @@ d.normalTexture = m.normalTexture;
 d.specularWorkflow = m.specularWorkflow ? 1 : 0;
 d.ior = m.ior;
 materials.push_back(d);
-@ With the textures uploaded, all device addresses are known and we store them
-in the launch parameters. A scene without triangles stops here: the handle
-stays zero, and [[render]] then simply paints the background.
+@ With the textures uploaded, the device addresses of the two shared tables
+are known and go into the launch parameters.
 
-<<Upload the textures and publish the device pointers>>=
-uploadTextures(g);
-m_params.vertices = reinterpret_cast<const float3*>(m_vertices.ptr);
-m_params.indices = reinterpret_cast<const uint3*>(m_indices.ptr);
-m_params.triMesh = reinterpret_cast<const unsigned int*>(m_triMesh.ptr);
-m_params.triMaterial = reinterpret_cast<const unsigned int*>(m_triMaterial.ptr);
-m_params.triUVs = reinterpret_cast<const float2*>(m_triUVs.ptr);
-m_params.triNormals = reinterpret_cast<const float3*>(m_triNormals.ptr);
+<<Upload the textures and publish the material tables>>=
+uploadTextures(scene);
 m_params.materials = reinterpret_cast<const MaterialData*>(m_materials.ptr);
 m_params.textures = reinterpret_cast<const cudaTextureObject_t*>(m_textureTable.ptr);
-if (g.empty())
-    return;
-@ The acceleration structure. OptiX builds a bounding volume hierarchy over
-the triangles, the \emph{geometry acceleration structure}, which the hardware
-ray-tracing cores traverse. The whole scene is one build input: an indexed
-triangle array of world-space [[float3]] vertices and [[uint3]] index
-triplets, with one SBT record.
+@ The meshes. For each mesh of the scene we upload its arrays, build its
+geometry acceleration structure (GAS), and describe the instance that places
+it in the world. Two host vectors collect the results: the [[MeshData]]
+records through which the device programs find the arrays, and the
+[[OptixInstance]]s for the top-level structure. Both are filled in the order
+of the scene's meshes, so that index~$i$ of either is mesh~$i$.
+
+<<Upload every mesh and build its acceleration structure>>=
+// one GAS per mesh, in the mesh's own space
+std::vector<MeshData> records;
+std::vector<OptixInstance> instances;
+for (const RenderMesh& mesh : scene.meshes())
+{
+    <<Upload the vertex data of a mesh>>
+
+    <<Build the geometry acceleration structure of a mesh>>
+
+    <<Place the mesh in the world with an instance>>
+}
+@ A [[RenderMesh]] holds its data in flat vectors of [[float]]s and
+[[unsigned int]]s; their device element types ([[float3]], [[float2]],
+[[uint3]]) have the same layout, so the vectors are copied as they are. The
+scene has already welded the corners of the faces into shared vertices, which
+is why one index can address the position, the normal and the texture
+coordinates alike. A mesh without normals or without texture coordinates
+uploads an empty vector, and its record holds a null pointer there.
+
+<<Upload the vertex data of a mesh>>=
+MeshBuffers& b = m_meshes.emplace_back();
+b.positions.upload(mesh.positions.data(), mesh.positions.size() * sizeof(float));
+b.normals.upload(mesh.normals.data(), mesh.normals.size() * sizeof(float));
+b.uvs.upload(mesh.uvs.data(), mesh.uvs.size() * sizeof(float));
+b.indices.upload(mesh.indices.data(), mesh.indices.size() * sizeof(unsigned int));
+b.triMaterial.upload(mesh.triMaterial.data(), mesh.triMaterial.size() * sizeof(unsigned int));
+records.push_back({reinterpret_cast<const float3*>(b.positions.ptr),
+                   reinterpret_cast<const float3*>(b.normals.ptr), reinterpret_cast<const float2*>(b.uvs.ptr),
+                   reinterpret_cast<const uint3*>(b.indices.ptr),
+                   reinterpret_cast<const unsigned int*>(b.triMaterial.ptr)});
+@ OptiX builds a bounding volume hierarchy over the triangles of the mesh, the
+\emph{geometry acceleration structure}, which the hardware ray-tracing cores
+traverse. The mesh is one build input: an indexed triangle array of
+[[float3]] positions in the mesh's local space and [[uint3]] index triplets,
+with one SBT record.
 
 The geometry flag deserves a word. The usual advice for opaque geometry is the flag
 \begin{center}[[OPTIX_GEOMETRY_FLAG_DISABLE_ANYHIT]],\end{center}
-which spares the traversal a call per candidate hit, and an early version of
-the viewer did exactly that. Alpha cutouts need the any-hit program, though,
-so the flag is now [[OPTIX_GEOMETRY_FLAG_NONE]]; for opaque materials the
-program returns at once.
+which spares the traversal a call per candidate hit. Alpha cutouts need the
+any-hit program, though, so the flag is [[OPTIX_GEOMETRY_FLAG_NONE]]; for
+opaque materials the program returns at once.
 
-<<Describe the triangles to OptiX>>=
+<<Build the geometry acceleration structure of a mesh>>=
 // any-hit stays enabled for alpha cutouts; it returns early for opaque materials
 const unsigned int flags[] = {OPTIX_GEOMETRY_FLAG_NONE};
 OptixBuildInput input = {};
@@ -892,38 +982,107 @@ input.type = OPTIX_BUILD_INPUT_TYPE_TRIANGLES;
 OptixBuildInputTriangleArray& tri = input.triangleArray;
 tri.vertexFormat = OPTIX_VERTEX_FORMAT_FLOAT3;
 tri.vertexStrideInBytes = sizeof(float3);
-tri.numVertices = unsigned(g.vertices.size() / 3);
-tri.vertexBuffers = &m_vertices.ptr;
+tri.numVertices = unsigned(mesh.vertexCount());
+tri.vertexBuffers = &b.positions.ptr;
 tri.indexFormat = OPTIX_INDICES_FORMAT_UNSIGNED_INT3;
 tri.indexStrideInBytes = sizeof(uint3);
-tri.numIndexTriplets = unsigned(g.indices.size() / 3);
-tri.indexBuffer = m_indices.ptr;
+tri.numIndexTriplets = unsigned(mesh.triangleCount());
+tri.indexBuffer = b.indices.ptr;
 tri.flags = flags;
 tri.numSbtRecords = 1;
-@ The scene is static once loaded, so we ask for the structure that traces
-fastest, at the price of a slower build, and do not request updates or
-compaction.
+b.handle = buildAccel(input, b.gas);
+@ An instance couples a GAS with the affine transform that takes it from the
+mesh's space to the world. OptiX wants that transform as the first three rows
+of a $4\times4$ matrix, row-major, acting on column vectors; the scene stores
+[[toWorld]] in exactly that form, so it is copied as it is.
 
+\begin{sloppypar}The [[instanceId]] is a 28-bit number of our choosing that the device
+programs read back with [[optixGetInstanceId]]. We set it to the index of the
+mesh, which makes it at once the index into the [[MeshData]] records and the
+mesh id written into the picking buffer. All rays may hit every instance (the
+visibility mask is all ones), every instance uses the one hit record
+(offset~0), and none overrides the geometry flags.\end{sloppypar}
+
+<<Place the mesh in the world with an instance>>=
+OptixInstance instance = {};
+std::copy(mesh.toWorld.begin(), mesh.toWorld.end(), instance.transform);
+instance.instanceId = unsigned(instances.size());  // the mesh id
+instance.visibilityMask = 255;
+instance.sbtOffset = 0;
+instance.flags = OPTIX_INSTANCE_FLAG_NONE;
+instance.traversableHandle = b.handle;
+instances.push_back(instance);
+@ The records go to the device as one array, which the launch parameters
+point to. A scene without meshes stops here: the handle stays zero, and
+[[render]] then simply paints the background.
+
+<<Publish the mesh records>>=
+m_meshRecords.upload(records.data(), records.size() * sizeof(MeshData));
+m_params.meshes = reinterpret_cast<const MeshData*>(m_meshRecords.ptr);
+if (instances.empty())
+    return;
+@ The instances themselves must also live in device memory, where the build
+reads them. Built over them, the \emph{instance acceleration structure} (IAS)
+is a hierarchy of the instances' world-space bounding boxes; its handle is
+the one that every [[optixTrace]] starts from.
+
+<<Build the instance acceleration structure>>=
+// the IAS places every mesh in the world
+m_instances.upload(instances.data(), instances.size() * sizeof(OptixInstance));
+OptixBuildInput input = {};
+input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
+input.instanceArray.instances = m_instances.ptr;
+input.instanceArray.numInstances = unsigned(instances.size());
+m_params.handle = buildAccel(input, m_ias);
+@ Building an acceleration structure is the same for both levels. The scene
+is static once loaded, so we ask for the structure that traces fastest, at
+the price of a slower build, and do not request updates or compaction.
+
+<<Build an acceleration structure>>=
+OptixTraversableHandle OptixRenderer::buildAccel(const OptixBuildInput& input, DeviceBuffer& output)
+{
+    <<Choose the acceleration structure build options>>
+
+    <<Run the build and wait for it>>
+}
+@
 <<Choose the acceleration structure build options>>=
 OptixAccelBuildOptions accelOptions = {};
 accelOptions.buildFlags = OPTIX_BUILD_FLAG_PREFER_FAST_TRACE;
 accelOptions.operation = OPTIX_BUILD_OPERATION_BUILD;
 @ OptiX first tells us how much memory the build needs: scratch space for the
-build itself and room for the result. The build runs on our stream and
-writes the \emph{traversable handle} straight into the launch parameters; we
-wait for it before releasing the scratch buffer.
+build itself and room for the result, which goes into the caller's buffer.
+The build runs on our stream and returns the \emph{traversable handle}; we
+wait for it before releasing the scratch buffer. Waiting after every mesh
+serializes the builds, but they happen once per scene, and it keeps only one
+scratch buffer alive at a time.
 
-<<Build the geometry acceleration structure>>=
+<<Run the build and wait for it>>=
 OptixAccelBufferSizes sizes = {};
 check(optixAccelComputeMemoryUsage(m_context, &accelOptions, &input, 1, &sizes), "optixAccelComputeMemoryUsage");
 DeviceBuffer temp;
 temp.resize(sizes.tempSizeInBytes);
-m_gas.resize(sizes.outputSizeInBytes);
-check(optixAccelBuild(m_context, m_stream, &accelOptions, &input, 1, temp.ptr, temp.size, m_gas.ptr, m_gas.size,
-                      &m_params.handle, nullptr, 0),
+output.resize(sizes.outputSizeInBytes);
+OptixTraversableHandle handle = 0;
+check(optixAccelBuild(m_context, m_stream, &accelOptions, &input, 1, temp.ptr, temp.size, output.ptr, output.size,
+                      &handle, nullptr, 0),
       "optixAccelBuild");
 check(cudaStreamSynchronize(m_stream), "accel build");
 temp.free();
+return handle;
+@ [[freeScene]] undoes [[setScene]]: the buffers of every mesh, the records,
+the instances and their structure, the materials and the textures.
+
+<<Free the scene>>=
+void OptixRenderer::freeScene()
+{
+    for (MeshBuffers& b : m_meshes)
+        b.free();
+    m_meshes.clear();
+    for (DeviceBuffer* b : {&m_meshRecords, &m_instances, &m_ias, &m_materials})
+        b->free();
+    freeTextures();
+}
 @* Textures. Every texture of the scene becomes a CUDA \emph{mipmapped array}
 holding its full mip chain, and a \emph{texture object}: a 64-bit handle that
 combines the array with a description of how to sample it. The handles go
@@ -931,10 +1090,10 @@ into a table on the device, indexed by the texture numbers stored in the
 materials.
 
 <<Upload the textures>>=
-void OptixRenderer::uploadTextures(const FlatGeometry& g)
+void OptixRenderer::uploadTextures(const Scene& scene)
 {
     freeTextures();
-    for (const Texture& t : g.textures)
+    for (const Texture& t : scene.textures())
     {
         <<Allocate a mipmapped array for the texture>>
         <<Upload every mip level>>

@@ -8,7 +8,7 @@
 extern "C" __constant__ LaunchParams params;
 
 constexpr float kPi = 3.14159265358979f;
-constexpr float kLightIntensity = 0.7f * kPi;  // keeps the diffuse look of the earlier versions
+constexpr float kLightIntensity = 0.7f * kPi;  // a surface facing the light reflects 0.7 x its albedo
 
 static __forceinline__ __device__ float3 operator+(float3 a, float3 b) { return make_float3(a.x + b.x, a.y + b.y, a.z + b.z); }
 static __forceinline__ __device__ float3 operator-(float3 a, float3 b) { return make_float3(a.x - b.x, a.y - b.y, a.z - b.z); }
@@ -62,16 +62,48 @@ static __forceinline__ __device__ float3 sky(float3 dir)
     return mix(make_float3(0.10f, 0.10f, 0.12f), make_float3(0.32f, 0.38f, 0.48f), 0.5f * (dir.y + 1.0f));
 }
 
+// ---- the hit triangle -----------------------------------------------------------
+// The triangle under the current hit: its mesh (the instance), its vertex
+// indices and its corners moved from the mesh's space to world space.
+struct HitTriangle
+{
+    const MeshData* mesh;
+    unsigned int prim;
+    uint3 tri;
+    float3 a, b, c;
+};
+
+static __forceinline__ __device__ HitTriangle hitTriangle()
+{
+    HitTriangle h;
+    h.mesh = &params.meshes[optixGetInstanceId()];
+    h.prim = optixGetPrimitiveIndex();
+    h.tri = h.mesh->indices[h.prim];
+    h.a = optixTransformPointFromObjectToWorldSpace(h.mesh->positions[h.tri.x]);
+    h.b = optixTransformPointFromObjectToWorldSpace(h.mesh->positions[h.tri.y]);
+    h.c = optixTransformPointFromObjectToWorldSpace(h.mesh->positions[h.tri.z]);
+    return h;
+}
+
+static __forceinline__ __device__ void cornerUVs(const HitTriangle& h, float2 uv[3])
+{
+    const float2* uvs = h.mesh->uvs;
+    uv[0] = uvs ? uvs[h.tri.x] : make_float2(0.0f, 0.0f);
+    uv[1] = uvs ? uvs[h.tri.y] : make_float2(0.0f, 0.0f);
+    uv[2] = uvs ? uvs[h.tri.z] : make_float2(0.0f, 0.0f);
+}
+
 // ---- textures -------------------------------------------------------------------
 // Samples a texture at the current hit, flipping USD's bottom-left st origin
 // to the image's top-left row order. For camera rays the mip level comes from
 // ray differentials: the rays through the neighbouring pixels are intersected
 // with the triangle's plane, and the offsets are converted to st gradients.
 // Shadow and reflection rays sample the finest level.
-static __forceinline__ __device__ float4 sampleTexture(int texture, unsigned int prim)
+static __forceinline__ __device__ float4 sampleTexture(int texture, const HitTriangle& h)
 {
     const float2 bary = optixGetTriangleBarycentrics();
-    const float2* uv = params.triUVs + 3 * prim;
+    float2 uv[3];
+    cornerUVs(h, uv);
     const float w0 = 1.0f - bary.x - bary.y;
     const float s = w0 * uv[0].x + bary.x * uv[1].x + bary.y * uv[2].x;
     const float t = w0 * uv[0].y + bary.x * uv[1].y + bary.y * uv[2].y;
@@ -79,9 +111,7 @@ static __forceinline__ __device__ float4 sampleTexture(int texture, unsigned int
     float2 dx = make_float2(0.0f, 0.0f), dy = make_float2(0.0f, 0.0f);
     if (params.mipmaps && !isShadowRay() && optixGetPayload_4() == 0)
     {
-        const uint3 tri = params.indices[prim];
-        const float3 a = params.vertices[tri.x];
-        const float3 e1 = params.vertices[tri.y] - a, e2 = params.vertices[tri.z] - a;
+        const float3 e1 = h.b - h.a, e2 = h.c - h.a;
         const float3 n = cross(e1, e2);
         const float3 o = optixGetWorldRayOrigin();
         const float3 p = o + optixGetWorldRayDirection() * optixGetRayTmax();
@@ -128,22 +158,21 @@ static __forceinline__ __device__ float channel(float4 v, int c)
     return c == 0 ? v.x : c == 1 ? v.y : c == 2 ? v.z : v.w;
 }
 
-static __forceinline__ __device__ float evalScalar(const ScalarParam& p, unsigned int prim)
+static __forceinline__ __device__ float evalScalar(const ScalarParam& p, const HitTriangle& h)
 {
     if (p.texture < 0)
         return p.value;
-    return channel(sampleTexture(p.texture, prim), p.channel) * p.scale + p.bias;
+    return channel(sampleTexture(p.texture, h), p.channel) * p.scale + p.bias;
 }
 
 // Shading normal from a tangent-space normal map. The tangent frame comes from
 // the triangle's positions and st (tangent along +s, bitangent along +t, the
 // image's "up"), orthonormalized around the base normal `n`.
-static __forceinline__ __device__ float3 normalMapped(const MaterialData& mat, unsigned int prim, float3 n)
+static __forceinline__ __device__ float3 normalMapped(const MaterialData& mat, const HitTriangle& h, float3 n)
 {
-    const uint3 tri = params.indices[prim];
-    const float3 a = params.vertices[tri.x];
-    const float3 e1 = params.vertices[tri.y] - a, e2 = params.vertices[tri.z] - a;
-    const float2* uv = params.triUVs + 3 * prim;
+    const float3 e1 = h.b - h.a, e2 = h.c - h.a;
+    float2 uv[3];
+    cornerUVs(h, uv);
     const float du1 = uv[1].x - uv[0].x, dv1 = uv[1].y - uv[0].y;
     const float du2 = uv[2].x - uv[0].x, dv2 = uv[2].y - uv[0].y;
     const float det = du1 * dv2 - du2 * dv1;
@@ -156,7 +185,7 @@ static __forceinline__ __device__ float3 normalMapped(const MaterialData& mat, u
     if (dot(b, bitangent) < 0.0f)
         b = b * -1.0f;  // mirrored st
 
-    const float4 texel = sampleTexture(mat.normalTexture, prim);
+    const float4 texel = sampleTexture(mat.normalTexture, h);
     const float3 local = make_float3(texel.x * mat.normalScale.x + mat.normalBias.x,
                                      texel.y * mat.normalScale.y + mat.normalBias.y,
                                      texel.z * mat.normalScale.z + mat.normalBias.z);
@@ -241,42 +270,41 @@ extern "C" __global__ void __miss__shadow()
 // reflection and shadow rays.
 extern "C" __global__ void __anyhit__cutout()
 {
-    const unsigned int prim = optixGetPrimitiveIndex();
-    const MaterialData& mat = params.materials[params.triMaterial[prim]];
+    const MeshData& mesh = params.meshes[optixGetInstanceId()];
+    const MaterialData& mat = params.materials[mesh.triMaterial[optixGetPrimitiveIndex()]];
     if (mat.opacityTexture < 0)
         return;
-    const float4 texel = sampleTexture(mat.opacityTexture, prim);
+    const float4 texel = sampleTexture(mat.opacityTexture, hitTriangle());
     if (channel(texel, mat.opacityChannel) < mat.opacityThreshold)
         optixIgnoreIntersection();
 }
 
 extern "C" __global__ void __closesthit__radiance()
 {
-    const unsigned int prim = optixGetPrimitiveIndex();
     const unsigned int depth = optixGetPayload_4();
     unsigned int seed = optixGetPayload_5();
-    const uint3 tri = params.indices[prim];
-    const float3 a = params.vertices[tri.x];
-    const float3 b = params.vertices[tri.y];
-    const float3 c = params.vertices[tri.z];
+    const HitTriangle hit = hitTriangle();
     const float3 rayDir = optixGetWorldRayDirection();
-    const unsigned int meshId = params.triMesh[prim];
-    const MaterialData& mat = params.materials[params.triMaterial[prim]];
+    const unsigned int meshId = optixGetInstanceId();
+    const MaterialData& mat = params.materials[hit.mesh->triMaterial[hit.prim]];
 
     // geometric normal: outward for counter-clockwise triangles (see Scene.cpp)
-    float3 n = normalize(cross(b - a, c - a));
+    float3 n = normalize(cross(hit.b - hit.a, hit.c - hit.a));
     // interpolated shading normal (smooth/authored normals); they win if the winding disagrees
     float3 ns = n;
-    const float3* cn = params.triNormals + 3 * prim;
-    if (dot(cn[0], cn[0]) > 0.0f)
+    if (const float3* cn = hit.mesh->normals)
     {
         const float2 bary = optixGetTriangleBarycentrics();
-        ns = normalize(cn[0] * (1.0f - bary.x - bary.y) + cn[1] * bary.x + cn[2] * bary.y);
-        if (dot(ns, n) < 0.0f)
-            n = n * -1.0f;
+        const float3 local = cn[hit.tri.x] * (1.0f - bary.x - bary.y) + cn[hit.tri.y] * bary.x + cn[hit.tri.z] * bary.y;
+        if (dot(local, local) > 0.0f)
+        {
+            ns = normalize(optixTransformNormalFromObjectToWorldSpace(local));
+            if (dot(ns, n) < 0.0f)
+                n = n * -1.0f;
+        }
     }
     if (params.normalMaps && mat.normalTexture >= 0)
-        ns = normalMapped(mat, prim, ns);
+        ns = normalMapped(mat, hit, ns);
     if (dot(n, rayDir) > 0.0f)
     {
         n = n * -1.0f;  // two-sided
@@ -293,20 +321,20 @@ extern "C" __global__ void __closesthit__radiance()
     float3 albedo = mat.color;
     if (mat.texture >= 0)
     {
-        const float4 texel = sampleTexture(mat.texture, prim);
+        const float4 texel = sampleTexture(mat.texture, hit);
         albedo = make_float3(texel.x * mat.texScale.x + mat.texBias.x, texel.y * mat.texScale.y + mat.texBias.y,
                              texel.z * mat.texScale.z + mat.texBias.z);
     }
     if (meshId == params.selectedMesh)
         albedo = mix(albedo, make_float3(1.0f, 0.55f, 0.1f), 0.6f);
-    const float roughness = __saturatef(evalScalar(mat.roughness, prim));
+    const float roughness = __saturatef(evalScalar(mat.roughness, hit));
     float3 f0, diffuse;
     if (mat.specularWorkflow)
     {
         f0 = mat.specColor;
         if (mat.specTexture >= 0)
         {
-            const float4 texel = sampleTexture(mat.specTexture, prim);
+            const float4 texel = sampleTexture(mat.specTexture, hit);
             f0 = make_float3(texel.x * mat.specScale.x + mat.specBias.x, texel.y * mat.specScale.y + mat.specBias.y,
                              texel.z * mat.specScale.z + mat.specBias.z);
         }
@@ -314,7 +342,7 @@ extern "C" __global__ void __closesthit__radiance()
     }
     else
     {
-        const float metallic = __saturatef(evalScalar(mat.metallic, prim));
+        const float metallic = __saturatef(evalScalar(mat.metallic, hit));
         const float r0 = (mat.ior - 1.0f) / (mat.ior + 1.0f);
         f0 = mix(make_float3(r0 * r0, r0 * r0, r0 * r0), albedo, metallic);
         diffuse = albedo * (1.0f - metallic);

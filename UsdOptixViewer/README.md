@@ -5,10 +5,11 @@ users in `/opt/viztools` (CUDA in `/usr/local/cuda-13.2`):
 
 | Tool        | Version  | Used for                                              |
 |-------------|----------|-------------------------------------------------------|
-| OpenUSD     | 26.11    | loading `.usd/.usda/.usdc/.usdz` stages               |
-| EnTT        | 4.0.0    | scene graph: one entity per prim (`PrimInfo`, `Hierarchy`, `MeshGeometry`) |
-| OptiX       | 9.1.0    | ray tracing the 3D view (flat shading + hard shadows) |
-| CUDA        | 13.2     | compiling the OptiX programs, device memory           |
+| OpenUSD     | 26.11    | loading `.usd/.usda/.usdc/.usdz` stages; the stage is the scene graph |
+| meshoptimizer | 1.3    | welding corners into indexed meshes, spatial and vertex-fetch order |
+| OptiX       | 9.1.0    | ray tracing the 3D view (one GAS per mesh + an IAS)   |
+| CUDA        | 13.2     | compiling the OptiX programs to OptiX-IR, device memory |
+| OpenXR / Vulkan / CloudXR | 1.1.58 / 1.3.275 / 6.2.1 | XR output (optional at run time) |
 | SDL3        | 3.4.18   | window, input, file dialog, drag & drop               |
 | Dear ImGui  | 1.93.0   | hierarchy, inspector and viewport panels              |
 | CMake / g++ | 3.28 / 11.5 | build and installation                             |
@@ -79,14 +80,15 @@ users in `/opt/viztools` (CUDA in `/usr/local/cuda-13.2`):
   (usdview's "fit" policy). Orbiting, panning or zooming switches to the
   orbit camera, which starts from the USD camera's position and direction.
   Aperture offsets are ignored with a warning.
-- XR output (branch `cloudxr`): stereo rendering to a headset through any
+- XR output: stereo rendering to a headset through any
   OpenXR runtime with Vulkan support, in particular NVIDIA CloudXR (Apple
-  Vision Pro, Quest through CloudXR.js). `--cloudxr --cloudxr-sdk DIR` runs the
-  CloudXR runtime inside the viewer; `--xr` uses the active runtime
+  Vision Pro, Quest through CloudXR.js). `--cloudxr` runs the CloudXR runtime
+  inside the viewer, from `--cloudxr-sdk DIR`, `$CLOUDXR_SDK_DIR` or
+  `/opt/viztools/cloudxr-6.2.1`; `--xr` uses the active runtime
   (`XR_RUNTIME_JSON`, for example one started by Isaac Teleop). The eyes are
   rendered by OptiX into Vulkan memory shared with CUDA. The headset starts at
   the desktop view's eye and follows it. See the *XR* menu and
-  [../CLOUDXR.md](../CLOUDXR.md) for all options and the differences from `main`.
+  [../CLOUDXR.md](../CLOUDXR.md) for all options and how to connect a headset.
 
 Controls: left-drag to orbit, right/middle-drag to pan, wheel to zoom, `F` to
 frame the selection, `Esc` to clear the selection, *Camera* menu to look
@@ -129,21 +131,18 @@ plastic, roughness 0.05 to 1.0 from left to right, a specular-workflow sphere,
 and a floor with a roughness checker texture whose smooth squares mirror the
 spheres.
 
-The first configure downloads the OpenXR SDK (loader built static) and the
-Vulkan headers from github.com/KhronosGroup with `FetchContent`.
-
 Dependency locations can be overridden with `CMAKE_PREFIX_PATH`,
 `-DOptiX_INSTALL_DIR=...`, `-DIMGUI_DIR=...`, `-DCUDAToolkit_ROOT=...` and
-`-DVIZ_PREFIX=...`. `VIZ_PREFIX` defaults to `/opt/viztools`, falling back to
-`~/.local/opt` when it does not exist.
+`-DVIZ_PREFIX=...` (default `/opt/viztools`; configuring fails if it does not
+exist). `-DCLOUDXR_SDK_DIR=...` sets the built-in default for `--cloudxr-sdk`.
 
 ## Layout
 
-- `src/Scene.*`: USD stage to EnTT registry, geometry extraction and triangulation, materials and texture loading
+- `src/Scene.*`: geometry extraction and triangulation into one local-space `RenderMesh` per prim (welded with meshoptimizer), materials, texture loading, cameras
 - `src/StbImage.cpp`, `src/third_party/stb_image.h`: image decoding (stb_image v2.30, public domain / MIT)
-- `src/OptixRenderer.*`: OptiX context, pipeline, SBT, GAS build and launch
-- `src/devicePrograms.cu`: raygen / miss / closest-hit programs (compiled to
-  PTX by nvcc and embedded into the binary via `cmake/EmbedFile.cmake`)
+- `src/OptixRenderer.*`: OptiX context, pipeline, SBT, per-mesh GAS + IAS build and launch
+- `src/devicePrograms.cu`: raygen / miss / closest-hit / any-hit programs (compiled
+  to OptiX-IR by nvcc and embedded into the binary via `cmake/EmbedFile.cmake`)
 - `src/App.*`: SDL3 + ImGui application and panels
 - `src/XrOutput.*`: OpenXR session, Vulkan device, CUDA-shared eye buffers and eye cameras
 - `src/CloudXrService.*`, `src/third_party/cxrServiceAPI.h`: in-process NVIDIA CloudXR runtime

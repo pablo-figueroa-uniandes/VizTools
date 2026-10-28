@@ -6,13 +6,14 @@ five parts, which we shall meet in turn.
 
 <<Locate the visualization tools>>
 
-<<Compile the device programs to PTX and embed them>>
+<<Compile the device programs to OptiX-IR and embed them>>
 
 <<Build Dear ImGui and the viewer executable>>
 
 <<Install the viewer>>
-@ We need CMake 3.24 or newer and C++20, the latter because EnTT~4 requires
-it. A build without an explicit type is an optimized \emph{Release} build:
+@ We need CMake 3.24 or newer and C++20, the language version the code is
+written in (it uses, for instance, the [[contains]] member of the standard
+containers). A build without an explicit type is an optimized \emph{Release} build:
 ray tracing a scene in a debug build is no fun.
 
 <<Declare the project and the language standard>>=
@@ -24,18 +25,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
-@ Finding the tools. The tools were first installed for one user under
-\lpfile{\textasciitilde/.local/opt} and later for everybody under
-\lpfile{/opt/viztools}, with CUDA in \lpfile{/usr/local/cuda-13.2}. The
-project prefers the system-wide copy and falls back to the personal one; every
-location can also be overridden from the command line or the environment.
+@ \begin{sloppypar}Finding the tools. The tools are installed for all users under
+\lpfile{/opt/viztools}, with CUDA in \lpfile{/usr/local/cuda-13.2}. Every
+location can be overridden from the command line or the environment; the
+login script \lpfile{/etc/profile.d/viztools.sh} sets the environment
+variables.\end{sloppypar}
 
 <<Locate the visualization tools>>=
 # ---------------------------------------------------------------------------
-# Dependencies. Locations can be given through CMAKE_PREFIX_PATH or the
-# variables / environment variables below (see /etc/profile.d/viztools.sh).
-# Defaults to the all-users install in /opt/viztools, falling back to the
-# per-user install in ~/.local/opt.
+# Dependencies, installed for all users in /opt/viztools (and CUDA in
+# /usr/local/cuda-13.2). Locations can be changed through CMAKE_PREFIX_PATH or
+# the variables / environment variables below (see /etc/profile.d/viztools.sh).
 # ---------------------------------------------------------------------------
 <<Choose the root of the installed tools and of CUDA>>
 
@@ -43,27 +43,26 @@ location can also be overridden from the command line or the environment.
 
 <<Find the Dear ImGui sources>>
 
-<<Find SDL3, EnTT, OpenUSD and CUDA>>
+<<Choose the default CloudXR SDK>>
 
-<<Fetch the OpenXR loader and the Vulkan headers>>
-@ The variable [[VIZ_PREFIX]] records the root of the tools. CUDA has its own
-rule: an explicit [[CUDAToolkit_ROOT]] wins, then the [[CUDA_HOME]] variable
-set by the login scripts, then the standard system directory.
+<<Find SDL3, OpenUSD, meshoptimizer and CUDA>>
+<<Find the OpenXR loader and the Vulkan headers>>
+@ The variable [[VIZ_PREFIX]] records the root of the tools. If that
+directory does not exist, configuration stops at once with a clear message,
+rather than later with a cryptic one about some missing package. CUDA has its
+own rule: an explicit [[CUDAToolkit_ROOT]] wins, then the [[CUDA_HOME]]
+variable set by the login script, then the standard system directory.
 
 <<Choose the root of the installed tools and of CUDA>>=
-if(EXISTS "/opt/viztools")
-  set(_vizDefault "/opt/viztools")
-else()
-  set(_vizDefault "$ENV{HOME}/.local/opt")
+set(VIZ_PREFIX "/opt/viztools" CACHE PATH "Root of the installed visualization tools")
+if(NOT EXISTS "${VIZ_PREFIX}")
+  message(FATAL_ERROR "Visualization tools not found in VIZ_PREFIX=${VIZ_PREFIX}")
 endif()
-set(VIZ_PREFIX "${_vizDefault}" CACHE PATH "Root of the installed visualization tools")
 if(NOT DEFINED CUDAToolkit_ROOT)
   if(DEFINED ENV{CUDA_HOME})
     set(CUDAToolkit_ROOT "$ENV{CUDA_HOME}")
-  elseif(EXISTS "/usr/local/cuda-13.2")
-    set(CUDAToolkit_ROOT "/usr/local/cuda-13.2")
   else()
-    set(CUDAToolkit_ROOT "${VIZ_PREFIX}/cuda-13.2")
+    set(CUDAToolkit_ROOT "/usr/local/cuda-13.2")
   endif()
 endif()
 @ OptiX is a header-only SDK: the implementation ships inside the NVIDIA
@@ -88,86 +87,100 @@ endif()
 if(NOT EXISTS "${IMGUI_DIR}/imgui.h")
   message(FATAL_ERROR "imgui.h not found in IMGUI_DIR=${IMGUI_DIR}")
 endif()
-@ The remaining dependencies provide CMake package files. OpenUSD's package
-is called \texttt{pxr}, after Pixar.
+@ The CloudXR runtime is not linked either: when the reader asks for it with
+\texttt{--cloudxr}, the program loads \lpfile{libcloudxr.so} from a CloudXR
+SDK directory. That directory is given by the option \texttt{--cloudxr-sdk},
+or else by the environment variable [[CLOUDXR_SDK_DIR]]; failing both, the
+program uses the directory recorded here at build time, which the executable
+receives as the definition [[CLOUDXR_SDK_DEFAULT]] (see
+<<Build Dear ImGui and the viewer executable>>).
 
-<<Find SDL3, EnTT, OpenUSD and CUDA>>=
-list(APPEND CMAKE_PREFIX_PATH "${VIZ_PREFIX}/sdl3" "${VIZ_PREFIX}/entt-4.0.0" "${VIZ_PREFIX}/usd-26.11")
+<<Choose the default CloudXR SDK>>=
+# Default for --cloudxr-sdk when CLOUDXR_SDK_DIR is not set at run time
+set(CLOUDXR_SDK_DIR "${VIZ_PREFIX}/cloudxr-6.2.1" CACHE PATH "CloudXR SDK (libcloudxr.so, openxr_cloudxr.json)")
+@ The remaining dependencies provide CMake package files, which
+[[find_package]] looks for under the directories we add to
+[[CMAKE_PREFIX_PATH]]. OpenUSD's package is called \texttt{pxr}, after Pixar.
+meshoptimizer, a library by Arseny Kapoulkine, welds the corners of each mesh
+into shared vertices and reorders them for the GPU; the part on the scene
+shows how.
+
+<<Find SDL3, OpenUSD, meshoptimizer and CUDA>>=
+list(APPEND CMAKE_PREFIX_PATH "${VIZ_PREFIX}/sdl3" "${VIZ_PREFIX}/usd-26.11" "${VIZ_PREFIX}/meshoptimizer-1.3"
+     "${VIZ_PREFIX}/openxr-1.1.58")
 
 find_package(CUDAToolkit 12 REQUIRED)
 find_package(SDL3 REQUIRED CONFIG)
-find_package(EnTT REQUIRED CONFIG)
 find_package(pxr REQUIRED CONFIG)
-@ The XR output of this branch needs two more things, neither of which is
-installed on the machine: the OpenXR loader, which finds the active OpenXR
-runtime and forwards calls to it, and the Vulkan headers, because the runtime
-talks to the application in Vulkan terms. Rather than installing them for all
-users, the project fetches both from Khronos at configure time with
-[[FetchContent]], pinned to fixed releases. The loader is built as a static
-library, so the installed binary carries it and needs no extra shared
-library. Vulkan itself is not linked at all: the program opens the driver's
-\lpfile{libvulkan.so.1} at run time (see the part on the XR output), and the CloudXR runtime is likewise loaded from
-a CloudXR SDK when it is asked for. Without a headset nothing of this is used.
+find_package(meshoptimizer REQUIRED CONFIG)
+@ The XR output needs two more packages: the OpenXR loader, which finds the
+active OpenXR runtime and forwards calls to it, and the Vulkan headers,
+because the runtime talks to the application in Vulkan terms. The loader is
+installed with the other tools as a static library, so the binary carries it
+and needs no extra shared library. Of Vulkan only the headers are used at
+build time: the program opens the driver's \lpfile{libvulkan.so.1} at run
+time (see the part on the XR output). Without a headset none of this is used.
 
-<<Fetch the OpenXR loader and the Vulkan headers>>=
-
-# XR output: the OpenXR loader (built static) and the Vulkan headers are
-# fetched with the project. Vulkan itself is loaded at run time from the
-# driver's libvulkan.so.1, and the CloudXR runtime from a CloudXR SDK.
-include(FetchContent)
-FetchContent_Declare(VulkanHeaders
-  GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git GIT_TAG v1.3.275 GIT_SHALLOW TRUE)
-FetchContent_Declare(OpenXR
-  GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git GIT_TAG release-1.1.58 GIT_SHALLOW TRUE)
-set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(VulkanHeaders OpenXR)
+<<Find the OpenXR loader and the Vulkan headers>>=
+# XR output: the OpenXR loader is linked statically. Only the Vulkan headers
+# are used at build time; Vulkan itself is loaded at run time from the
+# driver's libvulkan.so.1, and the CloudXR runtime from the CloudXR SDK.
+find_package(OpenXR REQUIRED CONFIG)
+find_package(Vulkan REQUIRED)
 @* Device code. The programs that run on the GPU (described in the part on
-device programs) are written in CUDA
-C++, but OptiX does not take machine code: it takes PTX, NVIDIA's portable
-assembly language, and compiles it for the actual GPU when the pipeline is
-created. We ask \texttt{nvcc} for PTX targeting the virtual architecture
-\texttt{compute\_75}, the oldest one supported by CUDA~13, so that the same
-executable runs on any recent GPU. The warning 20044 that we silence is
-\texttt{nvcc}'s remark that an \textbf{extern} declaration of the launch
-parameters is treated as a definition, which is exactly what OptiX expects.
+device programs) are written in CUDA C++, but OptiX does not take machine
+code. We ask \texttt{nvcc} for \emph{OptiX-IR}, the intermediate
+representation that NVIDIA recommends as the input of OptiX modules. It is
+a binary form of the program that is independent of the GPU model; the OptiX
+compiler in the driver translates it for the actual GPU when the pipeline is
+created. The target is the virtual
+architecture \texttt{compute\_75}, the oldest one supported by CUDA~13, so
+that the same executable runs on any recent GPU. The option
+\texttt{-lineinfo} keeps the correspondence between the code and the source
+lines, which debuggers and profilers such as Nsight Compute use to point at
+the line of \lpfile{devicePrograms.cu} a cost belongs to; it does not slow
+the code down. The warning 20044 that we silence is \texttt{nvcc}'s remark
+that an \textbf{extern} declaration of the launch parameters is treated as a
+definition, which is exactly what OptiX expects.
 
-The PTX text is then turned into a C++ source file by a small CMake script,
-<<UsdOptixViewer/cmake/EmbedFile.cmake>>, and compiled into the executable. The viewer therefore
-needs no data files at run time.
+The OptiX-IR file is then turned into a C++ source file by a small CMake
+script, <<UsdOptixViewer/cmake/EmbedFile.cmake>>, and compiled into the
+executable. The viewer therefore needs no data files at run time.
 
-<<Compile the device programs to PTX and embed them>>=
+<<Compile the device programs to OptiX-IR and embed them>>=
 # ---------------------------------------------------------------------------
-# OptiX device code: compiled to PTX with nvcc and embedded into the binary.
+# OptiX device code: compiled to OptiX-IR with nvcc and embedded into the binary.
 # ---------------------------------------------------------------------------
-set(OPTIX_ARCH "compute_75" CACHE STRING "Virtual architecture used for the OptiX PTX")
-set(PTX_FILE "${CMAKE_CURRENT_BINARY_DIR}/devicePrograms.ptx")
-set(PTX_CPP  "${CMAKE_CURRENT_BINARY_DIR}/devicePrograms_ptx.cpp")
+set(OPTIX_ARCH "compute_75" CACHE STRING "Virtual architecture used for the OptiX-IR")
+set(OPTIXIR_FILE "${CMAKE_CURRENT_BINARY_DIR}/devicePrograms.optixir")
+set(OPTIXIR_CPP  "${CMAKE_CURRENT_BINARY_DIR}/devicePrograms_optixir.cpp")
 add_custom_command(
-  OUTPUT "${PTX_FILE}"
-  COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}" -ptx -arch=${OPTIX_ARCH} -std=c++17 --use_fast_math -diag-suppress 20044
-          -ccbin "${CMAKE_CXX_COMPILER}"
+  OUTPUT "${OPTIXIR_FILE}"
+  COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}" -optix-ir -arch=${OPTIX_ARCH} -std=c++17 --use_fast_math -lineinfo
+          -diag-suppress 20044 -ccbin "${CMAKE_CXX_COMPILER}"
           -I "${OptiX_INCLUDE_DIR}" -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
-          "${CMAKE_CURRENT_SOURCE_DIR}/src/devicePrograms.cu" -o "${PTX_FILE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/devicePrograms.cu" -o "${OPTIXIR_FILE}"
   DEPENDS src/devicePrograms.cu src/LaunchParams.h
-  COMMENT "Compiling OptiX programs to PTX")
+  COMMENT "Compiling OptiX programs to OptiX-IR")
 add_custom_command(
-  OUTPUT "${PTX_CPP}"
-  COMMAND "${CMAKE_COMMAND}" -DINPUT=${PTX_FILE} -DOUTPUT=${PTX_CPP} -DSYMBOL=g_devicePrograms
+  OUTPUT "${OPTIXIR_CPP}"
+  COMMAND "${CMAKE_COMMAND}" -DINPUT=${OPTIXIR_FILE} -DOUTPUT=${OPTIXIR_CPP} -DSYMBOL=g_devicePrograms
           -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFile.cmake"
-  DEPENDS "${PTX_FILE}" cmake/EmbedFile.cmake
-  COMMENT "Embedding PTX")
+  DEPENDS "${OPTIXIR_FILE}" cmake/EmbedFile.cmake
+  COMMENT "Embedding OptiX-IR")
 @* The executable. Dear ImGui and its two back ends (SDL3 for input,
 SDL\_Renderer for drawing) become a static library. The viewer itself consists
-of seven C++ files plus the generated PTX source. It links the parts of OpenUSD
+of seven C++ files plus the generated OptiX-IR source. It links meshoptimizer
+and the parts of OpenUSD
 it uses: \texttt{usd} for stages, \texttt{usdGeom} for geometry,
 \texttt{usdShade} for materials, \texttt{ar} for resolving and opening assets,
 and the base libraries \texttt{sdf}, \texttt{tf}, \texttt{gf} and~\texttt{vt}.
 It also links the OpenXR loader and uses the Vulkan headers. Two definitions
 apply to every file: [[VK_NO_PROTOTYPES]], because Vulkan functions are looked
-up at run time instead of linked, and [[XR_USE_GRAPHICS_API_VULKAN]], which
-makes \lpfile{openxr\_platform.h} declare the Vulkan binding.
+up at run time rather than linked, and [[XR_USE_GRAPHICS_API_VULKAN]], which
+makes \lpfile{openxr\_platform.h} declare the Vulkan binding. A third,
+[[CLOUDXR_SDK_DEFAULT]], carries the default CloudXR SDK directory of
+<<Choose the default CloudXR SDK>> into the code as a string literal.
 
 <<Build Dear ImGui and the viewer executable>>=
 # ---------------------------------------------------------------------------
@@ -182,12 +195,13 @@ target_link_libraries(imgui PUBLIC SDL3::SDL3)
 
 add_executable(UsdOptixViewer
   src/main.cpp src/App.cpp src/Scene.cpp src/OptixRenderer.cpp src/StbImage.cpp src/XrOutput.cpp
-  src/CloudXrService.cpp "${PTX_CPP}")
+  src/CloudXrService.cpp "${OPTIXIR_CPP}")
 target_include_directories(UsdOptixViewer PRIVATE src ${OptiX_INCLUDE_DIR})
 target_link_libraries(UsdOptixViewer PRIVATE
-  imgui SDL3::SDL3 EnTT::EnTT usd usdGeom usdShade ar sdf tf gf vt
+  imgui SDL3::SDL3 meshoptimizer::meshoptimizer usd usdGeom usdShade ar sdf tf gf vt
   CUDA::cudart CUDA::cuda_driver OpenXR::openxr_loader Vulkan::Headers ${CMAKE_DL_LIBS})
-target_compile_definitions(UsdOptixViewer PRIVATE VK_NO_PROTOTYPES XR_USE_GRAPHICS_API_VULKAN)
+target_compile_definitions(UsdOptixViewer PRIVATE VK_NO_PROTOTYPES XR_USE_GRAPHICS_API_VULKAN
+  CLOUDXR_SDK_DEFAULT="${CLOUDXR_SDK_DIR}")
 # USD headers trigger a few deprecation warnings under C++20
 target_compile_options(UsdOptixViewer PRIVATE -Wno-deprecated -Wno-deprecated-declarations)
 @ Installation copies the executable and the test scenes. The libraries it
@@ -207,7 +221,7 @@ set_target_properties(UsdOptixViewer PROPERTIES
 install(TARGETS UsdOptixViewer RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY assets/ DESTINATION ${CMAKE_INSTALL_DATADIR}/UsdOptixViewer/assets)
 @* Embedding a file. CMake has no command to turn a file into a C++ array,
-but its scripting language is enough. We read the PTX as a hexadecimal string,
+but its scripting language is enough. We read the OptiX-IR as a hexadecimal string,
 turn every pair of hex digits into a byte literal, and write a source file that
 defines two symbols: the bytes followed by a terminating zero, and the size
 without it. The renderer declares both as \textbf{extern} and hands
@@ -215,7 +229,7 @@ them to OptiX.
 
 <<UsdOptixViewer/cmake/EmbedFile.cmake>>=
 # Usage: cmake -DINPUT=file -DOUTPUT=file.cpp -DSYMBOL=name -P EmbedFile.cmake
-# Writes a C++ source defining `extern const char SYMBOL[]` (NUL terminated)
+# Writes a C++ source defining `extern const unsigned char SYMBOL[]` (NUL terminated)
 # and `extern const size_t SYMBOL_size` (without the terminator).
 file(READ "${INPUT}" content HEX)
 string(LENGTH "${content}" hexLength)
@@ -223,5 +237,5 @@ math(EXPR size "${hexLength} / 2")
 string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," bytes "${content}")
 file(WRITE "${OUTPUT}"
   "#include <cstddef>\n"
-  "extern const char ${SYMBOL}[] = {${bytes}0x00};\n"
+  "extern const unsigned char ${SYMBOL}[] = {${bytes}0x00};\n"
   "extern const size_t ${SYMBOL}_size = ${size};\n")

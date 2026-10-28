@@ -1,47 +1,18 @@
-// A USD stage mirrored into an EnTT registry: one entity per prim, with
-// components describing its place in the hierarchy and its geometry.
+// A USD stage and what the renderer needs from it. The stage itself is the
+// scene graph (hierarchy, names, types); the scene adds one indexed
+// triangle mesh per renderable prim, its materials and textures, and the
+// stage's cameras.
 #pragma once
 
 #include <array>
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
-#include <entt/entt.hpp>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usdShade/material.h>
-
-// ---- components -----------------------------------------------------------
-struct PrimInfo
-{
-    pxr::SdfPath path;
-    std::string  name;
-    std::string  typeName;
-};
-
-struct Hierarchy
-{
-    entt::entity parent = entt::null;
-    std::vector<entt::entity> children;
-};
-
-// Present on prims that contributed triangles to the rendered geometry.
-struct MeshGeometry
-{
-    unsigned int meshId;
-    unsigned int firstTriangle;
-    unsigned int triangleCount;
-    unsigned int material;        // material bound to the prim itself
-    unsigned int subsetMaterials;  // number of GeomSubsets with their own material
-    bool hasUVs;
-};
-
-// Present on UsdGeomCamera prims: index into Scene::cameras().
-struct CameraView
-{
-    unsigned int index;
-};
 
 // ---- render data ----------------------------------------------------------
 enum class TextureWrap { Repeat, Mirror, Clamp, Black };
@@ -103,22 +74,26 @@ struct Material
     }
 };
 
-// Geometry flattened to world space, ready to upload to the renderer.
-struct FlatGeometry
+// One renderable prim (Mesh, Cube or Sphere) as an indexed triangle mesh in
+// the prim's local space, placed in the world by `toWorld`. Vertices are the
+// distinct corners of the source faces (position, shading normal and st),
+// welded and reordered with meshoptimizer.
+struct RenderMesh
 {
-    std::vector<float>        vertices;     // xyz
-    std::vector<unsigned int> indices;      // 3 per triangle
-    std::vector<unsigned int> triMesh;      // mesh id per triangle
-    std::vector<unsigned int> triMaterial;  // material per triangle
-    std::vector<float>        triUVs;       // 6 per triangle (st of each corner)
-    std::vector<float>        triNormals;   // 9 per triangle (shading normal of each corner, 0 = flat)
-    std::vector<Material>     materials;
-    std::vector<Texture>      textures;
-    std::vector<entt::entity> meshEntity;   // entity of each mesh id
-    float boundsMin[3] = {0, 0, 0};
-    float boundsMax[3] = {0, 0, 0};
+    pxr::SdfPath path;
+    std::array<float, 12> toWorld;          // row-major 3x4, acting on column vectors
+    std::vector<float>        positions;    // xyz per vertex
+    std::vector<float>        normals;      // xyz per vertex; empty for flat shading
+    std::vector<float>        uvs;          // st per vertex; empty without texture coordinates
+    std::vector<unsigned int> indices;      // 3 per triangle, counter-clockwise from outside
+    std::vector<unsigned int> triMaterial;  // material of each triangle
+    unsigned int material;         // material bound to the prim itself
+    unsigned int subsetMaterials;  // number of GeomSubsets with their own material
+    size_t corners;                // triangle corners before welding
+    float boundsMin[3], boundsMax[3];  // world space
 
-    bool empty() const { return indices.empty(); }
+    size_t triangleCount() const { return indices.size() / 3; }
+    size_t vertexCount() const { return positions.size() / 3; }
 };
 
 // A UsdGeomCamera at the stage's start time, in world space. The window is
@@ -126,7 +101,6 @@ struct FlatGeometry
 // units (orthographic); the viewer fits it to the viewport's aspect ratio.
 struct SceneCamera
 {
-    entt::entity entity = entt::null;
     std::string path;
     std::array<float, 3> eye = {0, 0, 0}, forward = {0, 0, -1}, up = {0, 1, 0};
     float halfWidth = 1.0f, halfHeight = 1.0f;
@@ -144,19 +118,25 @@ public:
     bool loaded() const { return static_cast<bool>(m_stage); }
     const std::string& filePath() const { return m_filePath; }
     const pxr::UsdStageRefPtr& stage() const { return m_stage; }
-    entt::registry& registry() { return m_registry; }
-    entt::entity root() const { return m_root; }
-    const FlatGeometry& geometry() const { return m_geometry; }
+    size_t primCount() const { return m_primCount; }
+    // The mesh id of a mesh is its index in meshes().
+    const std::vector<RenderMesh>& meshes() const { return m_meshes; }
+    const std::vector<Material>& materials() const { return m_materials; }
+    const std::vector<Texture>& textures() const { return m_textures; }
     const std::vector<SceneCamera>& cameras() const { return m_cameras; }
     const std::vector<std::string>& warnings() const { return m_warnings; }
     bool zUp() const { return m_zUp; }
+    const float* boundsMin() const { return m_boundsMin; }
+    const float* boundsMax() const { return m_boundsMax; }
+    size_t triangleCount() const;
 
-    pxr::UsdPrim prim(entt::entity e) const;
+    // -1 when the prim has no mesh or is not a camera
+    int meshIndex(const pxr::SdfPath& path) const;
+    int cameraIndex(const pxr::SdfPath& path) const;
 
 private:
-    entt::entity createEntities(const pxr::UsdPrim& prim, entt::entity parent);
     void extractGeometry();
-    void extractCameras(entt::entity e);
+    void extractCameras();
     unsigned int materialFor(const pxr::UsdShadeMaterial& material);
     unsigned int displayColorMaterial(const pxr::UsdPrim& prim);
     // srgbByDefault: color space when sourceColorSpace is neither "raw" nor "sRGB"
@@ -167,12 +147,16 @@ private:
     std::string         m_filePath;
     pxr::UsdStageRefPtr m_stage;
     pxr::UsdTimeCode    m_time;
-    entt::registry      m_registry;
-    entt::entity        m_root = entt::null;
-    FlatGeometry        m_geometry;
+    size_t              m_primCount = 0;
+    std::vector<RenderMesh>  m_meshes;
+    std::vector<Material>    m_materials;
+    std::vector<Texture>     m_textures;
     std::vector<SceneCamera> m_cameras;
     std::vector<std::string> m_warnings;
+    std::unordered_map<pxr::SdfPath, unsigned int, pxr::SdfPath::Hash> m_meshByPath;
     std::map<pxr::SdfPath, unsigned int> m_materialCache;
     std::map<std::tuple<std::string, bool, int, int>, int> m_textureCache;
+    float               m_boundsMin[3] = {0, 0, 0};
+    float               m_boundsMax[3] = {0, 0, 0};
     bool                m_zUp = false;
 };

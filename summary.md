@@ -34,6 +34,13 @@ a sample app (see `logbook.md`, October 24th, tasks 1 to 3).
      real `McUsd.usdz` asset.
    - The installed binary runs in a clean environment.
 
+4. **Update (October 28th).** The `cloudxr` branch is merged into `main`. The
+   viewer no longer uses EnTT: the USD stage is the scene graph, each prim is
+   a local-space mesh welded by meshoptimizer 1.3, and OptiX renders one GAS
+   per mesh under an IAS. The device code is compiled to OptiX-IR. meshoptimizer,
+   the OpenXR loader, the Vulkan headers and the CloudXR SDK are installed for
+   all users, and `install_all_users.sh` was removed. See `logbook.md`.
+
 ## Where things are
 
 | Path | Contents |
@@ -41,7 +48,6 @@ a sample app (see `logbook.md`, October 24th, tasks 1 to 3).
 | `logbook.md` | Task list and detailed results |
 | `CLAUDE.md` | Working notes for Claude Code sessions |
 | `UsdOptixViewer/` | App sources, CMake project, test scenes, README |
-| `install_all_users.sh` | The script used for task 3 (can't be re-run; its sources were cleaned up) |
 | `~/.local/opt/UsdOptixViewer` | Installed app and sample assets |
 | `/opt/viztools`, `/usr/local/cuda-13.2` | Installed tools |
 

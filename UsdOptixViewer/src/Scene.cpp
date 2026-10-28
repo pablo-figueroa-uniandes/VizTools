@@ -2,12 +2,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
+
+#include <meshoptimizer.h>
 
 #include <pxr/base/gf/camera.h>
 #include <pxr/base/gf/frustum.h>
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/usd/ar/asset.h>
 #include <pxr/usd/ar/resolver.h>
+#include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdGeom/cube.h>
 #include <pxr/usd/usdGeom/mesh.h>
@@ -157,6 +161,69 @@ void meshFromSphere(double radius, LocalMesh& out)
         out.cornerNormals.push_back(out.points[idx]);  // normalized later
 }
 
+// Turns per-corner attributes (3 corners per triangle) into an indexed mesh
+// with meshoptimizer. Corners with the same position, normal and st become one
+// vertex. The triangles are grouped by material and sorted for spatial
+// locality within each group, and the vertices are stored in the order the
+// triangles first use them, so a ray's hits touch nearby memory.
+void weldCorners(std::vector<float> positions, std::vector<float> normals, std::vector<float> uvs,
+                 const std::vector<unsigned>& triMaterial, RenderMesh& out)
+{
+    const size_t corners = positions.size() / 3, triCount = corners / 3;
+    std::vector<meshopt_Stream> streams = {{positions.data(), 3 * sizeof(float), 3 * sizeof(float)}};
+    if (!normals.empty())
+        streams.push_back({normals.data(), 3 * sizeof(float), 3 * sizeof(float)});
+    if (!uvs.empty())
+        streams.push_back({uvs.data(), 2 * sizeof(float), 2 * sizeof(float)});
+    std::vector<unsigned> remap(corners);
+    const size_t vertexCount =
+        meshopt_generateVertexRemapMulti(remap.data(), nullptr, corners, corners, streams.data(), streams.size());
+    auto remapStream = [&](std::vector<float>& stream, size_t floats, size_t from, size_t to,
+                           const std::vector<unsigned>& table) {
+        if (stream.empty())
+            return;
+        std::vector<float> result(to * floats);
+        meshopt_remapVertexBuffer(result.data(), stream.data(), from, floats * sizeof(float), table.data());
+        stream.swap(result);
+    };
+    std::vector<unsigned> welded(corners);
+    meshopt_remapIndexBuffer(welded.data(), nullptr, corners, remap.data());
+    remapStream(positions, 3, corners, vertexCount, remap);
+    remapStream(normals, 3, corners, vertexCount, remap);
+    remapStream(uvs, 2, corners, vertexCount, remap);
+
+    std::vector<unsigned> order(triCount);
+    std::iota(order.begin(), order.end(), 0u);
+    std::stable_sort(order.begin(), order.end(),
+                     [&](unsigned a, unsigned b) { return triMaterial[a] < triMaterial[b]; });
+    std::vector<unsigned> sorted(corners);
+    out.triMaterial.resize(triCount);
+    for (size_t t = 0; t < triCount; ++t)
+    {
+        std::copy_n(&welded[3 * size_t(order[t])], 3, &sorted[3 * t]);
+        out.triMaterial[t] = triMaterial[order[t]];
+    }
+    for (size_t begin = 0, end; begin < triCount; begin = end)
+    {
+        for (end = begin + 1; end < triCount && out.triMaterial[end] == out.triMaterial[begin]; ++end)
+            ;
+        meshopt_spatialSortTriangles(&sorted[3 * begin], &sorted[3 * begin], 3 * (end - begin), positions.data(),
+                                     vertexCount, 3 * sizeof(float));
+    }
+
+    std::vector<unsigned> fetch(vertexCount);
+    const size_t used = meshopt_optimizeVertexFetchRemap(fetch.data(), sorted.data(), corners, vertexCount);
+    out.indices.resize(corners);
+    meshopt_remapIndexBuffer(out.indices.data(), sorted.data(), corners, fetch.data());
+    remapStream(positions, 3, vertexCount, used, fetch);
+    remapStream(normals, 3, vertexCount, used, fetch);
+    remapStream(uvs, 2, vertexCount, used, fetch);
+    out.positions = std::move(positions);
+    out.normals = std::move(normals);
+    out.uvs = std::move(uvs);
+    out.corners = corners;
+}
+
 // Value of a shader input, following connections to material interface
 // inputs. Returns false when the input is unset or driven by another shader.
 template <typename T>
@@ -221,21 +288,26 @@ bool Scene::load(const std::string& path, std::string& error)
     m_filePath = path;
     m_zUp = UsdGeomGetStageUpAxis(stage) == UsdGeomTokens->z;
     m_time = stage->HasAuthoredTimeCodeRange() ? UsdTimeCode(stage->GetStartTimeCode()) : UsdTimeCode::Default();
-    m_root = createEntities(stage->GetPseudoRoot(), entt::null);
+    const UsdPrimRange prims = UsdPrimRange::Stage(stage, UsdTraverseInstanceProxies());
+    m_primCount = size_t(std::distance(prims.begin(), prims.end()));
     extractGeometry();
-    extractCameras(m_root);
+    extractCameras();
     return true;
 }
 
 void Scene::clear()
 {
-    m_registry.clear();
-    m_root = entt::null;
-    m_geometry = FlatGeometry{};
+    m_meshes.clear();
+    m_meshByPath.clear();
+    m_materials.clear();
+    m_textures.clear();
     m_cameras.clear();
     m_warnings.clear();
     m_materialCache.clear();
     m_textureCache.clear();
+    m_primCount = 0;
+    std::fill_n(m_boundsMin, 3, 0.0f);
+    std::fill_n(m_boundsMax, 3, 0.0f);
     m_stage = nullptr;
     m_filePath.clear();
 }
@@ -246,23 +318,26 @@ void Scene::warn(const std::string& message)
         m_warnings.push_back(message);
 }
 
-UsdPrim Scene::prim(entt::entity e) const
+size_t Scene::triangleCount() const
 {
-    if (!m_stage || !m_registry.valid(e))
-        return {};
-    return m_stage->GetPrimAtPath(m_registry.get<PrimInfo>(e).path);
+    size_t count = 0;
+    for (const RenderMesh& mesh : m_meshes)
+        count += mesh.triangleCount();
+    return count;
 }
 
-entt::entity Scene::createEntities(const UsdPrim& prim, entt::entity parent)
+int Scene::meshIndex(const SdfPath& path) const
 {
-    const entt::entity e = m_registry.create();
-    m_registry.emplace<PrimInfo>(e, prim.GetPath(), prim.IsPseudoRoot() ? std::string("/") : prim.GetName().GetString(),
-                                 prim.GetTypeName().GetString());
-    Hierarchy hierarchy{parent, {}};
-    for (const UsdPrim& child : prim.GetFilteredChildren(UsdTraverseInstanceProxies()))
-        hierarchy.children.push_back(createEntities(child, e));
-    m_registry.emplace<Hierarchy>(e, std::move(hierarchy));
-    return e;
+    const auto it = m_meshByPath.find(path);
+    return it == m_meshByPath.end() ? -1 : int(it->second);
+}
+
+int Scene::cameraIndex(const SdfPath& path) const
+{
+    for (size_t i = 0; i < m_cameras.size(); ++i)
+        if (m_cameras[i].path == path.GetString())
+            return int(i);
+    return -1;
 }
 
 // ---- materials and textures -------------------------------------------------
@@ -273,8 +348,8 @@ unsigned int Scene::displayColorMaterial(const UsdPrim& prim)
     VtArray<GfVec3f> colors;
     if (UsdGeomGprim(prim).GetDisplayColorPrimvar().ComputeFlattened(&colors, m_time) && !colors.empty())
         m.color = {colors[0][0], colors[0][1], colors[0][2]};
-    m_geometry.materials.push_back(m);
-    return unsigned(m_geometry.materials.size() - 1);
+    m_materials.push_back(m);
+    return unsigned(m_materials.size() - 1);
 }
 
 unsigned int Scene::materialFor(const UsdShadeMaterial& material)
@@ -397,8 +472,8 @@ unsigned int Scene::materialFor(const UsdShadeMaterial& material)
         else if (normal)
             warn("Unsupported shader driving normal: " + shaderId(normal).GetString() + " (" + m.name + ")");
     }
-    m_geometry.materials.push_back(m);
-    const unsigned index = unsigned(m_geometry.materials.size() - 1);
+    m_materials.push_back(m);
+    const unsigned index = unsigned(m_materials.size() - 1);
     m_materialCache[path] = index;
     return index;
 }
@@ -478,8 +553,8 @@ int Scene::loadTexture(const UsdShadeShader& shader, bool srgbByDefault)
         t.wrapS = wrapS;
         t.wrapT = wrapT;
         stbi_image_free(pixels);
-        m_geometry.textures.push_back(std::move(t));
-        index = int(m_geometry.textures.size() - 1);
+        m_textures.push_back(std::move(t));
+        index = int(m_textures.size() - 1);
     }
     else
         warn("Could not load texture " + resolved + (buffer ? std::string(": ") + stbi_failure_reason() : ""));
@@ -491,13 +566,11 @@ int Scene::loadTexture(const UsdShadeShader& shader, bool srgbByDefault)
 void Scene::extractGeometry()
 {
     UsdGeomXformCache xformCache(m_time);
-    FlatGeometry& g = m_geometry;
     float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
 
-    for (auto [e, info] : m_registry.view<PrimInfo>().each())
+    for (const UsdPrim& p : UsdPrimRange::Stage(m_stage, UsdTraverseInstanceProxies()))
     {
-        const UsdPrim p = m_stage->GetPrimAtPath(info.path);
-        if (!p || !p.IsA<UsdGeomGprim>())
+        if (!p.IsA<UsdGeomGprim>())
             continue;
         const UsdGeomImageable imageable(p);
         const TfToken purpose = imageable.ComputePurpose();
@@ -543,11 +616,11 @@ void Scene::extractGeometry()
         }
 
         // texture coordinates, read from the primvar the material asks for
-        std::string uvSet = g.materials[baseMaterial].uvSet;
+        std::string uvSet = m_materials[baseMaterial].uvSet;
         for (unsigned m : faceMaterial)
-            if (g.materials[m].usesTextures())
+            if (m_materials[m].usesTextures())
             {
-                uvSet = g.materials[m].uvSet;
+                uvSet = m_materials[m].uvSet;
                 break;
             }
         VtArray<GfVec2f> uvs;
@@ -566,75 +639,93 @@ void Scene::extractGeometry()
             return i < uvs.size() ? uvs[i] : GfVec2f(0.0f);
         };
 
-        const GfMatrix4d toWorld = xformCache.GetLocalToWorldTransform(p);
-        const GfMatrix4d normalToWorld = toWorld.GetInverse().GetTranspose();
-        const unsigned baseVertex = unsigned(g.vertices.size() / 3);
-        for (const GfVec3f& pt : local.points)
+        // every triangle corner with its attributes, in the prim's local space
+        const unsigned triCount = unsigned(local.indices.size() / 3);
+        std::vector<float> positions, normals, cornerUVs;
+        std::vector<unsigned> triMaterial(triCount);
+        for (unsigned t = 0; t < triCount; ++t)
         {
-            const GfVec3d w = toWorld.Transform(GfVec3d(pt));
-            for (int k = 0; k < 3; ++k)
+            triMaterial[t] = faceMaterial[local.faceOfTri[t]];
+            for (int c = 0; c < 3; ++c)
             {
-                g.vertices.push_back(float(w[k]));
-                lo[k] = std::min(lo[k], float(w[k]));
-                hi[k] = std::max(hi[k], float(w[k]));
+                const GfVec3f& pt = local.points[local.indices[3 * t + c]];
+                positions.insert(positions.end(), {pt[0], pt[1], pt[2]});
+                if (!local.cornerNormals.empty())
+                {
+                    GfVec3f n = local.cornerNormals[3 * t + c];
+                    if (n.GetLength() > 1e-12f)
+                        n.Normalize();
+                    normals.insert(normals.end(), {n[0], n[1], n[2]});
+                }
+                if (!uvs.empty())
+                {
+                    const GfVec2f uv = cornerUV(t, c);
+                    cornerUVs.insert(cornerUVs.end(), {uv[0], uv[1]});
+                }
             }
         }
 
-        const unsigned meshId = unsigned(g.meshEntity.size());
-        const unsigned firstTri = unsigned(g.indices.size() / 3);
-        const unsigned triCount = unsigned(local.indices.size() / 3);
-        for (unsigned idx : local.indices)
-            g.indices.push_back(baseVertex + idx);
-        g.triMesh.insert(g.triMesh.end(), triCount, meshId);
-        for (unsigned t = 0; t < triCount; ++t)
+        RenderMesh mesh;
+        mesh.path = p.GetPath();
+        mesh.material = baseMaterial;
+        mesh.subsetMaterials = subsetMaterials;
+        weldCorners(std::move(positions), std::move(normals), std::move(cornerUVs), triMaterial, mesh);
+
+        // USD transforms row vectors (p * M); OptiX wants the transpose
+        const GfMatrix4d toWorld = xformCache.GetLocalToWorldTransform(p);
+        for (int r = 0; r < 3; ++r)
+            for (int c = 0; c < 4; ++c)
+                mesh.toWorld[4 * r + c] = float(toWorld[c][r]);
+        std::fill_n(mesh.boundsMin, 3, INFINITY);
+        std::fill_n(mesh.boundsMax, 3, -INFINITY);
+        for (size_t v = 0; v < mesh.vertexCount(); ++v)
         {
-            g.triMaterial.push_back(faceMaterial[local.faceOfTri[t]]);
-            for (int c = 0; c < 3; ++c)
+            const GfVec3d w = toWorld.Transform(GfVec3d(mesh.positions[3 * v], mesh.positions[3 * v + 1],
+                                                        mesh.positions[3 * v + 2]));
+            for (int k = 0; k < 3; ++k)
             {
-                const GfVec2f uv = cornerUV(t, c);
-                g.triUVs.insert(g.triUVs.end(), {uv[0], uv[1]});
-                GfVec3d n(0.0);
-                if (!local.cornerNormals.empty())
-                {
-                    n = normalToWorld.TransformDir(GfVec3d(local.cornerNormals[3 * t + c]));
-                    if (n.GetLength() > 1e-12)
-                        n.Normalize();
-                }
-                g.triNormals.insert(g.triNormals.end(), {float(n[0]), float(n[1]), float(n[2])});
+                mesh.boundsMin[k] = std::min(mesh.boundsMin[k], float(w[k]));
+                mesh.boundsMax[k] = std::max(mesh.boundsMax[k], float(w[k]));
             }
         }
-        g.meshEntity.push_back(e);
-        m_registry.emplace<MeshGeometry>(e, meshId, firstTri, triCount, baseMaterial, subsetMaterials,
-                                         !uvs.empty());
+        for (int k = 0; k < 3; ++k)
+        {
+            lo[k] = std::min(lo[k], mesh.boundsMin[k]);
+            hi[k] = std::max(hi[k], mesh.boundsMax[k]);
+        }
 
         bool textured = false;
         for (unsigned m : faceMaterial)
-            textured = textured || g.materials[m].usesTextures();
+            textured = textured || m_materials[m].usesTextures();
         if (textured && uvs.empty())
-            warn("Textured prim without '" + uvSet + "' texture coordinates: " + info.path.GetString());
+            warn("Textured prim without '" + uvSet + "' texture coordinates: " + p.GetPath().GetString());
+
+        m_meshByPath[mesh.path] = unsigned(m_meshes.size());
+        m_meshes.push_back(std::move(mesh));
     }
 
-    if (!g.empty())
+    if (!m_meshes.empty())
         for (int k = 0; k < 3; ++k)
         {
-            g.boundsMin[k] = lo[k];
-            g.boundsMax[k] = hi[k];
+            m_boundsMin[k] = lo[k];
+            m_boundsMax[k] = hi[k];
         }
 }
 
 // ---- cameras ----------------------------------------------------------------
 // Walks the hierarchy depth first, so cameras keep the order of the stage.
-void Scene::extractCameras(entt::entity e)
+void Scene::extractCameras()
 {
-    if (const UsdPrim p = prim(e); p && p.IsA<UsdGeomCamera>())
+    for (const UsdPrim& p : UsdPrimRange::Stage(m_stage, UsdTraverseInstanceProxies()))
     {
+        if (!p.IsA<UsdGeomCamera>())
+            continue;
         // GfFrustum drops any scale in the camera's transform, as USD requires
         const GfCamera camera = UsdGeomCamera(p).GetCamera(m_time);
         const GfFrustum frustum = camera.GetFrustum();
         const GfVec3d eye = frustum.GetPosition(), forward = frustum.ComputeViewDirection(),
                       up = frustum.ComputeUpVector();
         SceneCamera c;
-        c.entity = e;
         c.path = p.GetPath().GetString();
         for (int k = 0; k < 3; ++k)
         {
@@ -652,9 +743,6 @@ void Scene::extractCameras(entt::entity e)
             c.fovYDeg = camera.GetFieldOfView(GfCamera::FOVVertical);
         if (window.GetMidpoint() != GfVec2d(0.0))
             warn("Camera aperture offsets are ignored: " + c.path);
-        m_registry.emplace<CameraView>(e, unsigned(m_cameras.size()));
         m_cameras.push_back(c);
     }
-    for (entt::entity child : m_registry.get<Hierarchy>(e).children)
-        extractCameras(child);
 }

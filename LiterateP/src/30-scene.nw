@@ -1,12 +1,13 @@
 @** The scene. Everything the viewer knows about a USD file passes through
-one object of class [[Scene]]. It has three jobs. First, it opens the stage and
-mirrors its prims into an EnTT \emph{registry}, so that the user interface can
-walk the hierarchy and attach information to any prim. Second, it resolves the
-materials of the scene: it follows UsdShade connections to the inputs of the
-UsdPreviewSurface shader, and loads the textures they name. Third, it
-\emph{flattens} every visible piece of geometry into a few large arrays of
-world-space triangles, which is the only form of geometry the renderer
-understands. Along the way it also collects the cameras of the stage, so that
+one object of class [[Scene]]. The USD stage is itself the scene graph: the
+user interface asks it directly for the hierarchy, the names and the types of
+the prims. What the stage does not offer is the form of the data that a ray
+tracer wants, and producing that form is the scene's work. It has three jobs.
+First, it turns every visible piece of geometry into a compact indexed
+triangle mesh, kept in the prim's own coordinate system and placed in the world
+by a transform. Second, it resolves the materials of the scene: it follows
+UsdShade connections to the inputs of the UsdPreviewSurface shader, and loads
+the textures they name. Third, it collects the cameras of the stage, so that
 the viewer can look through them.
 
 The declarations live in \lpfile{Scene.h} and the code in \lpfile{Scene.cpp}.
@@ -15,112 +16,92 @@ The header is short enough to be read as a table of contents for this part.
 <<UsdOptixViewer/src/Scene.h>>=
 <<Headers needed by the scene declarations>>
 
-<<The PrimInfo component>>
-
-<<The Hierarchy component>>
-
-<<The MeshGeometry component>>
-
-<<The CameraView component>>
-
 <<Texture wrap modes and decoded textures>>
 
 <<The ScalarInput material parameter>>
 
 <<The Material record>>
 
-<<The flattened world-space geometry>>
+<<A renderable mesh>>
 
 <<A camera of the stage>>
 
 <<The Scene class>>
-@ The header needs the standard containers, EnTT, and two USD headers: the
-stage itself and the UsdShade material class, which appears in the
-signature of a private member function.
+@ The header needs the standard containers and two USD headers: the stage
+itself and the UsdShade material class, which appears in the signature of a
+private member function. The hash map is the index from prim paths to meshes.
 
 <<Headers needed by the scene declarations>>=
-// A USD stage mirrored into an EnTT registry: one entity per prim, with
-// components describing its place in the hierarchy and its geometry.
+// A USD stage and what the renderer needs from it. The stage itself is the
+// scene graph (hierarchy, names, types); the scene adds one indexed
+// triangle mesh per renderable prim, its materials and textures, and the
+// stage's cameras.
 #pragma once
 
 #include <array>
 #include <map>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
-#include <entt/entt.hpp>
 #include <pxr/usd/usd/stage.h>
 #include <pxr/usd/usdShade/material.h>
-@* Entities and components. EnTT is an \emph{entity--component--system}
-library. An entity is nothing but an integer handle; data are attached to it as
-\emph{components}, plain structures stored in dense arrays, one array per
-component type. We create one entity for every prim of the stage, including the
-invisible pseudo-root ``[[/]]''. This costs little and gives every prim an
-identity that the user interface can store (the current selection is an
-entity) and that other parts of the program can decorate: only the prims that
-produce triangles receive a [[MeshGeometry]] component, so ``is this prim
-drawn?'' is simply ``does this entity have that component?''.
+@* Meshes for the renderer. The renderer traces rays through a two-level
+acceleration structure. At the bottom, every mesh has its own \emph{geometry
+acceleration structure} (GAS), built over its triangles in the mesh's own
+coordinates. At the top, one \emph{instance acceleration structure} (IAS)
+holds an \emph{instance} per mesh: a reference to its GAS, a $3\times4$
+transform that places it in the world, and a 32-bit instance id. This is the
+shape in which OptiX expects a scene of many objects, and it fits USD well:
+every prim has a local-to-world transform, so its points can stay exactly as
+the file authors them, and the transform rides along in the instance. A moved
+object changes only its instance; its GAS, the expensive part, stays valid.
+The instance id is the index of the mesh, which the device programs use to
+find its attributes and which the renderer writes into its picking buffer, so
+that a click on the image leads back to the prim.
 
-Every entity carries a [[PrimInfo]], which names the prim it stands for. The
-path is the key back into the USD stage; the name and the type name are copied
-because the hierarchy panel shows them for every visible row, every frame.
+A [[RenderMesh]] is the record of one such mesh. Each vertex has a position
+and, when the prim has them, a shading normal and texture coordinates, all in
+the prim's local space. The triangles are given by [[indices]] and, in
+parallel, by the material of each triangle in [[triMaterial]]: when a ray hits
+triangle $t$ of a mesh, OptiX reports the index $t$, and that is all the
+device needs to find the three vertices and the material. An empty
+[[normals]] array means ``shade flat''; an empty [[uvs]] array means that the
+prim has no texture coordinates. The remaining fields serve the inspector and
+the camera: the path of the prim, the material bound to the prim itself, the
+number of GeomSubsets that override it, how many triangle corners the prim had
+before identical ones were merged, and the bounds of the mesh in world space.
 
-<<The PrimInfo component>>=
-// ---- components -----------------------------------------------------------
-struct PrimInfo
+<<A renderable mesh>>=
+// One renderable prim (Mesh, Cube or Sphere) as an indexed triangle mesh in
+// the prim's local space, placed in the world by `toWorld`. Vertices are the
+// distinct corners of the source faces (position, shading normal and st),
+// welded and reordered with meshoptimizer.
+struct RenderMesh
 {
     pxr::SdfPath path;
-    std::string  name;
-    std::string  typeName;
-};
-@ The tree structure is stored explicitly. USD can of course enumerate the
-children of a prim, but doing so through the stage on every frame of the user
-interface would be wasteful, and the list would have to be filtered the same
-way every time. A [[Hierarchy]] keeps the parent and the children in USD's
-order. The root's parent is [[entt::null]].
-
-<<The Hierarchy component>>=
-struct Hierarchy
-{
-    entt::entity parent = entt::null;
-    std::vector<entt::entity> children;
-};
-@ A prim that contributed triangles remembers where they went. Its triangles
-occupy a contiguous range of the flattened arrays, from [[firstTriangle]] on;
-[[meshId]] is the small integer that the renderer writes into its picking
-buffer, so that a click on the image can be mapped back to the entity. The
-remaining fields are for the inspector: the index of the material bound to the
-prim, how many GeomSubsets override it, and whether texture coordinates were
-found.
-
-<<The MeshGeometry component>>=
-// Present on prims that contributed triangles to the rendered geometry.
-struct MeshGeometry
-{
-    unsigned int meshId;
-    unsigned int firstTriangle;
-    unsigned int triangleCount;
-    unsigned int material;        // material bound to the prim itself
+    std::array<float, 12> toWorld;          // row-major 3x4, acting on column vectors
+    std::vector<float>        positions;    // xyz per vertex
+    std::vector<float>        normals;      // xyz per vertex; empty for flat shading
+    std::vector<float>        uvs;          // st per vertex; empty without texture coordinates
+    std::vector<unsigned int> indices;      // 3 per triangle, counter-clockwise from outside
+    std::vector<unsigned int> triMaterial;  // material of each triangle
+    unsigned int material;         // material bound to the prim itself
     unsigned int subsetMaterials;  // number of GeomSubsets with their own material
-    bool hasUVs;
-};
-@ Camera prims receive a [[CameraView]] component instead. It only holds the
-index of the camera in the scene's list of cameras (described with the
-cameras, at the end of this part), so that the inspector can offer to look
-through the selected prim.
+    size_t corners;                // triangle corners before welding
+    float boundsMin[3], boundsMax[3];  // world space
 
-<<The CameraView component>>=
-// Present on UsdGeomCamera prims: index into Scene::cameras().
-struct CameraView
-{
-    unsigned int index;
+    size_t triangleCount() const { return indices.size() / 3; }
+    size_t vertexCount() const { return positions.size() / 3; }
 };
 @ The [[Scene]] class is small from the outside. A scene is either empty or
 holds one open stage; [[load]] replaces whatever was there. The accessors give
-the user interface the stage, the registry, the root entity, the flattened
-geometry, the cameras and the list of warnings collected while reading the file. The up
-axis matters to the camera, which must know whether ``up'' is $+y$ or $+z$.
+the user interface the stage, the meshes, materials, textures and cameras, and
+the list of warnings collected while reading the file. The number of prims and
+the total number of triangles are for the status bar. The up axis matters to
+the camera, which must know whether ``up'' is $+y$ or $+z$, and the bounds of
+the whole scene let it frame everything.
 
 <<The Scene class>>=
 class Scene
@@ -133,7 +114,12 @@ private:
 
     <<Data members of the scene>>
 };
-@
+@ A prim is identified by its [[SdfPath]] everywhere in the program: the
+selection is a path, and the hierarchy panel walks the stage. Two lookups turn
+a path into the index of its mesh or of its camera, with $-1$ for a prim that
+has neither, so ``is this prim drawn?'' is simply ``is [[meshIndex]]
+nonnegative?''.
+
 <<Public interface of the scene>>=
 bool load(const std::string& path, std::string& error);
 void clear();
@@ -141,38 +127,50 @@ void clear();
 bool loaded() const { return static_cast<bool>(m_stage); }
 const std::string& filePath() const { return m_filePath; }
 const pxr::UsdStageRefPtr& stage() const { return m_stage; }
-entt::registry& registry() { return m_registry; }
-entt::entity root() const { return m_root; }
-const FlatGeometry& geometry() const { return m_geometry; }
+size_t primCount() const { return m_primCount; }
+// The mesh id of a mesh is its index in meshes().
+const std::vector<RenderMesh>& meshes() const { return m_meshes; }
+const std::vector<Material>& materials() const { return m_materials; }
+const std::vector<Texture>& textures() const { return m_textures; }
 const std::vector<SceneCamera>& cameras() const { return m_cameras; }
 const std::vector<std::string>& warnings() const { return m_warnings; }
 bool zUp() const { return m_zUp; }
+const float* boundsMin() const { return m_boundsMin; }
+const float* boundsMax() const { return m_boundsMax; }
+size_t triangleCount() const;
 
-pxr::UsdPrim prim(entt::entity e) const;
-@ Besides the registry and the geometry, the scene keeps the time at which
-the stage is sampled, and two caches that we shall explain with the materials:
-a material is converted only once however many prims bind it, and a texture is
-decoded only once however many materials read it.
+// -1 when the prim has no mesh or is not a camera
+int meshIndex(const pxr::SdfPath& path) const;
+int cameraIndex(const pxr::SdfPath& path) const;
+@ Besides the stage and the vectors that the accessors expose, the scene
+keeps the time at which the stage is sampled, the index from paths to meshes,
+and two caches that we shall explain with the materials: a material is
+converted only once however many prims bind it, and a texture is decoded only
+once however many materials read it. Materials and textures refer to each
+other, and meshes to materials, by their indices in these vectors.
 
 <<Data members of the scene>>=
 std::string         m_filePath;
 pxr::UsdStageRefPtr m_stage;
 pxr::UsdTimeCode    m_time;
-entt::registry      m_registry;
-entt::entity        m_root = entt::null;
-FlatGeometry        m_geometry;
+size_t              m_primCount = 0;
+std::vector<RenderMesh>  m_meshes;
+std::vector<Material>    m_materials;
+std::vector<Texture>     m_textures;
 std::vector<SceneCamera> m_cameras;
 std::vector<std::string> m_warnings;
+std::unordered_map<pxr::SdfPath, unsigned int, pxr::SdfPath::Hash> m_meshByPath;
 std::map<pxr::SdfPath, unsigned int> m_materialCache;
 std::map<std::tuple<std::string, bool, int, int>, int> m_textureCache;
+float               m_boundsMin[3] = {0, 0, 0};
+float               m_boundsMax[3] = {0, 0, 0};
 bool                m_zUp = false;
 @ The private member functions do the real work, and each has its own
 sections below.
 
 <<Private helpers of the scene>>=
-entt::entity createEntities(const pxr::UsdPrim& prim, entt::entity parent);
 void extractGeometry();
-void extractCameras(entt::entity e);
+void extractCameras();
 unsigned int materialFor(const pxr::UsdShadeMaterial& material);
 unsigned int displayColorMaterial(const pxr::UsdPrim& prim);
 // srgbByDefault: color space when sourceColorSpace is neither "raw" nor "sRGB"
@@ -181,8 +179,9 @@ ScalarInput scalarInput(const pxr::UsdShadeShader& surface, const char* name, fl
 void warn(const std::string& message);
 @* The implementation file. \lpfile{Scene.cpp} begins with a number of
 helpers that know nothing about the [[Scene]] class: they turn USD geometry
-into triangles and read values out of shading networks. They live in an
-anonymous namespace. The member functions follow.
+into triangles, weld the triangles into indexed meshes and read values out of
+shading networks. They live in an anonymous namespace. The member functions
+follow.
 
 <<UsdOptixViewer/src/Scene.cpp>>=
 <<Headers needed by the scene implementation>>
@@ -199,6 +198,8 @@ namespace {
 
 <<Generate the triangles of a sphere>>
 
+<<Weld the corners of a prim into an indexed mesh>>
+
 <<Read the value of a shader input>>
 
 <<Find the shader that drives an input>>
@@ -213,9 +214,9 @@ namespace {
 
 <<Collect a warning once>>
 
-<<Find the prim of an entity>>
+<<Count the triangles of the scene>>
 
-<<Mirror the prim hierarchy into the registry>>
+<<Find the mesh or the camera of a prim>>
 
 <<Material for a prim without a bound material>>
 
@@ -225,25 +226,31 @@ namespace {
 
 <<Load a texture once>>
 
-<<Flatten the stage into world-space triangles>>
+<<Extract the renderable meshes of the stage>>
 
 <<Collect the cameras of the stage>>
-@ Besides the USD schemas for geometry, shading and cameras, we need the asset
-resolver (to read textures, even from inside \lpfile{.usdz} packages) and the
-image decoder. [[PXR_NAMESPACE_USING_DIRECTIVE]] lets us write [[UsdPrim]]
-instead of [[pxr::UsdPrim]] in this file.
+@ Besides the USD schemas for geometry, shading and cameras, we need the prim
+range that walks the stage, the asset resolver (to read textures, even from
+inside \lpfile{.usdz} packages), \emph{meshoptimizer} (to weld and reorder
+triangles) and the image decoder. [[<numeric>]] provides [[std::iota]].
+[[PXR_NAMESPACE_USING_DIRECTIVE]] lets us write [[UsdPrim]] instead of
+[[pxr::UsdPrim]] in this file.
 
 <<Headers needed by the scene implementation>>=
 #include "Scene.h"
 
 #include <algorithm>
 #include <cmath>
+#include <numeric>
+
+#include <meshoptimizer.h>
 
 #include <pxr/base/gf/camera.h>
 #include <pxr/base/gf/frustum.h>
 #include <pxr/base/gf/matrix4d.h>
 #include <pxr/usd/ar/asset.h>
 #include <pxr/usd/ar/resolver.h>
+#include <pxr/usd/usd/primRange.h>
 #include <pxr/usd/usdGeom/camera.h>
 #include <pxr/usd/usdGeom/cube.h>
 #include <pxr/usd/usdGeom/mesh.h>
@@ -267,8 +274,22 @@ Two global properties of the stage are recorded. The up axis is part of the
 stage metadata and defaults to $y$. The time is the start of the authored
 time range if there is one, and USD's \emph{default} time otherwise: the
 viewer shows a single moment, and for an animated file the first frame is the
-natural choice. Then we build the entities, flatten the geometry and collect
-the cameras.
+natural choice. Then we count the prims, extract the geometry and collect the
+cameras.
+
+The prims are walked with a [[UsdPrimRange]], which visits the stage depth
+first, in the order of the file, skipping the invisible pseudo-root. The
+predicate [[UsdTraverseInstanceProxies]] deserves a word. USD shares the
+contents of \emph{instanceable} prims: all instances of a model point to a
+single hidden \emph{prototype}, and by default the children of an instance are
+not visited at all. With this predicate, the walk descends into every instance
+and yields \emph{instance proxies}, read-only stand-ins for the prototype's
+prims at the instance's location. Each instance therefore gets its own row in
+the hierarchy panel and its own mesh, with its own copy of the triangles. The
+two-level acceleration structure could let all instances of a prototype share
+one GAS; the viewer keeps one mesh per prim, which is simpler, and costs
+memory only in scenes with very many instances. The hierarchy panel walks the
+stage with the same predicate, so the prim count and the tree agree.
 
 <<Open a stage and build the scene>>=
 bool Scene::load(const std::string& path, std::string& error)
@@ -284,24 +305,30 @@ bool Scene::load(const std::string& path, std::string& error)
     m_filePath = path;
     m_zUp = UsdGeomGetStageUpAxis(stage) == UsdGeomTokens->z;
     m_time = stage->HasAuthoredTimeCodeRange() ? UsdTimeCode(stage->GetStartTimeCode()) : UsdTimeCode::Default();
-    m_root = createEntities(stage->GetPseudoRoot(), entt::null);
+    const UsdPrimRange prims = UsdPrimRange::Stage(stage, UsdTraverseInstanceProxies());
+    m_primCount = size_t(std::distance(prims.begin(), prims.end()));
     extractGeometry();
-    extractCameras(m_root);
+    extractCameras();
     return true;
 }
-@ Clearing destroys every entity, forgets the cameras and empties both caches. Releasing the
+@ Clearing forgets the meshes, materials, textures and cameras, empties the
+index and both caches, and resets the bounds to the zero box. Releasing the
 stage pointer closes the stage, unless somebody else still holds it.
 
 <<Forget the current stage>>=
 void Scene::clear()
 {
-    m_registry.clear();
-    m_root = entt::null;
-    m_geometry = FlatGeometry{};
+    m_meshes.clear();
+    m_meshByPath.clear();
+    m_materials.clear();
+    m_textures.clear();
     m_cameras.clear();
     m_warnings.clear();
     m_materialCache.clear();
     m_textureCache.clear();
+    m_primCount = 0;
+    std::fill_n(m_boundsMin, 3, 0.0f);
+    std::fill_n(m_boundsMax, 3, 0.0f);
     m_stage = nullptr;
     m_filePath.clear();
 }
@@ -317,115 +344,50 @@ void Scene::warn(const std::string& message)
     if (std::find(m_warnings.begin(), m_warnings.end(), message) == m_warnings.end())
         m_warnings.push_back(message);
 }
-@ Going from an entity back to its prim is a path lookup on the stage. An
-invalid entity (for instance [[entt::null]], meaning ``nothing selected'')
-yields an invalid prim, which callers test with [[if (prim)]].
+@ The total number of triangles is summed over the meshes when asked; the
+status bar asks once a frame, and a scene has far fewer meshes than triangles.
 
-<<Find the prim of an entity>>=
-UsdPrim Scene::prim(entt::entity e) const
+<<Count the triangles of the scene>>=
+size_t Scene::triangleCount() const
 {
-    if (!m_stage || !m_registry.valid(e))
-        return {};
-    return m_stage->GetPrimAtPath(m_registry.get<PrimInfo>(e).path);
+    size_t count = 0;
+    for (const RenderMesh& mesh : m_meshes)
+        count += mesh.triangleCount();
+    return count;
 }
-@ The hierarchy is copied by a recursive walk. Each entity gets its
-[[PrimInfo]] before its children are visited, so the entities are created in
-depth-first preorder, and its [[Hierarchy]] after, when the children's handles
-are known.
+@ Meshes are looked up in a hash map filled as they are created, because the
+user interface asks about the selected prim every frame and a large scene has
+tens of thousands of meshes. Cameras are few, so a linear search by path is
+enough.
 
-The predicate [[UsdTraverseInstanceProxies]] deserves a word. USD shares the
-contents of \emph{instanceable} prims: all instances of a model point to a
-single hidden \emph{prototype}, and by default the children of an instance are
-not visible at all. With this predicate, the walk descends into every instance
-and yields \emph{instance proxies}, read-only stand-ins for the prototype's
-prims at the instance's location. Each instance therefore gets its own
-entities, its own row in the tree and, later, its own copy of the triangles.
-That is wasteful for scenes with thousands of instances, but it keeps the
-renderer simple: there is just one bag of triangles.
-
-<<Mirror the prim hierarchy into the registry>>=
-entt::entity Scene::createEntities(const UsdPrim& prim, entt::entity parent)
+<<Find the mesh or the camera of a prim>>=
+int Scene::meshIndex(const SdfPath& path) const
 {
-    const entt::entity e = m_registry.create();
-    m_registry.emplace<PrimInfo>(e, prim.GetPath(), prim.IsPseudoRoot() ? std::string("/") : prim.GetName().GetString(),
-                                 prim.GetTypeName().GetString());
-    Hierarchy hierarchy{parent, {}};
-    for (const UsdPrim& child : prim.GetFilteredChildren(UsdTraverseInstanceProxies()))
-        hierarchy.children.push_back(createEntities(child, e));
-    m_registry.emplace<Hierarchy>(e, std::move(hierarchy));
-    return e;
+    const auto it = m_meshByPath.find(path);
+    return it == m_meshByPath.end() ? -1 : int(it->second);
 }
-@* The flattened geometry. The renderer builds a single acceleration
-structure over all the triangles of the scene, already placed in world space.
-[[FlatGeometry]] is that soup, together with everything a hit point needs in
-order to be shaded. Positions are shared between the triangles of one prim and
-addressed by [[indices]]; all the other arrays are \emph{per triangle}, so that
-the GPU, which learns only the index of the triangle that was hit, can find
-its mesh, its material, the texture coordinates of its three corners and the
-shading normals of its three corners. A zero normal means ``no shading normal;
-use the flat normal of the triangle''. Materials and textures are kept in
-arrays and referred to by index. Finally, [[meshEntity]] maps a [[meshId]] back
-to its entity, and the bounds let the camera frame the whole scene.
 
-The cameras of the stage are kept next to the geometry, in a list of
-[[SceneCamera]] records, one per [[UsdGeomCamera]] prim. Like the geometry,
-each is evaluated once, at the scene's time, and stored in world space. A USD
-camera is described by its transform and by physical lens parameters: a focal
-length and the size of the film back (the \emph{aperture}), in tenths of a
-scene unit for orthographic cameras. What the renderer wants is simpler: an
-eye point, a forward and an up direction, and the half size of the
-\emph{window}, the part of the image plane that the camera sees. For a
-perspective camera the window lies at distance 1, so its half height is the
-tangent of half the vertical field of view; for an orthographic camera it is
-measured in scene units. The viewport rarely has the shape of the camera's
-film back, so the window is fitted to it later, in the application. The
-vertical field of view is kept for the inspector.
-
-<<The flattened world-space geometry>>=
-// Geometry flattened to world space, ready to upload to the renderer.
-struct FlatGeometry
+int Scene::cameraIndex(const SdfPath& path) const
 {
-    std::vector<float>        vertices;     // xyz
-    std::vector<unsigned int> indices;      // 3 per triangle
-    std::vector<unsigned int> triMesh;      // mesh id per triangle
-    std::vector<unsigned int> triMaterial;  // material per triangle
-    std::vector<float>        triUVs;       // 6 per triangle (st of each corner)
-    std::vector<float>        triNormals;   // 9 per triangle (shading normal of each corner, 0 = flat)
-    std::vector<Material>     materials;
-    std::vector<Texture>      textures;
-    std::vector<entt::entity> meshEntity;   // entity of each mesh id
-    float boundsMin[3] = {0, 0, 0};
-    float boundsMax[3] = {0, 0, 0};
+    for (size_t i = 0; i < m_cameras.size(); ++i)
+        if (m_cameras[i].path == path.GetString())
+            return int(i);
+    return -1;
+}
+@* Extracting the geometry. Extraction is one pass over the prims. For each
+prim that should be drawn we produce its triangles in local space, decide the
+material of each face, read its texture coordinates, gather the attributes of
+every triangle corner, weld the corners into an indexed mesh, and record the
+transform that places it in the world. Each of these steps gets a section of
+its own.
 
-    bool empty() const { return indices.empty(); }
-};
-@
-<<A camera of the stage>>=
-// A UsdGeomCamera at the stage's start time, in world space. The window is
-// the image plane at distance 1 (perspective) or the view size in scene
-// units (orthographic); the viewer fits it to the viewport's aspect ratio.
-struct SceneCamera
-{
-    entt::entity entity = entt::null;
-    std::string path;
-    std::array<float, 3> eye = {0, 0, 0}, forward = {0, 0, -1}, up = {0, 1, 0};
-    float halfWidth = 1.0f, halfHeight = 1.0f;
-    bool orthographic = false;
-    float clipNear = 0.0f, clipFar = 1e16f;
-    float fovYDeg = 0.0f;  // vertical field of view of a perspective camera
-};
-@ Flattening is one pass over the entities. For each prim that should be
-drawn we produce its triangles in local space, decide the material of each
-face, read its texture coordinates, transform it to world space and append it
-to the arrays. Each of these steps gets a section of its own.
-
-<<Flatten the stage into world-space triangles>>=
+<<Extract the renderable meshes of the stage>>=
 // ---- geometry ---------------------------------------------------------------
 void Scene::extractGeometry()
 {
-    <<Prepare the flattening of the stage>>
+    <<Prepare the extraction of the geometry>>
 
-    for (auto [e, info] : m_registry.view<PrimInfo>().each())
+    for (const UsdPrim& p : UsdPrimRange::Stage(m_stage, UsdTraverseInstanceProxies()))
     {
         <<Skip prims that are not visible renderable geometry>>
 
@@ -435,22 +397,27 @@ void Scene::extractGeometry()
 
         <<Read the texture coordinates of a prim>>
 
-        <<Transform the points of a prim to world space>>
+        <<Gather the corners of a prim's triangles>>
 
-        <<Append the triangles of a prim to the flat geometry>>
+        <<Build the indexed mesh of a prim>>
+
+        <<Pass the transform of a mesh to the renderer>>
+        <<Compute the world bounds of a mesh>>
 
         <<Warn about textured prims without texture coordinates>>
+
+        <<Register the mesh of a prim>>
     }
 
     <<Record the bounds of the scene>>
 }
 @ A [[UsdGeomXformCache]] computes local-to-world matrices and remembers the
 matrices of ancestors, so that siblings deep in the tree do not recompute the
-same chain of transforms. The bounds start empty, at $+\infty$ and $-\infty$.
+same chain of transforms. The bounds of the scene start empty, at $+\infty$
+and $-\infty$.
 
-<<Prepare the flattening of the stage>>=
+<<Prepare the extraction of the geometry>>=
 UsdGeomXformCache xformCache(m_time);
-FlatGeometry& g = m_geometry;
 float lo[3] = {INFINITY, INFINITY, INFINITY}, hi[3] = {-INFINITY, -INFINITY, -INFINITY};
 @ Only \emph{gprims}, the geometric primitives of UsdGeom, can be drawn.
 Visibility is inherited, so we ask USD to \emph{compute} it rather than read
@@ -460,8 +427,7 @@ The \emph{purpose} works the same way; we draw what a final render would draw
 geometry that applications use for previews and manipulators.
 
 <<Skip prims that are not visible renderable geometry>>=
-const UsdPrim p = m_stage->GetPrimAtPath(info.path);
-if (!p || !p.IsA<UsdGeomGprim>())
+if (!p.IsA<UsdGeomGprim>())
     continue;
 const UsdGeomImageable imageable(p);
 const TfToken purpose = imageable.ComputePurpose();
@@ -629,7 +595,7 @@ a triangle has length twice its area, so summing the unnormalized cross
 products weights each triangle by its area: large faces dominate, and a sliver
 triangle does not tilt the normal. Since the triangles were rewound in the
 previous step, all the cross products point outward. The sums are normalized
-later, after the transformation to world space.
+later, when the corners of the triangles are gathered.
 
 <<Compute smooth normals for a subdivision surface>>=
 TfToken scheme;
@@ -650,9 +616,10 @@ if (normals.empty() && scheme != UsdGeomTokens->none)
 @ Finally each corner looks up its normal according to the interpolation:
 by face-vertex index, by point index, or by face. A [[constant]] normal falls
 through all the tests and uses element~0. An index beyond the array, which only
-a malformed file produces, gives the zero vector, which the renderer treats as
-``flat''. When there are no normals at all, [[cornerNormals]] stays empty and
-the whole mesh is shaded flat.
+a malformed file produces, gives the zero vector; where all three corners of a
+triangle carry it, the renderer falls back to the triangle's flat normal. When
+there are no normals at all, [[cornerNormals]] stays empty and the whole mesh
+is shaded flat.
 
 <<Pick the shading normal of each triangle corner>>=
 if (!normals.empty())
@@ -706,13 +673,14 @@ Each grid cell, with corners $a$ and $a+1$ on one stack and $b$ and $b+1$ on
 the next, becomes two triangles. The order $(a, a+1, b)$ is the outward one:
 near the equator at $\theta=0$, the edge from $a$ to $a+1$ runs toward $+z$
 and the edge from $a$ to $b$ runs toward $-y$, and $(0,0,1)\times(0,-1,0) =
-(1,0,0)$ points away from the center. (An earlier version had the opposite
-order, which went unnoticed while the shading was two-sided and flat; it
-became visible as soon as shading normals had to agree with the winding.)
+(1,0,0)$ points away from the center. The winding matters: shading normals
+must agree with it.
 
 On a sphere centered at the origin the normal at a point is the point itself,
-scaled; we store the points as normals and let the world-space step normalize
-them. Every corner thus gets an exact, smooth normal.
+scaled; we store the points as normals and let the gathering of the corners
+normalize them. Every corner thus gets an exact, smooth normal. The grid
+repeats points: the seam at $\theta=0$ and $\theta=2\pi$ has two copies of
+each point, and each pole has 49. Welding, below, merges them back.
 
 <<Generate the triangles of a sphere>>=
 void meshFromSphere(double radius, LocalMesh& out)
@@ -782,8 +750,8 @@ struct ScalarInput
     int channel = 0;
     float scale = 1.0f, bias = 0.0f;
 };
-@ The [[Material]] record. Texture fields are indices into
-[[FlatGeometry::textures]], with $-1$ for ``none''.
+@ The [[Material]] record. Texture fields are indices into the scene's
+[[textures]], with $-1$ for ``none''.
 
 <<The Material record>>=
 // Simplified UsdPreviewSurface: diffuse color, optionally from a texture
@@ -937,8 +905,8 @@ unsigned int Scene::displayColorMaterial(const UsdPrim& prim)
     VtArray<GfVec3f> colors;
     if (UsdGeomGprim(prim).GetDisplayColorPrimvar().ComputeFlattened(&colors, m_time) && !colors.empty())
         m.color = {colors[0][0], colors[0][1], colors[0][2]};
-    m_geometry.materials.push_back(m);
-    return unsigned(m_geometry.materials.size() - 1);
+    m_materials.push_back(m);
+    return unsigned(m_materials.size() - 1);
 }
 @ Converting a UsdShade material proceeds input by input.
 [[ComputeSurfaceSource]] finds the shader connected to the material's surface
@@ -982,8 +950,8 @@ m.name = path.GetString();
 m.color = {0.18f, 0.18f, 0.18f};  // UsdPreviewSurface default
 @
 <<Store a new Material in the cache>>=
-m_geometry.materials.push_back(m);
-const unsigned index = unsigned(m_geometry.materials.size() - 1);
+m_materials.push_back(m);
+const unsigned index = unsigned(m_materials.size() - 1);
 m_materialCache[path] = index;
 return index;
 @ The diffuse color. A plain value, possibly published on the material's
@@ -991,9 +959,8 @@ interface, is the easy case. But an input can carry both a value and a
 connection: many exporters write the color that a texture would average to
 next to the connection to the texture. [[inputValue]] does not return that
 value, because the connection wins, so we read the attribute's own value
-separately. It becomes the color used if the texture cannot be loaded. This
-matters in practice: before textures were supported, it was the reason a
-textured model looked plausible but plain.
+separately. It becomes the color used if the texture cannot be loaded, so a
+textured model whose image is missing still looks plausible.
 
 <<Read the diffuse color of a surface>>=
 GfVec3f c;
@@ -1200,8 +1167,7 @@ ScalarInput Scene::scalarInput(const UsdShadeShader& surface, const char* name, 
     return in;
 }
 @* Textures. Loading a texture turns a [[UsdUVTexture]] node into an index
-into [[FlatGeometry::textures]], or $-1$ with a warning if anything goes
-wrong.
+into the scene's [[textures]], or $-1$ with a warning if anything goes wrong.
 
 <<Load a texture once>>=
 int Scene::loadTexture(const UsdShadeShader& shader, bool srgbByDefault)
@@ -1288,14 +1254,14 @@ if (pixels)
     t.wrapS = wrapS;
     t.wrapT = wrapT;
     stbi_image_free(pixels);
-    m_geometry.textures.push_back(std::move(t));
-    index = int(m_geometry.textures.size() - 1);
+    m_textures.push_back(std::move(t));
+    index = int(m_textures.size() - 1);
 }
 else
     warn("Could not load texture " + resolved + (buffer ? std::string(": ") + stbi_failure_reason() : ""));
 m_textureCache[key] = index;
 return index;
-@* Materials per face. Back in the flattening loop, each prim needs a
+@* Materials per face. Back in the extraction loop, each prim needs a
 material for each of its faces. The material bound to the prim is found by
 [[ComputeBoundMaterial]], which applies USD's binding rules for us: bindings
 are inherited from ancestors, and a binding marked ``stronger than
@@ -1341,11 +1307,11 @@ missing value gives the coordinates $(0,0)$.
 
 <<Read the texture coordinates of a prim>>=
 // texture coordinates, read from the primvar the material asks for
-std::string uvSet = g.materials[baseMaterial].uvSet;
+std::string uvSet = m_materials[baseMaterial].uvSet;
 for (unsigned m : faceMaterial)
-    if (g.materials[m].usesTextures())
+    if (m_materials[m].usesTextures())
     {
-        uvSet = g.materials[m].uvSet;
+        uvSet = m_materials[m].uvSet;
         break;
     }
 VtArray<GfVec2f> uvs;
@@ -1363,128 +1329,327 @@ auto cornerUV = [&](unsigned tri, int corner) -> GfVec2f {
         i = local.faceOfTri[tri];
     return i < uvs.size() ? uvs[i] : GfVec2f(0.0f);
 };
-@* World space. The local-to-world matrix $M$ of the prim moves its points.
-USD's matrices act on row vectors, $p' = pM$, and [[Transform]] includes the
-translation. The points are transformed in double precision and stored as
-floats, and the bounds of the scene grow to include them. [[baseVertex]] is
-the index that the prim's first point receives in the shared array.
+@* Corners and vertices. A GPU vertex carries one value of every attribute:
+one position, one normal, one pair of texture coordinates. USD's points are
+not such vertices. A cube whose faces are each mapped to the whole texture
+has eight points, but the corner of three faces meets them with three
+different texture coordinates, and the same holds for the normals of a
+hard edge. The face-varying attributes make the \emph{corner} of a face the
+natural unit, so we first spell out every corner of every triangle, with its
+position, its shading normal and its texture coordinates, all in local space,
+and leave it to the next step to find which corners are really the same
+vertex.
 
-Normals cannot be transformed with $M$ itself: under a non-uniform scale, a
-vector perpendicular to the surface would stop being perpendicular. The
-correct matrix is the inverse transpose, $(M^{-1})^{\mathsf T}$, applied
-without translation ([[TransformDir]]). It keeps the transformed normal
-perpendicular to every transformed tangent, because for a tangent $u$ and a
-normal $n$ with $u\cdot n=0$ we have $(uM)\cdot\bigl(n(M^{-1})^{\mathsf
-T}\bigr)= u\,M M^{-1}\,n^{\mathsf T} = u\cdot n = 0$.
+Normals are normalized here, which also takes care of the unnormalized sums
+of the smooth normals and of the sphere's points. Normalizing before welding
+matters: two corners whose normals point the same way but have different
+lengths would otherwise remain distinct vertices. A degenerate normal is left
+as it is. The material of each triangle is that of its source face. Only the
+attributes the prim has are gathered, so [[normals]] and [[cornerUVs]] may
+stay empty.
 
-<<Transform the points of a prim to world space>>=
-const GfMatrix4d toWorld = xformCache.GetLocalToWorldTransform(p);
-const GfMatrix4d normalToWorld = toWorld.GetInverse().GetTranspose();
-const unsigned baseVertex = unsigned(g.vertices.size() / 3);
-for (const GfVec3f& pt : local.points)
-{
-    const GfVec3d w = toWorld.Transform(GfVec3d(pt));
-    for (int k = 0; k < 3; ++k)
-    {
-        g.vertices.push_back(float(w[k]));
-        lo[k] = std::min(lo[k], float(w[k]));
-        hi[k] = std::max(hi[k], float(w[k]));
-    }
-}
-@ Appending the triangles. The prim's mesh id is the next free one; its
-triangles start where the previous prim's ended. The point indices are offset
-by [[baseVertex]]. Every triangle is tagged with the mesh id.
-
-<<Append the triangles of a prim to the flat geometry>>=
-const unsigned meshId = unsigned(g.meshEntity.size());
-const unsigned firstTri = unsigned(g.indices.size() / 3);
+<<Gather the corners of a prim's triangles>>=
+// every triangle corner with its attributes, in the prim's local space
 const unsigned triCount = unsigned(local.indices.size() / 3);
-for (unsigned idx : local.indices)
-    g.indices.push_back(baseVertex + idx);
-g.triMesh.insert(g.triMesh.end(), triCount, meshId);
-<<Append the material, texture coordinates and normals of each triangle>>
-<<Record the mesh in the registry>>
-@ Then come the per-triangle attributes: the material of the triangle's
-face, and for each corner its texture coordinates and its shading normal in
-world space. Normals are normalized here, after the transformation, which
-also takes care of the unnormalized sums of the smooth normals and of the
-sphere's points. A degenerate normal is left at zero, and a flat mesh stores
-zeros throughout: both mean ``use the triangle's own normal''.
-
-<<Append the material, texture coordinates and normals of each triangle>>=
+std::vector<float> positions, normals, cornerUVs;
+std::vector<unsigned> triMaterial(triCount);
 for (unsigned t = 0; t < triCount; ++t)
 {
-    g.triMaterial.push_back(faceMaterial[local.faceOfTri[t]]);
+    triMaterial[t] = faceMaterial[local.faceOfTri[t]];
     for (int c = 0; c < 3; ++c)
     {
-        const GfVec2f uv = cornerUV(t, c);
-        g.triUVs.insert(g.triUVs.end(), {uv[0], uv[1]});
-        GfVec3d n(0.0);
+        const GfVec3f& pt = local.points[local.indices[3 * t + c]];
+        positions.insert(positions.end(), {pt[0], pt[1], pt[2]});
         if (!local.cornerNormals.empty())
         {
-            n = normalToWorld.TransformDir(GfVec3d(local.cornerNormals[3 * t + c]));
-            if (n.GetLength() > 1e-12)
+            GfVec3f n = local.cornerNormals[3 * t + c];
+            if (n.GetLength() > 1e-12f)
                 n.Normalize();
+            normals.insert(normals.end(), {n[0], n[1], n[2]});
         }
-        g.triNormals.insert(g.triNormals.end(), {float(n[0]), float(n[1]), float(n[2])});
+        if (!uvs.empty())
+        {
+            const GfVec2f uv = cornerUV(t, c);
+            cornerUVs.insert(cornerUVs.end(), {uv[0], uv[1]});
+        }
     }
 }
-@ The entity learns where its triangles are. Adding a [[MeshGeometry]]
-component while we iterate over the [[PrimInfo]] components is safe in EnTT,
-because each component type has its own storage and the view walks only the
-[[PrimInfo]] storage.
+@ The mesh record is started with what the inspector shows, and the corners
+are handed to [[weldCorners]], which fills in the vertices, the triangles and
+their materials.
 
-<<Record the mesh in the registry>>=
-g.meshEntity.push_back(e);
-m_registry.emplace<MeshGeometry>(e, meshId, firstTri, triCount, baseMaterial, subsetMaterials,
-                                 !uvs.empty());
+<<Build the indexed mesh of a prim>>=
+RenderMesh mesh;
+mesh.path = p.GetPath();
+mesh.material = baseMaterial;
+mesh.subsetMaterials = subsetMaterials;
+weldCorners(std::move(positions), std::move(normals), std::move(cornerUVs), triMaterial, mesh);
+@ Welding. Corners with the same position, the same normal and the same
+texture coordinates are the same vertex, and should be stored once: on a
+smooth mesh, a vertex is typically shared by six triangles, so the vertex
+arrays shrink to about a sixth of the corner arrays. Corners that differ in
+any attribute, like the three corners of a textured cube at one point, stay
+separate, which is exactly what the face-varying data require. The tool for
+this is \emph{meshoptimizer}, a library of mesh-processing algorithms by
+Arseny Kapoulkine. Along the way it reorders the triangles and the vertices
+for memory locality, for reasons explained in the sections that follow. The
+arguments are taken by value, so that the caller can move its arrays in and
+the function can reorder them in place.
+
+<<Weld the corners of a prim into an indexed mesh>>=
+// Turns per-corner attributes (3 corners per triangle) into an indexed mesh
+// with meshoptimizer. Corners with the same position, normal and st become one
+// vertex. The triangles are grouped by material and sorted for spatial
+// locality within each group, and the vertices are stored in the order the
+// triangles first use them, so a ray's hits touch nearby memory.
+void weldCorners(std::vector<float> positions, std::vector<float> normals, std::vector<float> uvs,
+                 const std::vector<unsigned>& triMaterial, RenderMesh& out)
+{
+    <<Find the distinct corners of a mesh>>
+    <<Reorder one attribute stream through a remap table>>
+    <<Replace the corners by the distinct vertices>>
+
+    <<Group the triangles by material>>
+    <<Sort the triangles of each material spatially>>
+
+    <<Store the vertices in the order the triangles first use them>>
+}
+@ The corners form an unindexed vertex buffer, three per triangle, split
+into separate \emph{streams}, one per attribute. Given the streams,
+[[meshopt_generateVertexRemapMulti]] compares corners bit for bit across all
+of them, and fills [[remap]] with the new index of each corner: equal corners
+get the same index, and the indices count up from zero without gaps in the
+order of first appearance. It returns the number of distinct vertices. A null
+index buffer means ``the corners are in order''.
+
+<<Find the distinct corners of a mesh>>=
+const size_t corners = positions.size() / 3, triCount = corners / 3;
+std::vector<meshopt_Stream> streams = {{positions.data(), 3 * sizeof(float), 3 * sizeof(float)}};
+if (!normals.empty())
+    streams.push_back({normals.data(), 3 * sizeof(float), 3 * sizeof(float)});
+if (!uvs.empty())
+    streams.push_back({uvs.data(), 2 * sizeof(float), 2 * sizeof(float)});
+std::vector<unsigned> remap(corners);
+const size_t vertexCount =
+    meshopt_generateVertexRemapMulti(remap.data(), nullptr, corners, corners, streams.data(), streams.size());
+@ Every attribute array must follow every reordering of the vertices, so a
+small helper applies a remap table to one stream: it builds an array of [[to]]
+vertices from one of [[from]] vertices, each element made of [[floats]]
+floats, and swaps it in. An attribute the prim does not have is left empty.
+
+<<Reorder one attribute stream through a remap table>>=
+auto remapStream = [&](std::vector<float>& stream, size_t floats, size_t from, size_t to,
+                       const std::vector<unsigned>& table) {
+    if (stream.empty())
+        return;
+    std::vector<float> result(to * floats);
+    meshopt_remapVertexBuffer(result.data(), stream.data(), from, floats * sizeof(float), table.data());
+    stream.swap(result);
+};
+@ The triangles become an index buffer, [[welded]], whose entry for each
+corner is that corner's new vertex index, and the three attribute streams
+shrink to the distinct vertices.
+
+<<Replace the corners by the distinct vertices>>=
+std::vector<unsigned> welded(corners);
+meshopt_remapIndexBuffer(welded.data(), nullptr, corners, remap.data());
+remapStream(positions, 3, corners, vertexCount, remap);
+remapStream(normals, 3, corners, vertexCount, remap);
+remapStream(uvs, 2, corners, vertexCount, remap);
+@ Reordering the triangles. The order of the triangles in a GAS is free:
+OptiX builds its own hierarchy over them anyway. But each triangle carries its
+material in [[triMaterial]], indexed by the triangle's position, so whatever
+order we choose, the materials must move with the triangles. We first sort
+the triangles by material, with a stable sort so that the source order
+survives within each material, and copy the indices and the materials in that
+order together. Grouping by material makes the next step possible: a spatial
+sort of each group on its own leaves every triangle in its group, and
+[[triMaterial]] stays aligned with the triangle order.
+
+<<Group the triangles by material>>=
+std::vector<unsigned> order(triCount);
+std::iota(order.begin(), order.end(), 0u);
+std::stable_sort(order.begin(), order.end(),
+                 [&](unsigned a, unsigned b) { return triMaterial[a] < triMaterial[b]; });
+std::vector<unsigned> sorted(corners);
+out.triMaterial.resize(triCount);
+for (size_t t = 0; t < triCount; ++t)
+{
+    std::copy_n(&welded[3 * size_t(order[t])], 3, &sorted[3 * t]);
+    out.triMaterial[t] = triMaterial[order[t]];
+}
+@ Within each run of triangles with the same material,
+[[meshopt_spatialSortTriangles]] orders the triangles along a space-filling
+curve through their centroids, so that triangles close in space are close in
+the index buffer. A ray tracer reads memory in an order dictated by space: a
+ray, and the rays of its neighboring pixels, hit triangles that lie near each
+other. When those triangles are also near each other in memory, their
+indices, materials and vertices share cache lines, on the GPU and in the
+acceleration structure built over them. The sort works in place.
+
+<<Sort the triangles of each material spatially>>=
+for (size_t begin = 0, end; begin < triCount; begin = end)
+{
+    for (end = begin + 1; end < triCount && out.triMaterial[end] == out.triMaterial[begin]; ++end)
+        ;
+    meshopt_spatialSortTriangles(&sorted[3 * begin], &sorted[3 * begin], 3 * (end - begin), positions.data(),
+                                 vertexCount, 3 * sizeof(float));
+}
+@ The vertices still have the order in which their corners first appeared
+in the source, which does not match the sorted triangles. [[meshopt_optimizeVertexFetchRemap]]
+renumbers them in the order in which the sorted triangles first use them, so
+that walking the triangles walks the vertex arrays almost sequentially, and
+the vertices of neighboring triangles are neighbors in memory too. It returns
+the number of vertices used, which equals the number of distinct vertices,
+since every vertex comes from some corner. The final index buffer and the
+attribute streams are rewritten through this remap and moved into the mesh,
+together with the number of corners the mesh started with.
+
+<<Store the vertices in the order the triangles first use them>>=
+std::vector<unsigned> fetch(vertexCount);
+const size_t used = meshopt_optimizeVertexFetchRemap(fetch.data(), sorted.data(), corners, vertexCount);
+out.indices.resize(corners);
+meshopt_remapIndexBuffer(out.indices.data(), sorted.data(), corners, fetch.data());
+remapStream(positions, 3, vertexCount, used, fetch);
+remapStream(normals, 3, vertexCount, used, fetch);
+remapStream(uvs, 2, vertexCount, used, fetch);
+out.positions = std::move(positions);
+out.normals = std::move(normals);
+out.uvs = std::move(uvs);
+out.corners = corners;
+@* World space. The mesh itself stays in local space; what goes to the
+renderer is the local-to-world matrix $M$ of the prim. The two libraries
+write matrices differently. USD's matrices act on row vectors: a point is
+transformed as $p' = pM$, so the translation is the last \emph{row} of $M$.
+An OptiX instance transform is a $3\times4$ matrix stored row by row that acts
+on column vectors, $p' = Tp$, with the translation in the last
+\emph{column}. Since $pM = (M^{\mathsf T}p^{\mathsf T})^{\mathsf T}$, the
+OptiX matrix is the transpose of USD's, without its last row (which, for an
+affine transform, is $(0,0,0,1)$): $T_{rc} = M_{cr}$ for $r<3$ and $c<4$. The
+matrix is computed in double precision and stored as floats.
+
+\begin{sloppypar}Normals are not transformed here. They cannot be transformed with $M$ itself:
+under a non-uniform scale, a vector perpendicular to the surface would stop
+being perpendicular. The correct matrix is the inverse transpose,
+$(M^{-1})^{\mathsf T}$, applied without translation. It keeps the transformed
+normal perpendicular to every transformed tangent, because for a tangent $u$
+and a normal $n$ with $u\cdot n=0$ we have $(uM)\cdot\bigl(n(M^{-1})^{\mathsf
+T}\bigr)= u\,M M^{-1}\,n^{\mathsf T} = u\cdot n = 0$. The device programs
+apply it at each hit, with OptiX's
+[[optixTransformNormalFromObjectToWorldSpace]], which derives it from the
+instance transform.\end{sloppypar}
+
+<<Pass the transform of a mesh to the renderer>>=
+// USD transforms row vectors (p * M); OptiX wants the transpose
+const GfMatrix4d toWorld = xformCache.GetLocalToWorldTransform(p);
+for (int r = 0; r < 3; ++r)
+    for (int c = 0; c < 4; ++c)
+        mesh.toWorld[4 * r + c] = float(toWorld[c][r]);
+@ The camera needs to know where things are in the world: the bounds of the
+mesh frame the selected prim, and the bounds of the scene frame everything.
+The welded vertices are transformed in double precision, with
+[[Transform]], which includes the translation, and the mesh's bounds grow to
+include them; then the scene's bounds grow to include the mesh's.
+
+<<Compute the world bounds of a mesh>>=
+std::fill_n(mesh.boundsMin, 3, INFINITY);
+std::fill_n(mesh.boundsMax, 3, -INFINITY);
+for (size_t v = 0; v < mesh.vertexCount(); ++v)
+{
+    const GfVec3d w = toWorld.Transform(GfVec3d(mesh.positions[3 * v], mesh.positions[3 * v + 1],
+                                                mesh.positions[3 * v + 2]));
+    for (int k = 0; k < 3; ++k)
+    {
+        mesh.boundsMin[k] = std::min(mesh.boundsMin[k], float(w[k]));
+        mesh.boundsMax[k] = std::max(mesh.boundsMax[k], float(w[k]));
+    }
+}
+for (int k = 0; k < 3; ++k)
+{
+    lo[k] = std::min(lo[k], mesh.boundsMin[k]);
+    hi[k] = std::max(hi[k], mesh.boundsMax[k]);
+}
 @ A prim whose material reads textures but which has no texture coordinates
 would show one texel stretched over the whole surface. Better to say so.
 
 <<Warn about textured prims without texture coordinates>>=
 bool textured = false;
 for (unsigned m : faceMaterial)
-    textured = textured || g.materials[m].usesTextures();
+    textured = textured || m_materials[m].usesTextures();
 if (textured && uvs.empty())
-    warn("Textured prim without '" + uvSet + "' texture coordinates: " + info.path.GetString());
+    warn("Textured prim without '" + uvSet + "' texture coordinates: " + p.GetPath().GetString());
+@ The mesh receives the next mesh id, its index in [[m_meshes]], and the
+index from paths learns it before the mesh is moved into the vector.
+
+<<Register the mesh of a prim>>=
+m_meshByPath[mesh.path] = unsigned(m_meshes.size());
+m_meshes.push_back(std::move(mesh));
 @ When the loop is over, the bounds are stored, but only if some geometry was
 found; an empty scene keeps the zero box rather than an inverted infinite one.
 
 <<Record the bounds of the scene>>=
-if (!g.empty())
+if (!m_meshes.empty())
     for (int k = 0; k < 3; ++k)
     {
-        g.boundsMin[k] = lo[k];
-        g.boundsMax[k] = hi[k];
+        m_boundsMin[k] = lo[k];
+        m_boundsMax[k] = hi[k];
     }
-@* Cameras. USD already knows how to turn a camera prim into the quantities
-we need. The method [[GetCamera]] of the [[UsdGeomCamera]] schema evaluates
-the prim's attributes and its full transform into a [[GfCamera]], and the camera's [[GfFrustum]] gives the
-eye position, the view and up directions, the window and the clipping range.
-The frustum also discards any scale in the transform, which USD requires: a
-camera under a scaled parent must still see with its own lens. An aperture
-offset moves the window off centre (a shifted lens); the renderer has no use
-for it yet, so it is reported rather than silently dropped.
+@* Cameras. The scene keeps a list of [[SceneCamera]] records, one per
+[[UsdGeomCamera]] prim. Like the geometry, each is evaluated once, at the
+scene's time, and unlike the geometry it is stored in world space, because the
+renderer reads it directly. A USD camera is described by its transform and by
+physical lens parameters: a focal length and the size of the film back (the
+\emph{aperture}), in tenths of a scene unit for orthographic cameras. What the
+renderer wants is simpler: an eye point, a forward and an up direction, and
+the half size of the \emph{window}, the part of the image plane that the
+camera sees. For a perspective camera the window lies at distance 1, so its
+half height is the tangent of half the vertical field of view; for an
+orthographic camera it is measured in scene units. The viewport rarely has the
+shape of the camera's film back, so the window is fitted to it later, in the
+application. The path identifies the prim, and the vertical field of view is
+kept for the inspector.
 
-The cameras are collected by a depth-first walk over the [[Hierarchy]]
-components rather than a view of the registry, because a view does not visit
-the entities in stage order and the camera menu should list the cameras as the
-file does.
+<<A camera of the stage>>=
+// A UsdGeomCamera at the stage's start time, in world space. The window is
+// the image plane at distance 1 (perspective) or the view size in scene
+// units (orthographic); the viewer fits it to the viewport's aspect ratio.
+struct SceneCamera
+{
+    std::string path;
+    std::array<float, 3> eye = {0, 0, 0}, forward = {0, 0, -1}, up = {0, 1, 0};
+    float halfWidth = 1.0f, halfHeight = 1.0f;
+    bool orthographic = false;
+    float clipNear = 0.0f, clipFar = 1e16f;
+    float fovYDeg = 0.0f;  // vertical field of view of a perspective camera
+};
+@ USD already knows how to turn a camera prim into the quantities we need.
+The method [[GetCamera]] of the [[UsdGeomCamera]] schema evaluates the prim's
+attributes and its full transform into a [[GfCamera]], and the camera's
+[[GfFrustum]] gives the eye position, the view and up directions, the window
+and the clipping range. The frustum also discards any scale in the transform,
+which USD requires: a camera under a scaled parent must still see with its own
+lens. An aperture offset moves the window off centre (a shifted lens); the
+renderer has no use for it, so it is reported rather than silently dropped.
+
+The cameras are collected by a walk over the stage with the same
+[[UsdPrimRange]] as the geometry. The range visits the prims depth first, in
+the order of the file, so the camera menu lists the cameras as the file does.
 
 <<Collect the cameras of the stage>>=
 // ---- cameras ----------------------------------------------------------------
 // Walks the hierarchy depth first, so cameras keep the order of the stage.
-void Scene::extractCameras(entt::entity e)
+void Scene::extractCameras()
 {
-    if (const UsdPrim p = prim(e); p && p.IsA<UsdGeomCamera>())
+    for (const UsdPrim& p : UsdPrimRange::Stage(m_stage, UsdTraverseInstanceProxies()))
     {
+        if (!p.IsA<UsdGeomCamera>())
+            continue;
         // GfFrustum drops any scale in the camera's transform, as USD requires
         const GfCamera camera = UsdGeomCamera(p).GetCamera(m_time);
         const GfFrustum frustum = camera.GetFrustum();
         const GfVec3d eye = frustum.GetPosition(), forward = frustum.ComputeViewDirection(),
                       up = frustum.ComputeUpVector();
         SceneCamera c;
-        c.entity = e;
         c.path = p.GetPath().GetString();
         for (int k = 0; k < 3; ++k)
         {
@@ -1493,11 +1658,8 @@ void Scene::extractCameras(entt::entity e)
             c.up[k] = float(up[k]);
         }
         <<Read the window and the clipping range of a camera>>
-        m_registry.emplace<CameraView>(e, unsigned(m_cameras.size()));
         m_cameras.push_back(c);
     }
-    for (entt::entity child : m_registry.get<Hierarchy>(e).children)
-        extractCameras(child);
 }
 @ [[GfCamera::GetFrustum]] already divides the aperture by the focal length
 for a perspective camera, and converts it to scene units for an orthographic

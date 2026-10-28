@@ -8,24 +8,19 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # ---------------------------------------------------------------------------
-# Dependencies. Locations can be given through CMAKE_PREFIX_PATH or the
-# variables / environment variables below (see /etc/profile.d/viztools.sh).
-# Defaults to the all-users install in /opt/viztools, falling back to the
-# per-user install in ~/.local/opt.
+# Dependencies, installed for all users in /opt/viztools (and CUDA in
+# /usr/local/cuda-13.2). Locations can be changed through CMAKE_PREFIX_PATH or
+# the variables / environment variables below (see /etc/profile.d/viztools.sh).
 # ---------------------------------------------------------------------------
-if(EXISTS "/opt/viztools")
-  set(_vizDefault "/opt/viztools")
-else()
-  set(_vizDefault "$ENV{HOME}/.local/opt")
+set(VIZ_PREFIX "/opt/viztools" CACHE PATH "Root of the installed visualization tools")
+if(NOT EXISTS "${VIZ_PREFIX}")
+  message(FATAL_ERROR "Visualization tools not found in VIZ_PREFIX=${VIZ_PREFIX}")
 endif()
-set(VIZ_PREFIX "${_vizDefault}" CACHE PATH "Root of the installed visualization tools")
 if(NOT DEFINED CUDAToolkit_ROOT)
   if(DEFINED ENV{CUDA_HOME})
     set(CUDAToolkit_ROOT "$ENV{CUDA_HOME}")
-  elseif(EXISTS "/usr/local/cuda-13.2")
-    set(CUDAToolkit_ROOT "/usr/local/cuda-13.2")
   else()
-    set(CUDAToolkit_ROOT "${VIZ_PREFIX}/cuda-13.2")
+    set(CUDAToolkit_ROOT "/usr/local/cuda-13.2")
   endif()
 endif()
 
@@ -43,46 +38,42 @@ if(NOT EXISTS "${IMGUI_DIR}/imgui.h")
   message(FATAL_ERROR "imgui.h not found in IMGUI_DIR=${IMGUI_DIR}")
 endif()
 
-list(APPEND CMAKE_PREFIX_PATH "${VIZ_PREFIX}/sdl3" "${VIZ_PREFIX}/entt-4.0.0" "${VIZ_PREFIX}/usd-26.11")
+# Default for --cloudxr-sdk when CLOUDXR_SDK_DIR is not set at run time
+set(CLOUDXR_SDK_DIR "${VIZ_PREFIX}/cloudxr-6.2.1" CACHE PATH "CloudXR SDK (libcloudxr.so, openxr_cloudxr.json)")
+
+list(APPEND CMAKE_PREFIX_PATH "${VIZ_PREFIX}/sdl3" "${VIZ_PREFIX}/usd-26.11" "${VIZ_PREFIX}/meshoptimizer-1.3"
+     "${VIZ_PREFIX}/openxr-1.1.58")
 
 find_package(CUDAToolkit 12 REQUIRED)
 find_package(SDL3 REQUIRED CONFIG)
-find_package(EnTT REQUIRED CONFIG)
 find_package(pxr REQUIRED CONFIG)
-
-# XR output: the OpenXR loader (built static) and the Vulkan headers are
-# fetched with the project. Vulkan itself is loaded at run time from the
-# driver's libvulkan.so.1, and the CloudXR runtime from a CloudXR SDK.
-include(FetchContent)
-FetchContent_Declare(VulkanHeaders
-  GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git GIT_TAG v1.3.275 GIT_SHALLOW TRUE)
-FetchContent_Declare(OpenXR
-  GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK.git GIT_TAG release-1.1.58 GIT_SHALLOW TRUE)
-set(DYNAMIC_LOADER OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(VulkanHeaders OpenXR)
+find_package(meshoptimizer REQUIRED CONFIG)
+# XR output: the OpenXR loader is linked statically. Only the Vulkan headers
+# are used at build time; Vulkan itself is loaded at run time from the
+# driver's libvulkan.so.1, and the CloudXR runtime from the CloudXR SDK.
+find_package(OpenXR REQUIRED CONFIG)
+find_package(Vulkan REQUIRED)
 
 # ---------------------------------------------------------------------------
-# OptiX device code: compiled to PTX with nvcc and embedded into the binary.
+# OptiX device code: compiled to OptiX-IR with nvcc and embedded into the binary.
 # ---------------------------------------------------------------------------
-set(OPTIX_ARCH "compute_75" CACHE STRING "Virtual architecture used for the OptiX PTX")
-set(PTX_FILE "${CMAKE_CURRENT_BINARY_DIR}/devicePrograms.ptx")
-set(PTX_CPP  "${CMAKE_CURRENT_BINARY_DIR}/devicePrograms_ptx.cpp")
+set(OPTIX_ARCH "compute_75" CACHE STRING "Virtual architecture used for the OptiX-IR")
+set(OPTIXIR_FILE "${CMAKE_CURRENT_BINARY_DIR}/devicePrograms.optixir")
+set(OPTIXIR_CPP  "${CMAKE_CURRENT_BINARY_DIR}/devicePrograms_optixir.cpp")
 add_custom_command(
-  OUTPUT "${PTX_FILE}"
-  COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}" -ptx -arch=${OPTIX_ARCH} -std=c++17 --use_fast_math -diag-suppress 20044
-          -ccbin "${CMAKE_CXX_COMPILER}"
+  OUTPUT "${OPTIXIR_FILE}"
+  COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}" -optix-ir -arch=${OPTIX_ARCH} -std=c++17 --use_fast_math -lineinfo
+          -diag-suppress 20044 -ccbin "${CMAKE_CXX_COMPILER}"
           -I "${OptiX_INCLUDE_DIR}" -I "${CMAKE_CURRENT_SOURCE_DIR}/src"
-          "${CMAKE_CURRENT_SOURCE_DIR}/src/devicePrograms.cu" -o "${PTX_FILE}"
+          "${CMAKE_CURRENT_SOURCE_DIR}/src/devicePrograms.cu" -o "${OPTIXIR_FILE}"
   DEPENDS src/devicePrograms.cu src/LaunchParams.h
-  COMMENT "Compiling OptiX programs to PTX")
+  COMMENT "Compiling OptiX programs to OptiX-IR")
 add_custom_command(
-  OUTPUT "${PTX_CPP}"
-  COMMAND "${CMAKE_COMMAND}" -DINPUT=${PTX_FILE} -DOUTPUT=${PTX_CPP} -DSYMBOL=g_devicePrograms
+  OUTPUT "${OPTIXIR_CPP}"
+  COMMAND "${CMAKE_COMMAND}" -DINPUT=${OPTIXIR_FILE} -DOUTPUT=${OPTIXIR_CPP} -DSYMBOL=g_devicePrograms
           -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedFile.cmake"
-  DEPENDS "${PTX_FILE}" cmake/EmbedFile.cmake
-  COMMENT "Embedding PTX")
+  DEPENDS "${OPTIXIR_FILE}" cmake/EmbedFile.cmake
+  COMMENT "Embedding OptiX-IR")
 
 # ---------------------------------------------------------------------------
 # Application
@@ -96,12 +87,13 @@ target_link_libraries(imgui PUBLIC SDL3::SDL3)
 
 add_executable(UsdOptixViewer
   src/main.cpp src/App.cpp src/Scene.cpp src/OptixRenderer.cpp src/StbImage.cpp src/XrOutput.cpp
-  src/CloudXrService.cpp "${PTX_CPP}")
+  src/CloudXrService.cpp "${OPTIXIR_CPP}")
 target_include_directories(UsdOptixViewer PRIVATE src ${OptiX_INCLUDE_DIR})
 target_link_libraries(UsdOptixViewer PRIVATE
-  imgui SDL3::SDL3 EnTT::EnTT usd usdGeom usdShade ar sdf tf gf vt
+  imgui SDL3::SDL3 meshoptimizer::meshoptimizer usd usdGeom usdShade ar sdf tf gf vt
   CUDA::cudart CUDA::cuda_driver OpenXR::openxr_loader Vulkan::Headers ${CMAKE_DL_LIBS})
-target_compile_definitions(UsdOptixViewer PRIVATE VK_NO_PROTOTYPES XR_USE_GRAPHICS_API_VULKAN)
+target_compile_definitions(UsdOptixViewer PRIVATE VK_NO_PROTOTYPES XR_USE_GRAPHICS_API_VULKAN
+  CLOUDXR_SDK_DEFAULT="${CLOUDXR_SDK_DIR}")
 # USD headers trigger a few deprecation warnings under C++20
 target_compile_options(UsdOptixViewer PRIVATE -Wno-deprecated -Wno-deprecated-declarations)
 

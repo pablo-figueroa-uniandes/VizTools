@@ -17,6 +17,8 @@ cannot be forgotten on one side; it can only be left unset.
 
 <<Material data on the device>>
 
+<<Mesh data on the device>>
+
 <<The launch parameters>>
 @ The header includes only CUDA and OptiX type definitions, never their
 function declarations. From OptiX we take [[OptixTraversableHandle]], from
@@ -43,8 +45,9 @@ The renderer traces two kinds of rays. \emph{Radiance} rays ask ``what colour
 arrives along this ray?''; \emph{shadow} rays only ask ``is the light visible
 from here?''. OptiX selects the program that handles a miss, and the record
 that handles a hit, by an index into the shader binding table; the enumeration
-gives these indices names, and [[RAY_TYPE_COUNT]] is the stride between the
-records of consecutive geometries.
+gives these indices names. [[RAY_TYPE_COUNT]] is the number of hit records,
+one per ray type, and the stride that every call of [[optixTrace]] passes for
+them.
 
 <<The background mesh id and the ray types>>=
 constexpr unsigned int kNoMesh = 0xffffffffu;
@@ -107,14 +110,6 @@ meets to one [[MaterialData]], and each triangle refers to one of them by
 index. The comment summarizes how the closest-hit program interprets the
 fields; we shall see each formula again when it is used.
 
-The order of the fields is not accidental. A [[float4]] must be aligned on a
-16-byte boundary, while a [[float3]] needs only 4 bytes. Putting the six
-[[float4]] members first, and pairing each [[float3]] with a following
-[[int]], fills every 16-byte line exactly, so the compiler inserts no padding
-and the structure has the same size on both sides of the bus. Texture
-references are indices into the array of CUDA texture objects of
-<<The scene as seen by the device>>, with $-1$ meaning ``no texture''.
-
 <<Material data on the device>>=
 // UsdPreviewSurface subset.
 //   diffuse  = texture(st) * texScale + texBias, or `color` when untextured
@@ -133,6 +128,12 @@ the specification asks for $s=(2,2,2)$ and $b=(-1,-1,-1)$, which maps the
 stored range $[0,1]$ to the vector range $[-1,1]$; files that use the
 DirectX convention flip the green channel through these same coefficients.
 
+These vectors open the structure for a reason of layout. A [[float4]] must be
+aligned on a 16-byte boundary, while a [[float3]], an [[int]] or a [[float]]
+needs only 4 bytes. Placed at the head of the structure, which is itself
+16-byte aligned, the six [[float4]] members fill its first 96 bytes with no
+gap between them.
+
 <<Texture remapping coefficients of a material>>=
 float4 texScale;
 float4 texBias;
@@ -149,6 +150,15 @@ refraction [[ior]]. The opacity fields describe an alpha cutout: the
 [[opacityChannel]] of [[opacityTexture]] is compared with
 [[opacityThreshold]].
 
+Every one of these members needs only 4-byte alignment, so none of them
+forces the compiler to insert padding. Each [[float3]] is followed by an
+[[int]], which completes a 16-byte line, and the two [[ScalarParam]] records
+of 20 bytes each are followed by six 4-byte fields, which bring the total to
+192 bytes, a multiple of 16. No padding is needed at the end either, and the
+structure has the same size and the same layout on both sides of the bus.
+Texture references are indices into the array of CUDA texture objects of
+<<The scene as seen by the device>>, with $-1$ meaning ``no texture''.
+
 <<Colors, textures and inputs of a material>>=
 float3 color;
 int    texture;  // index into LaunchParams::textures, -1 for none
@@ -162,6 +172,41 @@ float  opacityThreshold;
 int    normalTexture;
 int    specularWorkflow;
 float  ior;
+@* Meshes. The scene keeps every renderable prim as one indexed triangle mesh
+in the prim's own local space, and the renderer builds a geometry
+acceleration structure (GAS) for each of them. One instance acceleration
+structure (IAS) then places the meshes in the world: instance~$i$ carries the
+transform of mesh~$i$ and points to its GAS. Since the instance id that the
+renderer gives to instance~$i$ is $i$ itself, the closest-hit program learns
+from [[optixGetInstanceId]] both which [[MeshData]] to read and which mesh id
+to report for picking.
+
+A [[MeshData]] holds device pointers to the arrays of one mesh. Vertices are
+indexed: [[indices]] gives the three vertices of each triangle, and
+[[positions]], [[normals]] and [[uvs]] are per vertex, so a vertex has one
+position, one shading normal and one pair of texture coordinates. Face-varying
+data, where the corner of one face needs a value different from the same
+point on the neighbouring face, is handled by the scene before it gets here:
+such corners simply become different vertices. A mesh without smooth normals
+has a null [[normals]] pointer and is shaded with the flat geometric normal;
+one without texture coordinates has a null [[uvs]]. [[triMaterial]] gives the
+material of each triangle, since USD geometry subsets may bind different
+materials to the faces of one mesh. All of these are in local space; the
+device programs carry hit points and normals to world space with the
+transforms of the instance.
+
+<<Mesh data on the device>>=
+// One mesh, in its local space. Instance i of the IAS is mesh i, so
+// optixGetInstanceId() is both the index into LaunchParams::meshes and the
+// mesh id used for picking.
+struct MeshData
+{
+    const float3*       positions;
+    const float3*       normals;      // shading normal per vertex; null: flat
+    const float2*       uvs;          // st per vertex; null: no texture coordinates
+    const uint3*        indices;      // 3 vertices per triangle
+    const unsigned int* triMaterial;  // material of each triangle
+};
 @* The launch parameters. Everything a launch needs is gathered in a single
 structure. The host copies it to a small device buffer before each launch,
 and OptiX makes it visible to all programs as the [[__constant__]] variable
@@ -209,25 +254,15 @@ unsigned int mipmaps;      // 0: always sample the finest texture level
 unsigned int normalMaps;   // 0: ignore normal maps
 unsigned int reflections;  // 0: reflect the sky only, without tracing rays
 unsigned int selectedMesh;
-@ The scene. All geometry is flattened into one list of world-space triangles
-and stored in a single geometry acceleration structure (GAS), whose handle is
-what [[optixTrace]] needs. Alongside it, plain arrays indexed by the
-primitive number that OptiX reports for a hit give everything the shading code
-wants to know about a triangle: its vertices, its mesh, its material, the
-texture coordinates and shading normals of its three corners. Storing UVs and
-normals per corner rather than per vertex wastes some memory, but it handles
-face-varying data, where one vertex has different values on different faces,
-without any special case. A zero normal at the first corner means ``no shading
-normals, use the flat geometric one''.
+@ The scene. [[handle]] is the traversable handle of the IAS, the one that
+[[optixTrace]] needs. [[meshes]] is the array of [[MeshData]] records,
+indexed by instance id, [[materials]] the array of materials that
+[[triMaterial]] refers to, and [[textures]] the CUDA texture objects that
+the materials refer to by index.
 
 <<The scene as seen by the device>>=
-// scene: one GAS with all triangles in world space
+// scene: an IAS with one instance (and one GAS) per mesh
 OptixTraversableHandle handle;
-const float3*       vertices;
-const uint3*        indices;
-const unsigned int* triMesh;      // mesh id of each triangle
-const unsigned int* triMaterial;  // material of each triangle
-const float2*       triUVs;       // st of the 3 corners of each triangle
-const float3*       triNormals;   // shading normal of the 3 corners (zero: flat)
+const MeshData*     meshes;
 const MaterialData* materials;
 const cudaTextureObject_t* textures;

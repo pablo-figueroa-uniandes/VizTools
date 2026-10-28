@@ -2,6 +2,59 @@
 
 This file describes the advances in visualization tools for this computer.
 
+## October 28th
+
+Do the following tasks:
+
+- Merge both branches into one (cloudxr and main). Work in these changes there
+- use optix-ir instead of ptx
+- Do not use ENTT and the FlatGeometry the way it is used now. Instead, use https://meshoptimizer.org . Show me an error if there is something that ENTT is still required for, so I can decide what to do
+- Install CUDA, CloudXR, and Vulkan libraries for all users of this computer, if they are not already there
+- Delete the file install_all_users.sh from the repository and the local references to libraries in the cmake
+- redo the literate programming documentation, without talking about the changes (i.e. ENTT) but only about the current implementation. Move the alignment explanation to sections 24 and 25.
+
+### Results (October 28th)
+
+**Done, on `main`.** Nothing is committed or pushed yet.
+
+1. **Branches merged.** `main` was an ancestor of `cloudxr`, so `main` was fast-forwarded to it (`753f819`) and the local `cloudxr` branch was deleted. `origin/cloudxr` still exists on GitHub. All the work below was done on `main`. `CLOUDXR.md` no longer lists differences from `main`. It now documents the XR output: how to run it, its files and dependencies, and connecting a Vision Pro.
+2. **OptiX-IR instead of PTX.**
+   - nvcc builds `devicePrograms.optixir` with `-optix-ir -lineinfo`, still for `compute_75`.
+   - `EmbedFile.cmake` now writes an `unsigned char` array, because OptiX-IR is binary: bytes above 127 don't fit a signed `char`. The renderer casts it to `const char*` for `optixModuleCreate`.
+3. **No EnTT; meshoptimizer for the geometry.** **Nothing still requires EnTT**, so no error was raised. Every use of it was covered by USD or a plain container:
+   - The hierarchy panel, filter, `--select` and reveal walk the USD stage. The selection is an `SdfPath`.
+   - Meshes and cameras are looked up by path (`Scene::meshIndex`, `cameraIndex`).
+   - EnTT remains installed in `/opt/viztools/entt-4.0.0`, but nothing links it.
+   - `FlatGeometry` is replaced by one `RenderMesh` per renderable prim: an indexed mesh in the prim's local space plus its transform.
+   - `weldCorners` uses meshoptimizer 1.3:
+     - `meshopt_generateVertexRemapMulti` merges identical corners (position, normal and st).
+     - The triangles are grouped by material, and `meshopt_spatialSortTriangles` sorts each group.
+     - `meshopt_optimizeVertexFetchRemap` stores the vertices in the order the triangles first use them.
+     - Example: the textured box's 36 corners become 20 vertices. The inspector shows triangles, vertices and corners.
+   - The renderer builds one GAS per mesh and an IAS. The instance id is the mesh id and indexes `LaunchParams::meshes`.
+   - The device programs take the triangle and its normals to world space with OptiX's transform functions (`HitTriangle`).
+4. **All-users install.** The user ran a root script; it is deleted, but its steps are listed here.
+   - CUDA 13.2 was already in `/usr/local/cuda-13.2` and was only checked.
+   - `apt install libvulkan-dev vulkan-tools` installed the 1.3.275 headers and tools.
+   - meshoptimizer 1.3 went to `/opt/viztools/meshoptimizer-1.3` and the OpenXR loader 1.1.58 (static) to `/opt/viztools/openxr-1.1.58`. Both were built as the user and installed as root.
+   - The CloudXR SDK 6.2.1 was copied from `/srv/isaac-shared/...` to `/opt/viztools/cloudxr-6.2.1`. Its license allows use by an educational institution's authorized users.
+   - `/etc/profile.d/viztools.sh` now adds both prefixes and `CLOUDXR_SDK_DIR`. The old version is in `viztools.sh.bak-20261028`.
+   - `--cloudxr-sdk` defaults to `$CLOUDXR_SDK_DIR`, then to `/opt/viztools/cloudxr-6.2.1` (`CLOUDXR_SDK_DEFAULT`).
+5. **`install_all_users.sh` deleted, along with its book part.** The CMake file only uses `/opt/viztools` and fails clearly without it. CUDA comes from `$CUDA_HOME` or `/usr/local/cuda-13.2`. There is no `~/.local/opt` fallback and no `FetchContent`. The per-user copies in `~/.local/opt` were left in place; nothing uses them, and they can be deleted.
+6. **Literate book redone.** Four sub-agents rewrote the parts in parallel; I then merged and checked them.
+   - The prose describes only the current code. There is no mention of EnTT, `FlatGeometry`, PTX, branches or history.
+   - Code comments and strings about history were fixed too: the About box and the `kLightIntensity` comment.
+   - The alignment explanation moved into the two sections that show the `MaterialData` fields: 96 bytes of `float4`, then the `float3`+`int` lines, 192 bytes in total.
+   - `lp.py check` is ok for all 16 files (405 sections, 397 chunks). The PDF has 149 pages and no overfull lines.
+- **Verified:**
+  - Clean configure and build in an environment with only `/etc/profile.d/viztools.sh`, with no warnings.
+  - Seven views were rendered with the old and the new build: textured with `/World/Box` selected, sample, mipmap, normal map, material, and the Front and Top cameras. The viewports are pixel-identical; only the status-bar text and the inspector's new vertex line differ.
+  - `McUsd.usdz` matches within 2/255, including the usdz textures and the cutouts.
+  - CloudXR with the installed SDK, without `--cloudxr-sdk`: the session runs at 2.6 ms per frame, the mirror is correct, and SIGTERM exits with code 0.
+  - The installed copy in `~/.local/opt/UsdOptixViewer` was updated.
+- **Not verified:** a real headset after the merge, and mouse picking by hand (only `--select` was used).
+
+
 ## October 26th
 
 I read 13 lines of the literate output, and leave notes in the document. I ask claude to answer to the following prompt:

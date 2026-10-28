@@ -65,8 +65,10 @@ private:
 #include <vector>
 
 #include "third_party/cxrServiceAPI.h"
-@ The SDK is found at run time, from a directory given on the command line,
-so the program neither links against CloudXR nor needs it to build. The
+@ The SDK is found at run time, from a directory that the application
+chooses (the command line, the environment, or the default recorded by the
+build; see <<Start the XR output>>), so the program neither links against
+CloudXR nor needs it to build. The
 \emph{device profile} tells the service what kind of client to expect, and
 with it the eye resolution and frame rate: [[apple-vision-pro]] and
 [[quest3]] are static profiles, whose OpenXR system exists as soon as the
@@ -232,7 +234,7 @@ if (result == NV_CXR_SUCCESS && !deviceProfile.empty())
     const std::string name = "device-profile";
     result = m_setStringProperty(m_service, name.data(), name.size(), deviceProfile.data(), deviceProfile.size());
 }
-@ Starting the service has a side effect that took some finding. The
+@ Starting the service has a side effect that is easy to miss. The
 service, like the Monado runtime it is built on, installs handlers for
 [[SIGINT]] and [[SIGTERM]] that stop it. In a process of its own that is
 right; in ours it is not, because a signal would pull the runtime away while

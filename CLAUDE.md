@@ -12,17 +12,19 @@ live in `logbook.md`. Read it before starting a new task, and add a dated
 | CUDA 13.2.1 | `/usr/local/cuda-13.2` |
 | OptiX 9.1.0 (headers only; the runtime comes with the driver) | `/opt/viztools/optix-9.1.0` |
 | SDL3 3.4.18 (X11/OpenGL/Vulkan, no Wayland) | `/opt/viztools/sdl3` |
-| EnTT 4.0.0 (requires C++20) | `/opt/viztools/entt-4.0.0` |
+| EnTT 4.0.0 (installed, unused by the viewer) | `/opt/viztools/entt-4.0.0` |
+| meshoptimizer 1.3 (static) | `/opt/viztools/meshoptimizer-1.3` |
+| OpenXR loader 1.1.58 (static) + headers | `/opt/viztools/openxr-1.1.58` |
+| Vulkan headers/loader dev 1.3.275, vulkan-tools | apt (`/usr/include/vulkan`) |
+| NVIDIA CloudXR SDK 6.2.1 (`CLOUDXR_SDK_DIR`) | `/opt/viztools/cloudxr-6.2.1` |
 | Dear ImGui 1.93.0 (sources + SDL3/SDL_Renderer/OpenGL3 backends) | `/opt/viztools/imgui-1.93.0` |
 | OpenUSD 26.11.1 (no Python, imaging, MaterialX or Hydra) | `/opt/viztools/usd-26.11` |
 | CMake 3.28, g++ 11.5 | `/usr/bin` |
 
 - Environment: `/etc/profile.d/viztools.sh` (login shells). In a fresh non-login
   shell, run `source /etc/profile.d/viztools.sh` first.
-- Older per-user copies remain in `~/.local/opt`; nothing uses them. Don't
-  build against them.
-- `install_all_users.sh` copied from build trees that have since been deleted,
-  so it can't be re-run as is.
+- Older per-user copies remain in `~/.local/opt`; nothing uses them, and the
+  CMake file only looks in `/opt/viztools`. Don't build against them.
 
 ## Permissions and boundaries
 
@@ -45,13 +47,17 @@ cmake --install build
 ```
 
 Architecture (`src/`):
-- `Scene.*`: USD stage to EnTT registry (one entity per prim: `PrimInfo`,
-  `Hierarchy`, `MeshGeometry`). It also flattens geometry to world space
-  (`FlatGeometry`: per-triangle mesh id, material and corner UVs), resolves
+- `Scene.*`: the USD stage is the scene graph (the UI reads hierarchy, names
+  and types from it). Each renderable prim becomes a `RenderMesh`: an indexed
+  mesh in local space plus a `toWorld` transform, its corners (position,
+  normal, st) welded and reordered with meshoptimizer (`weldCorners`), with a
+  material per triangle. `meshIndex()`/`cameraIndex()` map an `SdfPath` to a
+  mesh id or camera. The scene also resolves
   UsdPreviewSurface materials and loads textures through `ArResolver`, so
   `.usdz` works. `UsdGeomCamera` prims become `SceneCamera` records
-  (world-space eye/forward/up, window, clipping) plus a `CameraView` component.
-- `OptixRenderer.*`: OptiX context, pipeline, SBT and a single GAS. Textures
+  (world-space eye/forward/up, window, clipping).
+- `OptixRenderer.*`: OptiX context, pipeline, SBT, one GAS per mesh and an
+  IAS (instance id = mesh id = index into `LaunchParams::meshes`). Textures
   are mipmapped CUDA texture objects (CPU-built mip chain, anisotropic
   filtering). It renders to a host RGBA buffer plus a per-pixel
   mesh-id buffer, which is used for picking.
@@ -65,16 +71,18 @@ Architecture (`src/`):
   only; shadow rays use level 0). `normalMapped` builds a per-triangle
   tangent frame from positions and st. Triangles are counter-clockwise from
   outside (Scene.cpp rewinds left-handed meshes), so `cross(e1, e2)` is the
-  outward normal. It is compiled to PTX by nvcc and embedded
-  via `cmake/EmbedFile.cmake`.
-- `XrOutput.*` (branch `cloudxr`): OpenXR client. The runtime creates the
+  outward normal (in world space: `HitTriangle` applies the instance
+  transform). It is compiled to OptiX-IR by nvcc (`-optix-ir`) and embedded
+  as an `unsigned char` array via `cmake/EmbedFile.cmake`.
+- `XrOutput.*`: OpenXR client. The runtime creates the
   Vulkan instance/device (`XR_KHR_vulkan_enable2`); eye buffers are Vulkan
   memory exported as opaque fds and imported into CUDA, copied to the
   swapchain images on the Vulkan queue. Vulkan is dlopened (`VK_NO_PROTOTYPES`).
-  `CloudXrService.*` dlopens `libcloudxr.so` from a CloudXR SDK and restores
+  `CloudXrService.*` dlopens `libcloudxr.so` from a CloudXR SDK
+  (`--cloudxr-sdk`, else `$CLOUDXR_SDK_DIR`, else `/opt/viztools/cloudxr-6.2.1`) and restores
   SDL's SIGINT/SIGTERM handlers after starting it. `OptixRenderer` can move to
   the runtime's GPU (`release()` + `init(error, uuid)`) and renders eyes with
-  `renderView`. The differences from `main` are listed in `CLOUDXR.md`; keep
+  `renderView`. How to run and connect a headset is in `CLOUDXR.md`; keep
   it current.
 - `LaunchParams.h`: shared by host and device. Keep both sides in sync when
   changing it.
@@ -89,7 +97,7 @@ and keep builds warning-free.
 
 ## Literate book (LiterateP/)
 
-`LiterateP/src/*.nw` contains every line of the 17 project source files
+`LiterateP/src/*.nw` contains every line of the 16 project source files
 (everything except stb_image.h and cxrServiceAPI.h) in noweb syntax, with Knuth-style prose.
 **When you change any source file, update the matching chunk in the book**,
 then run `python3 LiterateP/lp.py check`. It must print `ok` for all files.
@@ -116,9 +124,8 @@ line after `@`. Never hard-code section numbers: cite chunks as `<<Name>>`.
   meshes need `subdivisionScheme = "none"`, or they shade smooth.
   Validate new scenes with `usdchecker`. `McUsd.usdz` from
   github.com/usd-wg/assets is a good real-world texture and cutout test.
-- XR without a headset: `--cloudxr --cloudxr-sdk
-  /srv/isaac-shared/cxr/cloudxr-lovr-sample/build/cloudxr/CloudXR-6.2.1-Linux-sdk
-  --cloudxr-profile apple-vision-pro --xr-mirror` gives a running session (a
+- XR without a headset: `--cloudxr --cloudxr-profile apple-vision-pro
+  --xr-mirror` gives a running session (a
   static profile needs no client); the mirror and the status bar show the
   result. Stop it with SIGTERM so the session ends before the service. Only
   one app can hold a CloudXR session.

@@ -1,4 +1,4 @@
-// Ray traces a FlatGeometry with OptiX into a host-side RGBA image.
+// Ray traces a Scene with OptiX into a host-side RGBA image.
 #pragma once
 
 #include <array>
@@ -11,7 +11,7 @@
 
 #include "LaunchParams.h"
 
-struct FlatGeometry;
+class Scene;
 
 class OptixRenderer
 {
@@ -29,7 +29,8 @@ public:
     const std::string& deviceName() const { return m_deviceName; }
     const std::array<unsigned char, 16>& deviceUuid() const { return m_deviceUuid; }
 
-    void setGeometry(const FlatGeometry& geometry);
+    // Uploads the meshes, materials and textures and builds the acceleration structures.
+    void setScene(const Scene& scene);
     void resize(unsigned int width, unsigned int height);
     void setCamera(const float eye[3], const float target[3], const float up[3], float fovYDeg);
     // halfWidth/halfHeight: the image plane at distance 1 (perspective) or half
@@ -72,10 +73,20 @@ private:
         void free();
     };
 
+    // A mesh's vertex data and its GAS
+    struct MeshBuffers
+    {
+        DeviceBuffer positions, normals, uvs, indices, triMaterial, gas;
+        OptixTraversableHandle handle = 0;
+        void free();
+    };
+
     void createPipeline();
     void buildSbt();
-    void uploadTextures(const FlatGeometry& geometry);
+    OptixTraversableHandle buildAccel(const OptixBuildInput& input, DeviceBuffer& output);
+    void uploadTextures(const Scene& scene);
     void freeTextures();
+    void freeScene();
 
     std::string m_deviceName;
     std::array<unsigned char, 16> m_deviceUuid{};
@@ -88,7 +99,8 @@ private:
     OptixShaderBindingTable m_sbt = {};
     DeviceBuffer m_raygenRecord, m_missRecords, m_hitRecords;
 
-    DeviceBuffer m_vertices, m_indices, m_triMesh, m_triMaterial, m_triUVs, m_triNormals, m_materials, m_gas;
+    std::vector<MeshBuffers> m_meshes;
+    DeviceBuffer m_meshRecords, m_instances, m_ias, m_materials;
     DeviceBuffer m_colorBuffer, m_accumBuffer, m_meshIdBuffer, m_paramsBuffer;
     DeviceBuffer m_viewAccum, m_viewMeshIds, m_viewParams;  // scratch for renderView
     std::vector<cudaMipmappedArray_t> m_textureArrays;
