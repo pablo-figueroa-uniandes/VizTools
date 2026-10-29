@@ -60,13 +60,14 @@ Architecture (`src/`):
   IAS (instance id = mesh id = index into `LaunchParams::meshes`). Textures
   are mipmapped CUDA texture objects (CPU-built mip chain, anisotropic
   filtering). It renders to a host RGBA buffer plus a per-pixel
-  mesh-id buffer, which is used for picking.
+  mesh-id buffer, which is used for picking, and a device-side buffer of hit
+  points that `hitPointAt` reads one pixel at a time (the orbit pivot).
 - `devicePrograms.cu`: raygen (pinhole or orthographic camera, clipping range
   as a depth along w; progressive, jittered after frame 0, which is
   also the picking frame), two miss programs (radiance, shadow), closest-hit
   (Lambert + GGX for the directional light, shadow ray, one VNDF-sampled glossy
   reflection ray at depth 0, firefly clamp on its result) and any-hit (alpha
-  cutout). Payload: rgb, mesh id, depth, rng seed; maxTraceDepth 3.
+  cutout). Payload: rgb, mesh id, depth, rng seed, hit distance; maxTraceDepth 3.
   `sampleTexture` picks the mip level from ray differentials (camera rays
   only; shadow rays use level 0). `normalMapped` builds a per-triangle
   tangent frame from positions and st. Triangles are counter-clockwise from
@@ -87,7 +88,7 @@ Architecture (`src/`):
 - `LaunchParams.h`: shared by host and device. Keep both sides in sync when
   changing it.
 - `App.*`: SDL3 window, ImGui panels (hierarchy, inspector, viewport,
-  status bar), an orbit camera and a Camera menu to look through USD cameras
+  status bar), an orbit camera (double-click a surface to orbit around it) and a Camera menu to look through USD cameras
   (`m_camera`; any mouse move hands the view back to the orbit camera).
   Setting `m_needsRender` restarts the accumulation; the app then adds a sample every frame until kMaxSamples (256).
 

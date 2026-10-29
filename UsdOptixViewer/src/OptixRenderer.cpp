@@ -137,7 +137,7 @@ void OptixRenderer::release()
     cudaDeviceSynchronize();
     freeScene();
     for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_colorBuffer, &m_accumBuffer,
-                            &m_meshIdBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds, &m_viewParams})
+                            &m_meshIdBuffer, &m_hitBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds, &m_viewParams})
         b->free();
     optixPipelineDestroy(m_pipeline);
     optixProgramGroupDestroy(m_raygenPG);
@@ -222,7 +222,7 @@ void OptixRenderer::createPipeline()
 
     OptixPipelineCompileOptions pipelineOptions = {};
     pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
-    pipelineOptions.numPayloadValues = 6;
+    pipelineOptions.numPayloadValues = 7;
     pipelineOptions.numAttributeValues = 2;
     pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
     pipelineOptions.pipelineLaunchParamsVariableName = "params";
@@ -508,8 +508,10 @@ void OptixRenderer::resize(unsigned int width, unsigned int height)
     m_params.accumBuffer = reinterpret_cast<float4*>(m_accumBuffer.ptr);
     m_params.frameIndex = 0;
     m_meshIdBuffer.resize(size_t(width) * height * sizeof(unsigned int));
+    m_hitBuffer.resize(size_t(width) * height * sizeof(float4));
     m_params.colorBuffer = reinterpret_cast<uchar4*>(m_colorBuffer.ptr);
     m_params.meshIdBuffer = reinterpret_cast<unsigned int*>(m_meshIdBuffer.ptr);
+    m_params.hitBuffer = reinterpret_cast<float4*>(m_hitBuffer.ptr);
     m_pixels.resize(size_t(width) * height);
     m_meshIds.resize(size_t(width) * height);
 }
@@ -589,6 +591,7 @@ void OptixRenderer::renderView(const Camera& camera, unsigned int width, unsigne
     params.colorBuffer = target;
     params.accumBuffer = reinterpret_cast<float4*>(m_viewAccum.ptr);
     params.meshIdBuffer = reinterpret_cast<unsigned int*>(m_viewMeshIds.ptr);
+    params.hitBuffer = nullptr;
     for (unsigned int s = 0; s < std::max(samples, 1u); ++s)
     {
         params.frameIndex = s;
@@ -606,4 +609,19 @@ unsigned int OptixRenderer::meshIdAt(unsigned int x, unsigned int y) const
     if (x >= m_params.width || y >= m_params.height)
         return kNoMesh;
     return m_meshIds[size_t(y) * m_params.width + x];
+}
+
+// Reads one pixel of the hit buffer back on demand: it is only needed when
+// the orbit pivot moves, so it is not downloaded with every frame.
+bool OptixRenderer::hitPointAt(unsigned int x, unsigned int y, float point[3]) const
+{
+    if (x >= m_params.width || y >= m_params.height || !m_params.handle || m_params.frameIndex == 0)
+        return false;
+    float4 hit;
+    if (cudaMemcpyAsync(&hit, reinterpret_cast<const float4*>(m_hitBuffer.ptr) + size_t(y) * m_params.width + x,
+                        sizeof(hit), cudaMemcpyDeviceToHost, m_stream) != cudaSuccess ||
+        cudaStreamSynchronize(m_stream) != cudaSuccess)
+        return false;
+    point[0] = hit.x, point[1] = hit.y, point[2] = hit.z;
+    return hit.w != 0.0f;
 }

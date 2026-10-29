@@ -24,7 +24,7 @@ interface and an OptiX ray-traced viewport.
     differentials.
   - Lighting: GGX specular with glossy reflections, a directional light with
     shadows, and smooth or authored shading normals.
-- **Interaction**: orbit, pan and zoom, click to select (highlighted in the
+- **Interaction**: orbit, pan and zoom, double-click to orbit around a point, click to select (highlighted in the
   viewport and revealed in the tree), and frame selection.
 - **Cameras**: look through any USD camera (perspective or orthographic, with
   its clipping range) from the Camera menu or `--camera`.

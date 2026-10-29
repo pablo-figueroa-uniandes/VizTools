@@ -72,10 +72,11 @@ struct MeshData
 
 struct LaunchParams
 {
-    // output: colorBuffer = accumBuffer / (frameIndex + 1); meshIdBuffer is written on frame 0
+    // output: colorBuffer = accumBuffer / (frameIndex + 1); meshIdBuffer and hitBuffer are written on frame 0
     uchar4*       colorBuffer;
     float4*       accumBuffer;
     unsigned int* meshIdBuffer;  // mesh under each pixel (kNoMesh for background)
+    float4*       hitBuffer;     // world-space point under each pixel, w = 1 (w = 0 for background); may be null
     unsigned int  width, height;
     unsigned int  frameIndex;    // progressive sample index, reset to 0 after any change
 

@@ -135,17 +135,19 @@ static __forceinline__ __device__ float rnd(unsigned int& seed)
     return float(seed & 0x00ffffffu) / float(0x01000000u);
 }
 @* The payload. A ray carries a few 32-bit registers, the \emph{payload},
-that the programs it reaches can read and write. Radiance rays use six: the
+that the programs it reaches can read and write. Radiance rays use seven: the
 red, green and blue components of the returned color, stored as the bit
 patterns of [[float]]s; the id of the mesh that was hit, for picking; the
 recursion depth of the ray, which tells primary rays from reflection rays;
 and the random seed, which travels with the ray so that a reflection
 continues the same random sequence instead of starting a correlated one.
-Shadow rays use a single register that the shadow miss program sets to~1.
+The seventh is the distance along the ray to the hit, which the closest-hit
+program sets and a miss leaves alone. Shadow rays use a single register that the shadow miss program sets to~1.
 
 <<Payload helpers and the sky>>=
 // ---- payload ------------------------------------------------------------------
-// Radiance rays: p0..p2 = rgb (float bits), p3 = mesh id, p4 = depth, p5 = rng seed.
+// Radiance rays: p0..p2 = rgb (float bits), p3 = mesh id, p4 = depth, p5 = rng seed,
+// p6 = hit distance (float bits; left alone on a miss).
 // Shadow rays: p0 = 1 when the light is visible.
 static __forceinline__ __device__ void setColor(float3 c, unsigned int meshId)
 {
@@ -551,7 +553,7 @@ The camera's clipping range is a depth, measured along $\mathbf w$, while
 [[optixTrace]] limits the distance along the ray. A ray of unit direction $d$
 advances $d\cdot\mathbf w$ in depth per unit of distance, so the near and far
 depths are divided by that factor; it is 1 for the orthographic camera and at
-the centre of the pinhole image. The six payload variables follow the layout
+the centre of the pinhole image. The seven payload variables follow the layout
 of <<Payload helpers and the sky>>; [[depth]] starts at zero, which marks a
 primary ray.
 
@@ -572,10 +574,10 @@ else
     dir = normalize(cam.w + cam.u * ndc.x + cam.v * ndc.y);
 const float depthPerT = dot(dir, cam.w);  // the clipping range is a depth along w, not a ray distance
 
-unsigned int r, g, b, meshId, depth = 0;
+unsigned int r, g, b, meshId, depth = 0, hitT = 0;
 optixTrace(params.handle, origin, dir, cam.clipNear / depthPerT, cam.clipFar / depthPerT, 0.0f,
            OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
-           r, g, b, meshId, depth, seed);
+           r, g, b, meshId, depth, seed, hitT);
 @ The new sample is added to the sum kept for the pixel, together with a count
 in the fourth component; on frame~0 the sum is simply replaced, which is how
 a reset takes effect. The displayed color is the average, $\bar c=\sum c_i/N$,
@@ -585,7 +587,10 @@ The conversion to 8 bits is a deliberate approximation. Displays expect sRGB,
 whose transfer curve is close to a power of $1/2.2$; we use $1/2$, a square
 root, which is cheaper and slightly brightens the midtones, a look that suits
 an interactive viewer. Values above~1 are clamped by [[__saturatef]]. Finally, the mesh id is
-stored on frame~0 only, the frame the host reads back for picking.
+stored on frame~0 only, the frame the host reads back for picking, together
+with the point that was hit, $\mathbf o+t\,\mathbf d$, from the distance
+$t$ in the payload. A miss leaves $t$ at~0 and marks the point as background
+in its fourth component.
 
 <<Accumulate the sample and write the pixel>>=
 const float4 sample = make_float4(__uint_as_float(r), __uint_as_float(g), __uint_as_float(b), 1.0f);
@@ -602,7 +607,15 @@ params.colorBuffer[pixel] = make_uchar4((unsigned char)(255.0f * __saturatef(sqr
                                         (unsigned char)(255.0f * __saturatef(sqrtf(sum.y * inv))),
                                         (unsigned char)(255.0f * __saturatef(sqrtf(sum.z * inv))), 255);
 if (params.frameIndex == 0)
+{
     params.meshIdBuffer[pixel] = meshId;
+    // the orbit camera pivots on these points
+    if (params.hitBuffer)
+    {
+        const float3 p = origin + dir * __uint_as_float(hitT);
+        params.hitBuffer[pixel] = make_float4(p.x, p.y, p.z, meshId == kNoMesh ? 0.0f : 1.0f);
+    }
+}
 @ The miss programs. A radiance ray that escapes returns the sky in its
 direction and no mesh. A shadow ray that escapes has reached the light; its
 caller initializes the payload to~0, so the light counts as blocked unless
@@ -1004,10 +1017,10 @@ scaling the whole color to preserve its hue. The image loses nothing visible
 and the fireflies disappear.
 
 <<Trace the reflection ray and clamp fireflies>>=
-unsigned int rr, rg, rb, rMesh, rDepth = depth + 1;
+unsigned int rr, rg, rb, rMesh, rDepth = depth + 1, rT;
 optixTrace(params.handle, hitPos + offset, r, 0.0f, 1e16f, 0.0f, OptixVisibilityMask(255),
            OPTIX_RAY_FLAG_NONE, RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
-           rr, rg, rb, rMesh, rDepth, seed);
+           rr, rg, rb, rMesh, rDepth, seed, rT);
 incoming = make_float3(__uint_as_float(rr), __uint_as_float(rg), __uint_as_float(rb));
 // Firefly clamp: a rough reflection that lands on another surface's sharp
 // highlight of the (delta) light returns huge, rare values. Anything above
@@ -1017,8 +1030,10 @@ if (peak > 2.0f)
     incoming = incoming * (2.0f / peak);
 @ Finally the program writes the advanced seed back into the payload, so that
 a reflection's caller continues the random sequence, and returns the color
-with the id of the mesh that was hit.
+with the id of the mesh that was hit and the hit distance, which
+[[optixGetRayTmax]] reports in a closest-hit program.
 
 <<Return the color and the seed to the caller>>=
 optixSetPayload_5(seed);
+optixSetPayload_6(__float_as_uint(optixGetRayTmax()));
 setColor(color, meshId);

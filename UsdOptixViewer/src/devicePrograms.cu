@@ -42,7 +42,8 @@ static __forceinline__ __device__ float rnd(unsigned int& seed)
 }
 
 // ---- payload ------------------------------------------------------------------
-// Radiance rays: p0..p2 = rgb (float bits), p3 = mesh id, p4 = depth, p5 = rng seed.
+// Radiance rays: p0..p2 = rgb (float bits), p3 = mesh id, p4 = depth, p5 = rng seed,
+// p6 = hit distance (float bits; left alone on a miss).
 // Shadow rays: p0 = 1 when the light is visible.
 static __forceinline__ __device__ void setColor(float3 c, unsigned int meshId)
 {
@@ -234,10 +235,10 @@ extern "C" __global__ void __raygen__renderFrame()
         dir = normalize(cam.w + cam.u * ndc.x + cam.v * ndc.y);
     const float depthPerT = dot(dir, cam.w);  // the clipping range is a depth along w, not a ray distance
 
-    unsigned int r, g, b, meshId, depth = 0;
+    unsigned int r, g, b, meshId, depth = 0, hitT = 0;
     optixTrace(params.handle, origin, dir, cam.clipNear / depthPerT, cam.clipFar / depthPerT, 0.0f,
                OptixVisibilityMask(255), OPTIX_RAY_FLAG_NONE, RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
-               r, g, b, meshId, depth, seed);
+               r, g, b, meshId, depth, seed, hitT);
 
     const float4 sample = make_float4(__uint_as_float(r), __uint_as_float(g), __uint_as_float(b), 1.0f);
     float4 sum = sample;
@@ -253,7 +254,15 @@ extern "C" __global__ void __raygen__renderFrame()
                                             (unsigned char)(255.0f * __saturatef(sqrtf(sum.y * inv))),
                                             (unsigned char)(255.0f * __saturatef(sqrtf(sum.z * inv))), 255);
     if (params.frameIndex == 0)
+    {
         params.meshIdBuffer[pixel] = meshId;
+        // the orbit camera pivots on these points
+        if (params.hitBuffer)
+        {
+            const float3 p = origin + dir * __uint_as_float(hitT);
+            params.hitBuffer[pixel] = make_float4(p.x, p.y, p.z, meshId == kNoMesh ? 0.0f : 1.0f);
+        }
+    }
 }
 
 extern "C" __global__ void __miss__radiance()
@@ -407,10 +416,10 @@ extern "C" __global__ void __closesthit__radiance()
             float3 incoming;
             if (params.reflections && depth == 0)
             {
-                unsigned int rr, rg, rb, rMesh, rDepth = depth + 1;
+                unsigned int rr, rg, rb, rMesh, rDepth = depth + 1, rT;
                 optixTrace(params.handle, hitPos + offset, r, 0.0f, 1e16f, 0.0f, OptixVisibilityMask(255),
                            OPTIX_RAY_FLAG_NONE, RAY_TYPE_RADIANCE, RAY_TYPE_COUNT, RAY_TYPE_RADIANCE,
-                           rr, rg, rb, rMesh, rDepth, seed);
+                           rr, rg, rb, rMesh, rDepth, seed, rT);
                 incoming = make_float3(__uint_as_float(rr), __uint_as_float(rg), __uint_as_float(rb));
                 // Firefly clamp: a rough reflection that lands on another surface's sharp
                 // highlight of the (delta) light returns huge, rare values. Anything above
@@ -426,5 +435,6 @@ extern "C" __global__ void __closesthit__radiance()
     }
 
     optixSetPayload_5(seed);
+    optixSetPayload_6(__float_as_uint(optixGetRayTmax()));
     setColor(color, meshId);
 }

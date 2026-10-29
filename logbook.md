@@ -311,3 +311,22 @@ Not supported yet: translucency, UsdTransform2d, UDIM, normal/roughness/metallic
   - Build card: OptiX-IR embedded, tools in `/opt/viztools`.
 - Built with pptxgenjs 3.12.0, installed in the session scratchpad. The theme was applied with the pptx skill's `apply_theme.js`. Run with `NODE_PATH` pointing to that install, `node make_slides.js` regenerates the deck without a `node_modules` in the repository.
 - Verified: `validate.py` passes. Every slide was rendered through LibreOffice and the changed slides were checked: no overflow and no stale terms. The screenshots in `Docs/images/` were not retaken. The viewports were pixel-identical after the merge, but `viewer-ui.jpg` lacks the inspector's new vertex line.
+
+### Follow-up (October 29th): orbit pivot on the surface (uniandes_city.usdz)
+
+- Problem: in `/share/data/uniandes_city.usdz` (the Desktop file is a symlink to it), rotating did not work in a useful way. The city is 5 × 5 km, Z-up, with 13 meshes merged by material, plus 5 USD cameras. The kitchen worked.
+  - After a handover from a USD camera, the orbit turned around a point at the depth of the scene's center. When that center was behind the camera, it used half the scene's diagonal instead. For Calle_21_path and Monserrate, the pivot was 3.5 km away, so each drag swung the eye across the city.
+  - In the orbit camera, the pivot is the center of the bounding box, which floats 358 m above the city. Pressing F doesn't help, because every building mesh spans the whole city.
+- Fix:
+  - On frame 0, raygen also writes the world-space hit point of each pixel to `LaunchParams::hitBuffer` (`float4`, w = 0 for background). Closest-hit returns the hit distance in a 7th payload value. `renderView` passes null, because the XR eyes need no points.
+  - `OptixRenderer::hitPointAt(x, y)` copies one pixel back on demand, so dragging pays no per-frame download.
+  - `orbitFromUsdCamera` pivots on the surface at the center of the view, while the image still shows that camera. Otherwise it falls back to the depth of the scene's center. When that center is behind the camera, it uses 2% of the diagonal instead of half of it.
+  - Double-clicking a surface makes it the orbit center (`App::pivotAt`): the eye stays put and turns to face the point. `orbitAround` sets the target, distance, yaw and pitch from a direction.
+  - The About box, both READMEs, CLAUDE.md and the book (4 parts) are updated. `lp.py check` is ok for all 16 files (408 sections, 400 chunks), and the PDF has 151 pages with no overfull lines.
+- Verified with a temporary test hook (removed before the final build). It called the handover or `pivotAt` after 30 frames and then added 0.4 rad of yaw:
+  - Calle_21_path: the pivot is now 48 m ahead on the ground (it was 3,549 m away). The handover image is identical to the USD camera's, and the yaw turns around the nearby building.
+  - Monserrate: the pivot is 397 m ahead on the mountainside.
+  - Double-click from the default view: the view turns to center the clicked terrain point.
+  - The orthographic Top camera in camera_test still hands over correctly.
+  - material_test and textured_scene (`--select /World/Box`) viewports are pixel-identical to the previous build. The build has no warnings, and the installed copy was updated.
+- Not verified: a real mouse drag or double-click, because synthetic input does not reach SDL.

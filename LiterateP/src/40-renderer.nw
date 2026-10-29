@@ -137,6 +137,9 @@ unsigned int width() const { return m_params.width; }
 unsigned int height() const { return m_params.height; }
 const std::vector<uchar4>& pixels() const { return m_pixels; }
 unsigned int meshIdAt(unsigned int x, unsigned int y) const;
+// World-space surface point at a pixel of the last rendered view; false
+// for the background or when no frame was rendered since the last reset.
+bool hitPointAt(unsigned int x, unsigned int y, float point[3]) const;
 float lastRenderMs() const { return m_lastRenderMs; }
 
 // Renders one view (an XR eye) into a device buffer of width x height
@@ -213,7 +216,8 @@ per array. [[m_instances]] holds the instances that place the meshes in the
 world, [[m_ias]] the acceleration structure built over them, and
 [[m_materials]] the materials of the whole scene. The image needs three buffers: the
 8-bit colors shown on screen, the floating-point sums of the progressive
-samples, and the mesh ids for picking. Finally, every texture is a mipmapped
+samples, the mesh ids for picking, and the surface points for the orbit
+pivot. Finally, every texture is a mipmapped
 CUDA array plus a texture object, and the objects are gathered in a device
 table that the shaders index by number. [[renderView]] has its own scratch
 buffers for the sums, the mesh ids and the parameters, so that an eye never
@@ -222,7 +226,7 @@ disturbs the desktop image.
 <<Scene and output buffers of the renderer>>=
 std::vector<MeshBuffers> m_meshes;
 DeviceBuffer m_meshRecords, m_instances, m_ias, m_materials;
-DeviceBuffer m_colorBuffer, m_accumBuffer, m_meshIdBuffer, m_paramsBuffer;
+DeviceBuffer m_colorBuffer, m_accumBuffer, m_meshIdBuffer, m_hitBuffer, m_paramsBuffer;
 DeviceBuffer m_viewAccum, m_viewMeshIds, m_viewParams;  // scratch for renderView
 std::vector<cudaMipmappedArray_t> m_textureArrays;
 std::vector<cudaTextureObject_t> m_textureObjects;
@@ -292,6 +296,8 @@ namespace {
 <<Render one view into a device buffer>>
 
 <<Look up the mesh under a pixel>>
+
+<<Read back the surface point under a pixel>>
 @ OptiX's host functions are not exported by any library. Instead, one header
 defines a global table of function pointers,
 \begin{center}\lpfile{optix\_function\_table\_definition.h},\end{center}
@@ -527,7 +533,7 @@ void OptixRenderer::release()
     cudaDeviceSynchronize();
     freeScene();
     for (DeviceBuffer* b : {&m_raygenRecord, &m_missRecords, &m_hitRecords, &m_colorBuffer, &m_accumBuffer,
-                            &m_meshIdBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds, &m_viewParams})
+                            &m_meshIdBuffer, &m_hitBuffer, &m_paramsBuffer, &m_viewAccum, &m_viewMeshIds, &m_viewParams})
         b->free();
     optixPipelineDestroy(m_pipeline);
     optixProgramGroupDestroy(m_raygenPG);
@@ -676,8 +682,9 @@ pipeline, because they shape the calling convention between programs.
   so that it can drop support for deeper graphs and for motion.
 \item The \emph{payload} is the set of 32-bit registers a ray carries between
   the program that traces it and the programs it triggers. Radiance rays use
-  six: the three color components as float bits, the id of the mesh that was
-  hit, the recursion depth, and the state of the random number generator.
+  seven: the three color components as float bits, the id of the mesh that
+  was hit, the recursion depth, the state of the random number generator, and
+  the distance to the hit.
   Shadow rays use only the first.
 \item Triangles report two \emph{attributes}, their barycentric coordinates.
 \item The launch parameters live in a constant-memory variable that the device
@@ -689,7 +696,7 @@ pipeline, because they shape the calling convention between programs.
 <<Pipeline compile options>>=
 OptixPipelineCompileOptions pipelineOptions = {};
 pipelineOptions.traversableGraphFlags = OPTIX_TRAVERSABLE_GRAPH_FLAG_ALLOW_SINGLE_LEVEL_INSTANCING;
-pipelineOptions.numPayloadValues = 6;
+pipelineOptions.numPayloadValues = 7;
 pipelineOptions.numAttributeValues = 2;
 pipelineOptions.exceptionFlags = OPTIX_EXCEPTION_FLAG_NONE;
 pipelineOptions.pipelineLaunchParamsVariableName = "params";
@@ -1216,8 +1223,10 @@ void OptixRenderer::resize(unsigned int width, unsigned int height)
     m_params.accumBuffer = reinterpret_cast<float4*>(m_accumBuffer.ptr);
     m_params.frameIndex = 0;
     m_meshIdBuffer.resize(size_t(width) * height * sizeof(unsigned int));
+    m_hitBuffer.resize(size_t(width) * height * sizeof(float4));
     m_params.colorBuffer = reinterpret_cast<uchar4*>(m_colorBuffer.ptr);
     m_params.meshIdBuffer = reinterpret_cast<unsigned int*>(m_meshIdBuffer.ptr);
+    m_params.hitBuffer = reinterpret_cast<float4*>(m_hitBuffer.ptr);
     m_pixels.resize(size_t(width) * height);
     m_meshIds.resize(size_t(width) * height);
 }
@@ -1359,6 +1368,7 @@ void OptixRenderer::renderView(const Camera& camera, unsigned int width, unsigne
     params.colorBuffer = target;
     params.accumBuffer = reinterpret_cast<float4*>(m_viewAccum.ptr);
     params.meshIdBuffer = reinterpret_cast<unsigned int*>(m_viewMeshIds.ptr);
+    params.hitBuffer = nullptr;
     for (unsigned int s = 0; s < std::max(samples, 1u); ++s)
     {
         params.frameIndex = s;
@@ -1379,4 +1389,27 @@ unsigned int OptixRenderer::meshIdAt(unsigned int x, unsigned int y) const
     if (x >= m_params.width || y >= m_params.height)
         return kNoMesh;
     return m_meshIds[size_t(y) * m_params.width + x];
+}
+@ The surface points, by contrast, stay on the GPU. They are needed only when
+the user moves the orbit pivot, a rare event, so copying 16 bytes per pixel
+back with every frame~0 would waste bandwidth during every drag. Instead we
+copy the one pixel asked for. The answer is valid only if a frame was rendered
+since the last reset ([[frameIndex]] is then above~0); before that the buffer
+still holds an older view. A CUDA error returns false rather than throwing,
+because the caller is in the middle of handling the mouse.
+
+<<Read back the surface point under a pixel>>=
+// Reads one pixel of the hit buffer back on demand: it is only needed when
+// the orbit pivot moves, so it is not downloaded with every frame.
+bool OptixRenderer::hitPointAt(unsigned int x, unsigned int y, float point[3]) const
+{
+    if (x >= m_params.width || y >= m_params.height || !m_params.handle || m_params.frameIndex == 0)
+        return false;
+    float4 hit;
+    if (cudaMemcpyAsync(&hit, reinterpret_cast<const float4*>(m_hitBuffer.ptr) + size_t(y) * m_params.width + x,
+                        sizeof(hit), cudaMemcpyDeviceToHost, m_stream) != cudaSuccess ||
+        cudaStreamSynchronize(m_stream) != cudaSuccess)
+        return false;
+    point[0] = hit.x, point[1] = hit.y, point[2] = hit.z;
+    return hit.w != 0.0f;
 }

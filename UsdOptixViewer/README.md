@@ -78,7 +78,8 @@ users in `/opt/viztools` (CUDA in `/usr/local/cuda-13.2`):
   and the full transform (scale ignored, as USD requires) are honoured, at the
   stage's start time. The camera's film back is fitted inside the viewport
   (usdview's "fit" policy). Orbiting, panning or zooming switches to the
-  orbit camera, which starts from the USD camera's position and direction.
+  orbit camera, which starts from the USD camera's position and direction and
+  orbits the surface at the center of the view.
   Aperture offsets are ignored with a warning.
 - XR output: stereo rendering to a headset through any
   OpenXR runtime with Vulkan support, in particular NVIDIA CloudXR (Apple
@@ -90,8 +91,8 @@ users in `/opt/viztools` (CUDA in `/usr/local/cuda-13.2`):
   the desktop view's eye and follows it. See the *XR* menu and
   [../CLOUDXR.md](../CLOUDXR.md) for all options and how to connect a headset.
 
-Controls: left-drag to orbit, right/middle-drag to pan, wheel to zoom, `F` to
-frame the selection, `Esc` to clear the selection, *Camera* menu to look
+Controls: left-drag to orbit, right/middle-drag to pan, wheel to zoom,
+double-click a surface to orbit around that point, `F` to frame the selection, `Esc` to clear the selection, *Camera* menu to look
 through a USD camera.
 
 ## Build and install

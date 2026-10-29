@@ -46,6 +46,8 @@ private:
     void viewFrame(float eye[3], float forward[3]) const;
     void lookThrough(int camera);
     void orbitFromUsdCamera();
+    void orbitAround(const float target[3], const float offset[3], float distance);
+    void pivotAt(unsigned int x, unsigned int y);
     void fittedWindow(const SceneCamera& camera, float& halfWidth, float& halfHeight) const;
     void openFileDialog();
 

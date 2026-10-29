@@ -783,9 +783,10 @@ void App::lookThrough(int camera)
 }
 
 // Hands the view over to the orbit camera, which starts where the USD camera
-// is, looking the same way. It orbits a point in front of the camera at the
-// depth of the scene's center. Roll is lost, and an orthographic camera
-// becomes a perspective one that shows the same size at that point.
+// is, looking the same way. It orbits the surface at the center of the view,
+// or, when the image shows none, a point at the depth of the scene's center.
+// Roll is lost, and an orthographic camera becomes a perspective one that
+// shows the same size at that point.
 void App::orbitFromUsdCamera()
 {
     if (m_camera < 0)
@@ -793,35 +794,77 @@ void App::orbitFromUsdCamera()
     const SceneCamera& c = m_scene.cameras()[m_camera];
     float halfW, halfH;
     fittedWindow(c, halfW, halfH);
+    // the image still shows this camera unless a change is pending
+    float hit[3];
+    const bool onSurface =
+        !m_needsRender && m_renderer.hitPointAt(m_renderer.width() / 2, m_renderer.height() / 2, hit);
     m_camera = -1;
     m_needsRender = true;
 
     const float* lo = m_scene.boundsMin();
     const float* hi = m_scene.boundsMax();
     const float* f = c.forward.data();
-    float depth = 0.0f, radius = 0.0f;
+    float depth = 0.0f, diagonal = 0.0f;
     for (int k = 0; k < 3; ++k)
     {
-        depth += (0.5f * (lo[k] + hi[k]) - c.eye[k]) * f[k];
-        radius += (hi[k] - lo[k]) * (hi[k] - lo[k]);
+        depth += ((onSurface ? hit[k] : 0.5f * (lo[k] + hi[k])) - c.eye[k]) * f[k];
+        diagonal += (hi[k] - lo[k]) * (hi[k] - lo[k]);
     }
+    // With the scene's center behind the camera (inside a large scene), a
+    // pivot that far away would swing the eye across the scene on every drag;
+    // a near one turns the view almost in place.
     if (depth < 1e-3f)
-        depth = std::max(0.5f * std::sqrt(radius), 1.0f);
+        depth = std::max(0.02f * std::sqrt(diagonal), 1e-3f);
+    float target[3], offset[3];
     for (int k = 0; k < 3; ++k)
-        m_target[k] = c.eye[k] + f[k] * depth;
+    {
+        target[k] = c.eye[k] + f[k] * depth;
+        offset[k] = -f[k];
+    }
     if (c.orthographic)
-        m_distance = halfH / std::tan(0.5f * m_fovY * float(M_PI) / 180.0f);
+        orbitAround(target, offset, halfH / std::tan(0.5f * m_fovY * float(M_PI) / 180.0f));
     else
     {
-        m_distance = depth;
         m_fovY = 2.0f * std::atan(halfH) * 180.0f / float(M_PI);
+        orbitAround(target, offset, depth);
     }
-    // the orbit offset (from the target to the eye) is -forward
+}
+
+// Orbits `target` from `distance` away; `offset` is the unit vector from the
+// target to the eye (the inverse of orbitOffset).
+void App::orbitAround(const float target[3], const float offset[3], float distance)
+{
+    std::copy(target, target + 3, m_target);
+    m_distance = distance;
     if (m_scene.zUp())
-        m_pitch = std::asin(std::clamp(-f[2], -1.0f, 1.0f)), m_yaw = std::atan2(-f[1], -f[0]);
+        m_pitch = std::asin(std::clamp(offset[2], -1.0f, 1.0f)), m_yaw = std::atan2(offset[1], offset[0]);
     else
-        m_pitch = std::asin(std::clamp(-f[1], -1.0f, 1.0f)), m_yaw = std::atan2(-f[0], -f[2]);
+        m_pitch = std::asin(std::clamp(offset[1], -1.0f, 1.0f)), m_yaw = std::atan2(offset[0], offset[2]);
     m_pitch = std::clamp(m_pitch, -1.55f, 1.55f);
+    m_needsRender = true;
+}
+
+// Double-click: the surface point under the cursor becomes the orbit center.
+// The eye stays where it is and turns to face the point.
+void App::pivotAt(unsigned int x, unsigned int y)
+{
+    float hit[3];
+    if (m_needsRender || !m_renderer.hitPointAt(x, y, hit))
+        return;
+    orbitFromUsdCamera();
+    float eye[3], forward[3], offset[3], distance = 0.0f;
+    viewFrame(eye, forward);
+    for (int k = 0; k < 3; ++k)
+    {
+        offset[k] = eye[k] - hit[k];
+        distance += offset[k] * offset[k];
+    }
+    distance = std::sqrt(distance);
+    if (distance < 1e-6f)
+        return;
+    for (float& o : offset)
+        o /= distance;
+    orbitAround(hit, offset, distance);
 }
 
 void App::frameBounds(const float lo[3], const float hi[3])
@@ -905,15 +948,17 @@ void App::drawViewport()
     const unsigned w = unsigned(size.x * fbScale), h = unsigned(size.y * fbScale);
     const bool mirroring = m_xrMirror && m_xr.state() == XrOutput::State::Running && !m_mirrorPixels.empty();
 
-    // pick on click (left release without dragging)
-    if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16.0f &&
-        m_renderer.width() == w && !mirroring)
+    // click (left release without dragging): pick; double-click: orbit around the point
+    const bool onImage = hovered && m_renderer.width() == w && !mirroring;
+    const unsigned px = onImage ? unsigned((io.MousePos.x - origin.x) * fbScale) : 0;
+    const unsigned py = onImage ? unsigned((io.MousePos.y - origin.y) * fbScale) : 0;
+    if (onImage && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16.0f)
     {
-        const unsigned px = unsigned((io.MousePos.x - origin.x) * fbScale);
-        const unsigned py = unsigned((io.MousePos.y - origin.y) * fbScale);
         const unsigned meshId = m_renderer.meshIdAt(px, py);
         select(meshId < m_scene.meshes().size() ? m_scene.meshes()[meshId].path : SdfPath(), true);
     }
+    if (onImage && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+        pivotAt(px, py);
 
     if (w != m_renderer.width() || h != m_renderer.height())
     {
@@ -997,6 +1042,7 @@ void App::drawPopups()
         ImGui::Text("SDL3 windowing and Dear ImGui %s user interface.", IMGUI_VERSION);
         ImGui::Spacing();
         ImGui::TextDisabled("Left drag: orbit   Right/middle drag: pan   Wheel: zoom");
+        ImGui::TextDisabled("Double-click: orbit around the point under the cursor");
         ImGui::TextDisabled("Click: select   F: frame selection   Esc: clear selection");
         ImGui::TextDisabled("Camera menu: look through a USD camera (moving returns to the orbit camera)");
         ImGui::TextDisabled("XR menu: headset output through OpenXR / NVIDIA CloudXR (--xr, --cloudxr)");

@@ -115,6 +115,8 @@ void orbitOffset(float offset[3], float up[3]) const;
 void viewFrame(float eye[3], float forward[3]) const;
 void lookThrough(int camera);
 void orbitFromUsdCamera();
+void orbitAround(const float target[3], const float offset[3], float distance);
+void pivotAt(unsigned int x, unsigned int y);
 void fittedWindow(const SceneCamera& camera, float& halfWidth, float& halfHeight) const;
 void openFileDialog();
 
@@ -282,6 +284,10 @@ namespace {
 <<Look through a USD camera>>
 
 <<Hand the view of a USD camera to the orbit camera>>
+
+<<Orbit a target from a direction and distance>>
+
+<<Orbit the surface point under a pixel>>
 
 <<Frame a bounding box>>
 
@@ -1519,16 +1525,20 @@ void App::lookThrough(int camera)
 @ A USD camera is fixed by its file, but the user will still want to look
 around from it. Any attempt to move the view therefore hands it over to the
 orbit camera, which should start exactly where the USD camera was, so that
-the image does not jump. The orbit camera needs a target in front of the eye.
-We take the point of the line of sight at the depth of the scene's centre,
-$\delta=(\mathbf c-\mathbf e)\cdot\mathbf f$, where $\mathbf f$ is the viewing
-direction; if the centre is behind the camera, we use the scene's radius (or
-1) instead. The orbit offset $\mathbf o$ points from the target to the eye, so
-it is $-\mathbf f$, and inverting the formulas of
-<<Send the orbit camera to the renderer>> gives the angles: for a Y-up stage
-$\varphi=\arcsin(-f_y)$ and $\theta=\operatorname{atan2}(-f_x,-f_z)$; for a
-Z-up stage $\varphi=\arcsin(-f_z)$ and $\theta=\operatorname{atan2}(-f_y,-f_x)$.
-The field of view is that of the fitted window, $2\arctan h$.
+the image does not jump. The orbit camera needs a target in front of the eye,
+and the best one is what the user is looking at: the surface at the centre of
+the image, which the renderer recorded on frame~0. Its depth along the line
+of sight is $\delta=(\mathbf p-\mathbf e)\cdot\mathbf f$, where $\mathbf f$ is
+the viewing direction. The point is only trusted while no change is pending,
+because the image then still shows this camera. Without it (the centre shows
+the sky, or the mirror replaced the image) we use the depth of the scene's
+centre $\mathbf c$ instead. In a large scene, a city for instance, that
+centre is often behind a camera standing inside it; the target is then put
+2\% of the scene's diagonal ahead. Half the scene, a natural first choice,
+would put it kilometres away, and every drag would swing the eye across the
+city instead of turning the view. The orbit offset $\mathbf o$ points from
+the target to the eye, so it is $-\mathbf f$. The field of view is that of
+the fitted window, $2\arctan h$.
 
 Two things cannot be carried over. The orbit camera has no roll, so a tilted
 camera straightens up. And it is always a pinhole: an orthographic view becomes
@@ -1537,9 +1547,10 @@ same, $d=h/\tan(\phi/2)$.
 
 <<Hand the view of a USD camera to the orbit camera>>=
 // Hands the view over to the orbit camera, which starts where the USD camera
-// is, looking the same way. It orbits a point in front of the camera at the
-// depth of the scene's center. Roll is lost, and an orthographic camera
-// becomes a perspective one that shows the same size at that point.
+// is, looking the same way. It orbits the surface at the center of the view,
+// or, when the image shows none, a point at the depth of the scene's center.
+// Roll is lost, and an orthographic camera becomes a perspective one that
+// shows the same size at that point.
 void App::orbitFromUsdCamera()
 {
     if (m_camera < 0)
@@ -1547,35 +1558,91 @@ void App::orbitFromUsdCamera()
     const SceneCamera& c = m_scene.cameras()[m_camera];
     float halfW, halfH;
     fittedWindow(c, halfW, halfH);
+    // the image still shows this camera unless a change is pending
+    float hit[3];
+    const bool onSurface =
+        !m_needsRender && m_renderer.hitPointAt(m_renderer.width() / 2, m_renderer.height() / 2, hit);
     m_camera = -1;
     m_needsRender = true;
 
     const float* lo = m_scene.boundsMin();
     const float* hi = m_scene.boundsMax();
     const float* f = c.forward.data();
-    float depth = 0.0f, radius = 0.0f;
+    float depth = 0.0f, diagonal = 0.0f;
     for (int k = 0; k < 3; ++k)
     {
-        depth += (0.5f * (lo[k] + hi[k]) - c.eye[k]) * f[k];
-        radius += (hi[k] - lo[k]) * (hi[k] - lo[k]);
+        depth += ((onSurface ? hit[k] : 0.5f * (lo[k] + hi[k])) - c.eye[k]) * f[k];
+        diagonal += (hi[k] - lo[k]) * (hi[k] - lo[k]);
     }
+    // With the scene's center behind the camera (inside a large scene), a
+    // pivot that far away would swing the eye across the scene on every drag;
+    // a near one turns the view almost in place.
     if (depth < 1e-3f)
-        depth = std::max(0.5f * std::sqrt(radius), 1.0f);
+        depth = std::max(0.02f * std::sqrt(diagonal), 1e-3f);
+    float target[3], offset[3];
     for (int k = 0; k < 3; ++k)
-        m_target[k] = c.eye[k] + f[k] * depth;
+    {
+        target[k] = c.eye[k] + f[k] * depth;
+        offset[k] = -f[k];
+    }
     if (c.orthographic)
-        m_distance = halfH / std::tan(0.5f * m_fovY * float(M_PI) / 180.0f);
+        orbitAround(target, offset, halfH / std::tan(0.5f * m_fovY * float(M_PI) / 180.0f));
     else
     {
-        m_distance = depth;
         m_fovY = 2.0f * std::atan(halfH) * 180.0f / float(M_PI);
+        orbitAround(target, offset, depth);
     }
-    // the orbit offset (from the target to the eye) is -forward
+}
+@ Placing the orbit camera. Given a target, the unit offset $\mathbf o$ from
+the target to the eye and a distance, inverting the formulas of
+<<Send the orbit camera to the renderer>> gives the angles: for a Y-up stage
+$\varphi=\arcsin o_y$ and $\theta=\operatorname{atan2}(o_x,o_z)$; for a Z-up
+stage $\varphi=\arcsin o_z$ and $\theta=\operatorname{atan2}(o_y,o_x)$. The
+pitch is clamped like a drag's, short of the poles.
+
+<<Orbit a target from a direction and distance>>=
+// Orbits `target` from `distance` away; `offset` is the unit vector from the
+// target to the eye (the inverse of orbitOffset).
+void App::orbitAround(const float target[3], const float offset[3], float distance)
+{
+    std::copy(target, target + 3, m_target);
+    m_distance = distance;
     if (m_scene.zUp())
-        m_pitch = std::asin(std::clamp(-f[2], -1.0f, 1.0f)), m_yaw = std::atan2(-f[1], -f[0]);
+        m_pitch = std::asin(std::clamp(offset[2], -1.0f, 1.0f)), m_yaw = std::atan2(offset[1], offset[0]);
     else
-        m_pitch = std::asin(std::clamp(-f[1], -1.0f, 1.0f)), m_yaw = std::atan2(-f[0], -f[2]);
+        m_pitch = std::asin(std::clamp(offset[1], -1.0f, 1.0f)), m_yaw = std::atan2(offset[0], offset[2]);
     m_pitch = std::clamp(m_pitch, -1.55f, 1.55f);
+    m_needsRender = true;
+}
+@ A double-click moves the pivot to the surface under the cursor: the orbit
+camera's target becomes that point, the eye stays where it is, and the view
+turns to face the point. This is what makes orbiting useful in a scene whose
+centre is far from what the user is looking at. A click on the sky does
+nothing. A USD camera first hands its view over, so the eye is the one on
+screen.
+
+<<Orbit the surface point under a pixel>>=
+// Double-click: the surface point under the cursor becomes the orbit center.
+// The eye stays where it is and turns to face the point.
+void App::pivotAt(unsigned int x, unsigned int y)
+{
+    float hit[3];
+    if (m_needsRender || !m_renderer.hitPointAt(x, y, hit))
+        return;
+    orbitFromUsdCamera();
+    float eye[3], forward[3], offset[3], distance = 0.0f;
+    viewFrame(eye, forward);
+    for (int k = 0; k < 3; ++k)
+    {
+        offset[k] = eye[k] - hit[k];
+        distance += offset[k] * offset[k];
+    }
+    distance = std::sqrt(distance);
+    if (distance < 1e-6f)
+        return;
+    for (float& o : offset)
+        o /= distance;
+    orbitAround(hit, offset, distance);
 }
 @ Framing. To frame an axis-aligned box, we aim at its center and enclose it
 in a sphere whose radius $r$ is half the box's diagonal. A sphere of radius
@@ -1773,18 +1840,23 @@ viewport's current width, so that pixel coordinates mean the same thing in
 both. A mesh id is the mesh's index in the scene, and each mesh records the
 path of the prim it came from, so the id leads straight to the prim to
 select. The selection is revealed in the tree; a click on the background,
-whose id is no mesh's index, clears it.
+whose id is no mesh's index, clears it. A double-click also moves the orbit
+pivot to the point under the cursor (<<Orbit the surface point under a pixel>>).
+The pixel is computed only over the image, where the mouse position cannot be
+negative.
 
 <<Pick the prim under a mouse click>>=
-// pick on click (left release without dragging)
-if (hovered && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16.0f &&
-    m_renderer.width() == w && !mirroring)
+// click (left release without dragging): pick; double-click: orbit around the point
+const bool onImage = hovered && m_renderer.width() == w && !mirroring;
+const unsigned px = onImage ? unsigned((io.MousePos.x - origin.x) * fbScale) : 0;
+const unsigned py = onImage ? unsigned((io.MousePos.y - origin.y) * fbScale) : 0;
+if (onImage && ImGui::IsMouseReleased(ImGuiMouseButton_Left) && io.MouseDragMaxDistanceSqr[0] < 16.0f)
 {
-    const unsigned px = unsigned((io.MousePos.x - origin.x) * fbScale);
-    const unsigned py = unsigned((io.MousePos.y - origin.y) * fbScale);
     const unsigned meshId = m_renderer.meshIdAt(px, py);
     select(meshId < m_scene.meshes().size() ? m_scene.meshes()[meshId].path : SdfPath(), true);
 }
+if (onImage && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
+    pivotAt(px, py);
 @ When the viewport changes size, the renderer reallocates its buffers and we
 replace the SDL texture by one of the new size. The texture is a
 \emph{streaming} texture, meant to be rewritten often, in the pixel format
@@ -1908,6 +1980,7 @@ void App::drawPopups()
         ImGui::Text("SDL3 windowing and Dear ImGui %s user interface.", IMGUI_VERSION);
         ImGui::Spacing();
         ImGui::TextDisabled("Left drag: orbit   Right/middle drag: pan   Wheel: zoom");
+        ImGui::TextDisabled("Double-click: orbit around the point under the cursor");
         ImGui::TextDisabled("Click: select   F: frame selection   Esc: clear selection");
         ImGui::TextDisabled("Camera menu: look through a USD camera (moving returns to the orbit camera)");
         ImGui::TextDisabled("XR menu: headset output through OpenXR / NVIDIA CloudXR (--xr, --cloudxr)");

@@ -55,6 +55,9 @@ public:
     unsigned int height() const { return m_params.height; }
     const std::vector<uchar4>& pixels() const { return m_pixels; }
     unsigned int meshIdAt(unsigned int x, unsigned int y) const;
+    // World-space surface point at a pixel of the last rendered view; false
+    // for the background or when no frame was rendered since the last reset.
+    bool hitPointAt(unsigned int x, unsigned int y, float point[3]) const;
     float lastRenderMs() const { return m_lastRenderMs; }
 
     // Renders one view (an XR eye) into a device buffer of width x height
@@ -101,7 +104,7 @@ private:
 
     std::vector<MeshBuffers> m_meshes;
     DeviceBuffer m_meshRecords, m_instances, m_ias, m_materials;
-    DeviceBuffer m_colorBuffer, m_accumBuffer, m_meshIdBuffer, m_paramsBuffer;
+    DeviceBuffer m_colorBuffer, m_accumBuffer, m_meshIdBuffer, m_hitBuffer, m_paramsBuffer;
     DeviceBuffer m_viewAccum, m_viewMeshIds, m_viewParams;  // scratch for renderView
     std::vector<cudaMipmappedArray_t> m_textureArrays;
     std::vector<cudaTextureObject_t> m_textureObjects;
