@@ -298,3 +298,16 @@ Not supported yet: translucency, UsdTransform2d, UDIM, normal/roughness/metallic
   - The headset client connects over TLS to 48322 only. The working Isaac Teleop setup has stunnel there, forwarding to the runtime on 127.0.0.1:48324, and ufw allows 48322/tcp and 47998-48012/udp from 157.253.113.0/24 only. Without stunnel the headset shows `0x800B1004`. The fix: the user runs the ufw + stunnel steps as root, and the viewer starts with `NV_CXR_SERVER_PORT=48324`.
 - Result: two sessions (3 and 4 minutes) with all streams connected, ended from the headset. The user confirmed that it runs.
 - Open: the XR menu shows the runtime's port (48324), not stunnel's 48322. A `--cloudxr-port` option and a menu hint for the TLS proxy would help.
+
+### Follow-up (October 29th): slide presentation updated
+
+- `Docs/UsdOptixViewer-code.pptx` (now 25 slides) and `Docs/make_slides.js` describe the merged code on `main`. Nothing mentions EnTT, `FlatGeometry`, PTX or the cloudxr branch any more.
+  - At a glance: 16 source files, about 4,600 lines, meshoptimizer in place of EnTT, 149 book pages.
+  - Architecture: the Scene box shows a RenderMesh per prim; OptixRenderer builds a GAS per mesh plus an IAS.
+  - "One entity per prim" is replaced by "The stage is the scene graph" (hierarchy, inspector, `meshIndex`/`cameraIndex`, selection as an `SdfPath`).
+  - "Flattening the geometry" is replaced by "From prim to RenderMesh": triangulate, orient, shade, weld with meshoptimizer, the `RenderMesh` struct, and 36 → 20 for the textured box.
+  - Renderer: module from embedded OptiX-IR, `setScene` with a GAS per mesh plus an IAS. `LaunchParams` shows `MeshData* meshes`. The notes explain `HitTriangle`.
+  - XR: 2.6 ms per frame (as measured on October 28th). New slide, "Connecting an Apple Vision Pro": stunnel on 48322 → the runtime on 48324, the steps, and the XR menu's addresses and port.
+  - Build card: OptiX-IR embedded, tools in `/opt/viztools`.
+- Built with pptxgenjs 3.12.0, installed in the session scratchpad. The theme was applied with the pptx skill's `apply_theme.js`. Run with `NODE_PATH` pointing to that install, `node make_slides.js` regenerates the deck without a `node_modules` in the repository.
+- Verified: `validate.py` passes. Every slide was rendered through LibreOffice and the changed slides were checked: no overflow and no stale terms. The screenshots in `Docs/images/` were not retaken. The viewports were pixel-identical after the merge, but `viewer-ui.jpg` lacks the inspector's new vertex line.

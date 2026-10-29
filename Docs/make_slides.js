@@ -182,14 +182,15 @@ pres.addSection({ title: "Overview" });
     s.addText("VizTools · ginebra · October 2026", { x: 0.6, y: 4.7, w: 4.4, h: 0.4, fontSize: 12, color: C.accent4,
                                                     margin: 0, isTextBox: true, objectName: "title-date" });
     s.addNotes("A walkthrough of the UsdOptixViewer source code, in the order the data flows: loading the USD " +
-               "stage, ray tracing it with OptiX, the desktop application, and the XR output of the cloudxr branch.");
+               "stage, ray tracing it with OptiX, the desktop application, and the XR output through CloudXR.");
 }
 
 // ---- 2. at a glance -------------------------------------------------------------
 {
     const s = content("The program at a glance", "Overview");
-    const stats = [["17", "source files", "C++, CUDA and CMake"], ["4,400", "lines of code", "plus stb_image"],
-                   ["5", "libraries", "OpenUSD, EnTT, OptiX, SDL3 + ImGui, OpenXR"], ["143", "book pages", "every line explained"]];
+    const stats = [["16", "source files", "C++, CUDA and CMake"], ["4,600", "lines of code", "plus stb_image"],
+                   ["5", "libraries", "OpenUSD, meshoptimizer, OptiX, SDL3 + ImGui, OpenXR"],
+                   ["149", "book pages", "every line explained"]];
     stats.forEach(([n, label, sub], i) => {
         const x = 0.5 + i * 2.3;
         s.addText(n, { x, y: 1.2, w: 2.1, h: 0.85, fontSize: 48, bold: true, color: C.accent1, margin: 0,
@@ -203,10 +204,10 @@ pres.addSection({ title: "Overview" });
         head: "What it does", bullets: true, size: 14, body: [
             "Opens .usd/.usda/.usdc/.usdz stages, shows the prim tree and every property",
             "Ray traces the geometry with UsdPreviewSurface materials, textures, shadows and glossy reflections",
-            "Looks through USD cameras; on the cloudxr branch, streams stereo to a headset through CloudXR",
+            "Looks through USD cameras and streams stereo to a headset (Vision Pro tested) through CloudXR",
         ] });
-    s.addNotes("Counts are for the cloudxr branch. main has 13 files: it lacks XrOutput and CloudXrService. " +
-               "The literate book in LiterateP/ contains every line of the code with prose.");
+    s.addNotes("Counts exclude the third-party stb_image.h and cxrServiceAPI.h. The literate book in LiterateP/ " +
+               "contains every line of the 16 files with prose. Every library is installed for all users in /opt/viztools.");
 }
 
 {
@@ -228,8 +229,8 @@ pres.addSection({ title: "Overview" });
     const s = content("Architecture: data flows left to right", "Overview");
     const y = 1.5, h = 1.1, w = 1.95;
     box(s, 0.5, y, w, h, "USD stage", "OpenUSD", HEX.accent2, C.text1);
-    box(s, 2.85, y, w, h, "Scene", "EnTT registry + FlatGeometry", C.text2, C.background1);
-    box(s, 5.2, y, w, h, "OptixRenderer", "GAS, SBT, launch", C.text2, C.background1);
+    box(s, 2.85, y, w, h, "Scene", "RenderMesh per prim, materials, cameras", C.text2, C.background1);
+    box(s, 5.2, y, w, h, "OptixRenderer", "GAS per mesh, IAS, SBT", C.text2, C.background1);
     box(s, 7.55, y, w, h, "Device programs", "devicePrograms.cu, on the GPU", C.accent1, C.text1);
     arrow(s, 2.45, y + h / 2, 2.85, y + h / 2);
     arrow(s, 4.8, y + h / 2, 5.2, y + h / 2);
@@ -245,46 +246,50 @@ pres.addSection({ title: "Overview" });
                { text: " is the one structure both CPU and GPU read" }],
               { x: 0.5, y: 4.6, w: 9.0, h: 0.4, fontSize: 14, color: C.text1, margin: 0, isTextBox: true,
                 objectName: "label-launch" });
-    s.addNotes("Scene.* converts USD into an EnTT registry and flat world-space triangle arrays. OptixRenderer.* " +
-               "uploads them and launches the OptiX programs in devicePrograms.cu. App.* owns the window, the " +
-               "panels and the camera. XrOutput (cloudxr branch) sends eye images to an OpenXR runtime.");
+    s.addNotes("The USD stage is the scene graph. Scene.* turns each renderable prim into a RenderMesh (local-space " +
+               "indexed mesh + transform) and resolves materials and cameras. OptixRenderer.* uploads them and " +
+               "launches the OptiX programs in devicePrograms.cu. App.* owns the window, the panels and the camera. " +
+               "XrOutput sends eye images to an OpenXR runtime.");
 }
 
 // ---- section 1: scene -----------------------------------------------------------------
-divider(1, "Loading the scene", "Scene.h / Scene.cpp: USD stage → EnTT registry → world-space triangles", "Scene");
+divider(1, "Loading the scene", "Scene.h / Scene.cpp: USD stage → one RenderMesh per prim → GPU", "Scene");
 
 {
-    const s = content("One entity per prim", "Scene");
-    const comps = [["PrimInfo", "path, name, type name"], ["Hierarchy", "parent and children entities"],
-                   ["MeshGeometry", "triangle range, material, mesh id"], ["CameraView", "index into Scene::cameras()"]];
-    comps.forEach(([name, what], i) => {
+    const s = content("The stage is the scene graph", "Scene");
+    const uses = [["Hierarchy panel", "walks UsdPrim children, filters by name"],
+                  ["Inspector", "reads the prim's type and properties"],
+                  ["meshIndex(SdfPath)", "prim → RenderMesh id, for --select"],
+                  ["cameraIndex(SdfPath)", "prim → SceneCamera, for --camera"]];
+    uses.forEach(([name, what], i) => {
         const y = 1.3 + i * 0.88;
         s.addShape(pres.shapes.ROUNDED_RECTANGLE, { x: 0.5, y, w: 4.3, h: 0.72, rectRadius: 0.08,
                                                     fill: { color: C.background2 }, line: { color: C.background2 },
-                                                    objectName: id("comp") });
+                                                    objectName: id("use") });
         badge(s, 0.65, y + 0.15, String.fromCharCode(65 + i));
-        s.addText([{ text: name, options: { bold: true, fontFace: MONO, breakLine: true } },
+        s.addText([{ text: name, options: { bold: true, fontFace: i > 1 ? MONO : undefined, breakLine: true } },
                    { text: what, options: { fontSize: 12, color: C.text2 } }],
                   { x: 1.2, y, w: 3.5, h: 0.72, fontSize: 14, valign: "middle", margin: 0, color: C.text1,
-                    isTextBox: true, objectName: id("comp-text") });
+                    isTextBox: true, objectName: id("use-text") });
     });
     card(s, 5.2, 1.3, 4.3, 3.52, {
-        head: "Why a registry", bullets: true, body: [
-            "The tree panel walks Hierarchy; the inspector reads the prim back by PrimInfo::path",
-            "Only drawn prims get MeshGeometry, so \"is it rendered?\" is one lookup",
-            "Picking maps a mesh id back to its entity",
-            "Instance proxies are included, so instanced models appear in full",
+        head: "No second scene graph", bullets: true, body: [
+            "Names, types and the tree come straight from USD",
+            "The selection is an SdfPath",
+            "Picking: mesh id → RenderMesh::path → prim",
+            "Instance proxies are traversed, so instanced models appear in full",
         ] });
-    s.addNotes("createEntities walks the stage with UsdTraverseInstanceProxies and creates one entity per prim. " +
-               "Components are added by later passes: extractGeometry adds MeshGeometry, extractCameras adds CameraView.");
+    s.addNotes("load() opens the stage, then extractGeometry and extractCameras walk it with " +
+               "UsdTraverseInstanceProxies. Only renderable prims become RenderMesh records, so \"is it drawn?\" " +
+               "is meshIndex(path) >= 0.");
 }
 
 {
-    const s = content("Flattening the geometry", "Scene");
+    const s = content("From prim to RenderMesh", "Scene");
     const steps = [["Triangulate", "Mesh faces fan-split; Cube and Sphere generated"],
                    ["Orient", "leftHanded meshes rewound, so e1 × e2 is the outward normal"],
                    ["Shade", "authored normals, smooth for subdivision, flat for \"none\""],
-                   ["Transform", "UsdGeomXformCache to world space, bounds grown"]];
+                   ["Weld", "meshoptimizer merges equal corners, sorts by material and space"]];
     steps.forEach(([head, body], i) => {
         const x = 0.5 + i * 2.3;
         badge(s, x, 1.35, String(i + 1));
@@ -294,16 +299,22 @@ divider(1, "Loading the scene", "Scene.h / Scene.cpp: USD stage → EnTT registr
                           isTextBox: true, objectName: id("step-body") });
         if (i < 3) arrow(s, x + 2.05, 1.56, x + 2.3, 1.56);
     });
-    code(s, 0.5, 3.1, 9.0, 1.85, [
-        "struct FlatGeometry {                  // one soup, ready for one GAS",
-        "    vertices, indices;                 // shared positions",
-        "    triMesh, triMaterial;              // per triangle",
-        "    triUVs (6), triNormals (9);        // per triangle corner",
-        "    materials, textures, meshEntity, bounds;",
+    code(s, 0.5, 3.1, 6.2, 1.85, [
+        "struct RenderMesh {           // one per renderable prim",
+        "    SdfPath path;",
+        "    array<float,12> toWorld;  // local → world",
+        "    positions, normals, uvs;  // per vertex",
+        "    indices, triMaterial;     // per triangle",
         "};",
     ], 12);
-    s.addNotes("Everything the GPU needs per hit is indexed by the triangle index OptiX reports, so all the " +
-               "attribute arrays are per triangle. A zero shading normal means flat shading.");
+    s.addText("36 → 20", { x: 7.0, y: 3.15, w: 2.5, h: 0.75, fontSize: 40, bold: true, color: C.accent1, margin: 0,
+                          fontFace: THEME.headFontFace, isTextBox: true, objectName: "weld-stat" });
+    s.addText("corners → vertices in the textured box after welding", {
+        x: 7.0, y: 3.95, w: 2.5, h: 0.9, fontSize: 13, color: C.text1, valign: "top", margin: 0, isTextBox: true,
+        objectName: "weld-label" });
+    s.addNotes("weldCorners: meshopt_generateVertexRemapMulti merges corners with identical position, normal and " +
+               "st; triangles are grouped by material and spatially sorted (meshopt_spatialSortTriangles); " +
+               "meshopt_optimizeVertexFetchRemap stores vertices in first-use order. The mesh stays in local space.");
 }
 
 {
@@ -352,7 +363,7 @@ divider(2, "Ray tracing with OptiX", "OptixRenderer.* on the host, deviceProgram
 
 {
     const s = content("The renderer on the host", "OptiX");
-    const steps = ["CUDA primary context", "OptiX device context", "Module from embedded PTX",
+    const steps = ["CUDA primary context", "OptiX device context", "Module from embedded OptiX-IR",
                    "Program groups → pipeline", "Shader binding table"];
     steps.forEach((t, i) => {
         const y = 1.3 + i * 0.68;
@@ -361,9 +372,9 @@ divider(2, "Ray tracing with OptiX", "OptixRenderer.* on the host, deviceProgram
                        isTextBox: true, objectName: id("init-step") });
     });
     card(s, 4.8, 1.3, 4.7, 1.45, {
-        head: "setGeometry(FlatGeometry)", body: [
-            "Uploads the arrays and textures",
-            "Builds one compacted GAS over all triangles",
+        head: "setScene(Scene)", body: [
+            "One compacted GAS per mesh (local space)",
+            "An IAS places them: instance id = mesh id",
         ] });
     card(s, 4.8, 2.95, 4.7, 2.05, {
         head: "render()", body: [
@@ -371,8 +382,9 @@ divider(2, "Ray tracing with OptiX", "OptixRenderer.* on the host, deviceProgram
             "Copies colors back; mesh ids too on frame 0",
             "frameIndex counts samples; resetAccumulation() sets it to 0",
         ] });
-    s.addNotes("init runs once (or again on another GPU in the cloudxr branch, through release()). The PTX is " +
-               "compiled by nvcc at build time and embedded with cmake/EmbedFile.cmake, so the binary is self-contained.");
+    s.addNotes("init runs once (or again on the XR runtime's GPU, through release()). nvcc compiles the device " +
+               "programs to OptiX-IR (-optix-ir) at build time; cmake/EmbedFile.cmake embeds the binary as an " +
+               "unsigned char array, so the executable is self-contained.");
 }
 
 {
@@ -388,7 +400,7 @@ divider(2, "Ray tracing with OptiX", "OptixRenderer.* on the host, deviceProgram
         "    float3 lightDir;",
         "    unsigned shadows, mipmaps, ...;",
         "    OptixTraversableHandle handle;",
-        "    const float3* vertices; ...",
+        "    const MeshData* meshes;// per instance",
         "};",
     ], 12);
     card(s, 6.1, 1.3, 3.4, 3.6, {
@@ -422,7 +434,8 @@ divider(2, "Ray tracing with OptiX", "OptixRenderer.* on the host, deviceProgram
     s.addText("Payload: rgb, mesh id, depth, rng seed · max trace depth 3 (camera → reflection → shadow)",
               { x: 0.5, y: 4.55, w: 9.0, h: 0.4, fontSize: 13, color: C.text2, margin: 0, isTextBox: true,
                 objectName: "payload" });
-    s.addNotes("sampleTexture picks the mip level from ray differentials: rays through neighbouring pixels are " +
+    s.addNotes("HitTriangle reads the hit mesh by optixGetInstanceId() and takes its vertices and normals to " +
+               "world space with the instance transform. sampleTexture picks the mip level from ray differentials: rays through neighbouring pixels are " +
                "intersected with the triangle's plane and turned into st gradients for tex2DGrad.");
 }
 
@@ -455,7 +468,7 @@ divider(3, "The application", "App.h / App.cpp: SDL3, Dear ImGui, cameras and pi
 {
     const s = content("One turn of the main loop", "Application");
     const steps = [["Events", "SDL events, drops"], ["Open", "pending file, loaded off the dialog thread"],
-                   ["XR", "headset frame (cloudxr branch)"], ["UI", "menus and four panels"], ["Present", "SDL_Renderer, vsync"]];
+                   ["XR", "headset frame, when a session runs"], ["UI", "menus and four panels"], ["Present", "SDL_Renderer, vsync"]];
     steps.forEach(([h, b], i) => {
         const x = 0.5 + i * 1.86;
         box(s, x, 1.35, 1.66, 1.2, h, b, i === 2 ? HEX.accent1 : C.background2, C.text1);
@@ -511,7 +524,7 @@ divider(3, "The application", "App.h / App.cpp: SDL3, Dear ImGui, cameras and pi
 }
 
 // ---- section 4: XR ---------------------------------------------------------------------------
-divider(4, "XR output", "cloudxr branch: XrOutput.* and CloudXrService.*", "XR");
+divider(4, "XR output", "XrOutput.* and CloudXrService.*: OpenXR through CloudXR", "XR");
 
 {
     const s = content("From OptiX to the headset", "XR");
@@ -522,7 +535,7 @@ divider(4, "XR output", "cloudxr branch: XrOutput.* and CloudXrService.*", "XR")
     box(s, 6.35, y, 1.5, h, "CloudXR", "OpenXR runtime", HEX.accent2, C.text1);
     box(s, 8.15, y, 1.35, h, "Headset", "Vision Pro, Quest", C.background2, C.text1);
     [[2.1, 2.4], [4.15, 4.45], [6.05, 6.35], [7.85, 8.15]].forEach(([a, b]) => arrow(s, a, y + h / 2, b, y + h / 2));
-    const stats = [["2 × 2400×1920", "eye images (Vision Pro profile)"], ["2.8 ms", "per frame, both eyes, 1 sample"],
+    const stats = [["2 × 2400×1920", "eye images (Vision Pro profile)"], ["2.6 ms", "per frame, both eyes, 1 sample"],
                    ["0", "copies through main memory"]];
     stats.forEach(([n, label], i) => {
         const x = 0.5 + i * 3.1;
@@ -576,7 +589,32 @@ divider(4, "XR output", "cloudxr branch: XrOutput.* and CloudXrService.*", "XR")
         ] });
     s.addNotes("--cloudxr starts the CloudXR service in-process (CloudXrService dlopens libcloudxr.so and " +
                "restores SDL's signal handlers); --xr uses a runtime already running, e.g. from Isaac Teleop. " +
-               "CLOUDXR.md lists every difference from main.");
+               "The SDK comes from --cloudxr-sdk, $CLOUDXR_SDK_DIR or /opt/viztools/cloudxr-6.2.1.");
+}
+
+{
+    const s = content("Connecting an Apple Vision Pro", "XR");
+    const y = 1.35, h = 1.0;
+    box(s, 0.5, y, 1.75, h, "Vision Pro", "CloudXRViewer", C.background2, C.text1);
+    box(s, 2.75, y, 1.75, h, "stunnel", "TLS on :48322", HEX.accent2, C.text1);
+    box(s, 5.0, y, 2.0, h, "CloudXR runtime", "127.0.0.1:48324", C.text2, C.background1);
+    box(s, 7.5, y, 2.0, h, "UsdOptixViewer", "--cloudxr", C.accent1, C.text1);
+    [[2.25, 2.75], [4.5, 5.0], [7.0, 7.5]].forEach(([a, b]) => arrow(s, a, y + h / 2, b, y + h / 2));
+    card(s, 0.5, 2.7, 5.1, 2.3, {
+        head: "Steps", size: 13, body: [
+            "As root, once per boot: ufw rules, start stunnel",
+            "Run the viewer with NV_CXR_SERVER_PORT=48324 --cloudxr --cloudxr-profile apple-vision-pro",
+            "In the headset: Manual IP Address 157.253.113.156, Connect",
+        ] });
+    card(s, 5.9, 2.7, 3.6, 2.3, {
+        head: "XR menu", body: [
+            "Shows every interface's IPv4 address",
+            "Port read from the service (server-port)",
+            "Without stunnel: error 0x800B1004",
+        ], size: 13 });
+    s.addNotes("Tested on October 27th: two sessions of 3 and 4 minutes with the color, alpha/depth, input and " +
+               "audio streams connected. The client only speaks TLS to 48322, so stunnel forwards to the runtime. " +
+               "The menu shows the runtime's port (48324), not stunnel's. Details in CLOUDXR.md.");
 }
 
 // ---- wrap-up ----------------------------------------------------------------------------------
@@ -584,7 +622,7 @@ pres.addSection({ title: "Wrap-up" });
 {
     const s = content("Build, test and document", "Wrap-up");
     card(s, 0.5, 1.3, 2.85, 2.2, {
-        head: "Build", badge: "B", body: ["CMake 3.28, C++20", "PTX embedded", "OpenXR fetched", "No warnings"] });
+        head: "Build", badge: "B", body: ["CMake 3.28, C++20", "OptiX-IR embedded", "Tools in /opt/viztools", "No warnings"] });
     card(s, 3.575, 1.3, 2.85, 2.2, {
         head: "Test", badge: "T", body: ["Six test scenes", "xwd screenshots", "usdchecker", "CloudXR, no headset"] });
     card(s, 6.65, 1.3, 2.85, 2.2, {
